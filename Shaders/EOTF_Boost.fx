@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.1 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
+    EOTF Boost v8.2 - 1D APL-Only Lookup
     =================================
 
     Purpose
@@ -139,7 +139,7 @@ uniform float SIGNAL_REFERENCE_NITS <
 
 uniform bool ShowOSD <
     ui_label = "Show APL / Metric Stats";
-    UI_TOOLTIP("Displays the current smoothed APL percentage and the maximum sampled raw luma value from the APL analysis pass.")
+    UI_TOOLTIP("Displays the current smoothed APL percentage and the maximum sampled decoded scene luminance in nits from the APL analysis pass.")
 > = false;
 
 uniform float OSDBrightness <
@@ -514,8 +514,10 @@ float GetPercent(float2 uv)
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
         return 0.0;
 
+    float2 d0 = uv - float2(0.3, 0.25);
+    float2 d1 = uv - float2(0.7, 0.75);
     bool slash = abs(uv.x - (1.0 - uv.y)) < 0.15;
-    bool circles = (distance(uv, float2(0.3, 0.25)) < 0.2) || (distance(uv, float2(0.7, 0.75)) < 0.2);
+    bool circles = (dot(d0, d0) < 0.04) || (dot(d1, d1) < 0.04);
 
     return (slash || circles) ? 1.0 : 0.0;
 }
@@ -1717,7 +1719,7 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
 // --- SHADERS ---
 
-// PASS 1: Calculate raw APL / Metric + Max Sampled Raw Luma
+// PASS 1: Calculate raw APL / Metric + Max Sampled Decoded Scene Nits
 float4 PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     const int MAX_GRID_SIZE = 32;
@@ -1725,7 +1727,8 @@ float4 PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Ta
     float invSteps = 1.0 / float(steps);
 
     float totalMetric = 0.0;
-    float maxSampledRawLuma = 0.0;
+    float maxSampledSceneNits = 0.0;
+    float invAPLReferenceWhiteNits = 1.0 / max(APLReferenceWhiteNits, 1.0);
     float invTotalSamples = invSteps * invSteps; // steps*steps samples total; multiply is cheaper than divide per-loop
 
     [loop]
@@ -1742,29 +1745,17 @@ float4 PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Ta
 
             float2 sampleUV = (float2(float(x), float(y)) + 0.5) * invSteps;
             float3 color = tex2Dlod(ReShade::BackBuffer, float4(sampleUV, 0.0, 0.0)).rgb;
+            float sceneNits = GetSceneNitsFromColor(color);
 
-            if (APLInputMode == 1)
-            {
-                // PQ mode: maxSampledRawLuma tracks 709 luma of the raw PQ-encoded signal
-                // (intentionally different from the decoded metric). No redundancy.
-                maxSampledRawLuma = max(maxSampledRawLuma, GetLuma709(max(color, 0.0.xxx)));
-                totalMetric += GetAPLMetricSample(color);
-            }
-            else
-            {
-                // scRGB mode: both maxSampledRawLuma and GetAPLMetricSample use
-                // GetLuma709(max(color,0)) — compute once and reuse.
-                float luma709 = GetLuma709(max(color, 0.0.xxx));
-                maxSampledRawLuma = max(maxSampledRawLuma, luma709);
-                totalMetric += saturate(luma709 * SIGNAL_REFERENCE_NITS / max(APLReferenceWhiteNits, 1.0));
-            }
+            maxSampledSceneNits = max(maxSampledSceneNits, sceneNits);
+            totalMetric += saturate(sceneNits * invAPLReferenceWhiteNits);
         }
     }
 
     float apl = totalMetric * invTotalSamples;
 
-    // r = raw current-frame APL metric, g = max sampled raw luma, a = valid
-    return float4(apl, maxSampledRawLuma, 0.0, 1.0);
+    // r = raw current-frame APL metric, g = max sampled decoded scene nits, a = valid
+    return float4(apl, maxSampledSceneNits, 0.0, 1.0);
 }
 
 float4 PS_CopyAPLState(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
@@ -1778,92 +1769,136 @@ float4 PS_SmoothAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_
     float4 prevData = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0));
 
     float rawAPL = saturate(currentData.r);
+    float currentMaxSampledNits = max(currentData.g, 0.0);
     float closedLoopCurrentAPL = SolveClosedLoopDisplayAPLFromRaw(rawAPL);
     float prevAPLRaw = prevData.r;
     float prevSmoothedAPL = saturate(prevAPLRaw);
+    float prevSmoothedMaxSampledNits = max(prevData.g, 0.0);
 
     float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
     float hasPrev = (prevData.a > 0.5 && prevAPLRaw >= 0.0 && prevAPLRaw <= 1.0) ? 1.0 : 0.0;
 
     float smoothedAPL = lerp(closedLoopCurrentAPL, lerp(prevSmoothedAPL, closedLoopCurrentAPL, alpha), hasPrev);
+    float smoothedMaxSampledNits = lerp(currentMaxSampledNits, lerp(prevSmoothedMaxSampledNits, currentMaxSampledNits, alpha), hasPrev);
     float dynamicRollOffStartNits = SolveDynamicRollOffStartNits(smoothedAPL);
     float rollOffAnchorBoostedNits = ComputeRollOffAnchorBoostedNits(smoothedAPL);
 
-    // r = smoothed closed-loop display-side APL metric, g = current max sampled raw luma,
+    // r = smoothed closed-loop display-side APL metric, g = smoothed max sampled decoded scene nits,
     // b = dynamic roll off start from smoothed APL, a = boosted anchor nits used by the PQ rational shoulder
-    return float4(smoothedAPL, currentData.g, dynamicRollOffStartNits, rollOffAnchorBoostedNits);
+    return float4(smoothedAPL, smoothedMaxSampledNits, dynamicRollOffStartNits, rollOffAnchorBoostedNits);
 }
 
-float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float currentAPL, float maxSampledLuma, float fader)
+float DrawOSDDigitAt(float2 texcoord, float2 topRight, float scale, float aspect, int digit)
 {
-    float2 posStart = float2(0.84, 0.05);
-    float scale = 0.04;
-    float lineSpacing = scale * 1.35;
-    float charSpacing = scale * 0.5;
+    float2 uv = texcoord;
+    uv.x *= aspect;
+
+    float2 anchor = topRight;
+    anchor.x *= aspect;
+
+    uv -= anchor;
+    uv.x = -uv.x;
+
+    return GetDigit(digit, uv / scale);
+}
+
+float DrawOSDPercentAt(float2 texcoord, float2 topRight, float scale, float aspect)
+{
+    float2 uv = texcoord;
+    uv.x *= aspect;
+
+    float2 anchor = topRight;
+    anchor.x -= scale / max(aspect, 1e-6);
+    anchor.x *= aspect;
+
+    uv -= anchor;
+
+    return GetPercent(uv / scale);
+}
+
+float DrawOSDRow3(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
+{
+    int v = clamp(value, 0, 999);
+    float mask = 0.0;
+
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, v % 10);
+
+    if (v >= 10)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (v / 10) % 10);
+
+    if (v >= 100)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (v / 100) % 10);
+
+    return saturate(mask);
+}
+
+float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
+{
+    int v = clamp(value, 0, 99999);
+    float mask = 0.0;
+
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, v % 10);
+
+    if (v >= 10)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (v / 10) % 10);
+
+    if (v >= 100)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (v / 100) % 10);
+
+    if (v >= 1000)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, (v / 1000) % 10);
+
+    if (v >= 10000)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (v / 10000) % 10);
+
+    return saturate(mask);
+}
+
+float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float currentAPL, float maxSampledNits, float fader)
+{
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
+    float invAspect = 1.0 / max(aspect, 1e-6);
+    float scale = 0.034;
+    float glyphWidth = scale * invAspect;
+    float stepX = glyphWidth * 1.10;
+    float lineSpacing = scale * 1.28;
+    float percentGap = glyphWidth * 0.22;
+
+    // Compact two-row numeric OSD on the right.
+    // Row 1 = smoothed APL percent, Row 2 = max sampled decoded scene nits.
+    float rightMargin = 0.018;
+    float2 percentTopRight = float2(1.0 - rightMargin, 0.045);
+    float2 topRowRight = percentTopRight - float2(glyphWidth + percentGap, 0.0);
+    float2 bottomRowRight = topRowRight + float2(0.0, lineSpacing);
+
+    float left = bottomRowRight.x - stepX * 4.0 - glyphWidth;
+    float right = percentTopRight.x;
+    float top = topRowRight.y;
+    float bottom = bottomRowRight.y + scale;
+
+    float padX = glyphWidth * 0.45;
+    float padY = scale * 0.22;
+
+    if (texcoord.x < left - padX || texcoord.x > right + padX || texcoord.y < top - padY || texcoord.y > bottom + padY)
+        return sceneColor;
+
+    int aplDisplay = clamp(int(floor(saturate(currentAPL) * 100.0 + 0.5)), 0, 100);
+    int nitDisplay = clamp(int(floor(max(maxSampledNits, 0.0) + 0.5)), 0, 99999);
+
+    float bgMask = (texcoord.x >= left - padX && texcoord.x <= right + padX && texcoord.y >= top - padY && texcoord.y <= bottom + padY) ? 1.0 : 0.0;
 
     float textMask = 0.0;
+    textMask += DrawOSDRow3(texcoord, topRowRight, scale, stepX, aspect, aplDisplay);
+    textMask += DrawOSDPercentAt(texcoord, percentTopRight, scale, aspect);
+    textMask += DrawOSDRow5(texcoord, bottomRowRight, scale, stepX, aspect, nitDisplay);
+    textMask = saturate(textMask);
 
-    // Line 1: APL percentage
-    int aplVal = clamp(int(currentAPL * 100.0), 0, 99);
-    int a0 = aplVal / 10;
-    int a1 = aplVal % 10;
-
-    float2 uvDigits1 = texcoord - posStart;
-    uvDigits1.x *= aspect;
-
-    float2 uvA0 = uvDigits1;
-    float2 uvA1 = uvDigits1 - float2(charSpacing * aspect, 0.0);
-    float2 uvA2 = uvDigits1 - float2(charSpacing * 2.0 * aspect, 0.0);
-
-    uvA0.x = -uvA0.x;
-    uvA1.x = -uvA1.x;
-
-    textMask += GetDigit(a0, uvA0 / scale);
-    textMask += GetDigit(a1, uvA1 / scale);
-    textMask += GetPercent(uvA2 / scale);
-
-    // Line 2: Max sampled raw luma as XX.XX
-    float maxDisplay = clamp(maxSampledLuma, 0.0, 99.99);
-    int maxWhole = int(floor(maxDisplay));
-    int maxFrac = int(floor(frac(maxDisplay) * 100.0 + 0.5));
-
-    if (maxFrac >= 100)
-    {
-        maxFrac -= 100;
-        maxWhole = min(maxWhole + 1, 99);
-    }
-
-    int m0 = (maxWhole / 10) % 10;
-    int m1 = maxWhole % 10;
-    int m2 = (maxFrac / 10) % 10;
-    int m3 = maxFrac % 10;
-
-    float2 uvDigits2 = texcoord - (posStart + float2(0.0, lineSpacing));
-    uvDigits2.x *= aspect;
-
-    float2 uvM0 = uvDigits2;
-    float2 uvM1 = uvDigits2 - float2(charSpacing * aspect, 0.0);
-    float2 uvM2 = uvDigits2 - float2(charSpacing * 2.0 * aspect, 0.0);
-    float2 uvM3 = uvDigits2 - float2(charSpacing * 3.0 * aspect, 0.0);
-    float2 uvM4 = uvDigits2 - float2(charSpacing * 4.0 * aspect, 0.0);
-
-    uvM0.x = -uvM0.x;
-    uvM1.x = -uvM1.x;
-    uvM2.x = -uvM2.x;
-    uvM3.x = -uvM3.x;
-    uvM4.x = -uvM4.x;
-
-    textMask += GetDigit(m0, uvM0 / scale);
-    textMask += GetDigit(m1, uvM1 / scale);
-    textMask += GetDot(uvM2 / scale);
-    textMask += GetDigit(m2, uvM3 / scale);
-    textMask += GetDigit(m3, uvM4 / scale);
-
-    float3 baseColor = lerp(float3(1, 1, 1), float3(0, 1, 0), fader);
+    float bgAlpha = 0.18 * OSDBrightness * bgMask;
+    float3 baseColor = lerp(float3(1.0, 1.0, 1.0), float3(0.0, 1.0, 0.0), fader);
     float3 textColor = baseColor * OSDBrightness;
+    float3 shadedScene = sceneColor * (1.0 - bgAlpha);
 
-    return lerp(sceneColor, textColor, saturate(textMask));
+    return lerp(shadedScene, textColor, textMask);
 }
 
 // PASS 2b: Main Rendering (1D APL-only measured scene gain + hybrid luminance participation)
