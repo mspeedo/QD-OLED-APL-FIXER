@@ -90,7 +90,7 @@ This is the main strength slider.
 - **Higher value** = stronger brightness boost
 - **Lower value** = weaker effect
 
-If you only change one setting, this is usually the first one to try.
+If you only change one setting, this is usually the first one to try. I do not recommend values above 0.4 for 1000nit content, otherwise there is too much compression of HDR input vs real monitor brightness output, which causes overblown highlights.
 
 ### Boost LUT Gamma
 Changes how the boost ramps in across different scene brightness levels.
