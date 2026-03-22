@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.0 - 1D APL-Only Lookup
+    EOTF Boost v8.1 - 1D APL-Only Lookup
     =================================
 
     Purpose
@@ -29,8 +29,19 @@
 
 // --- COMPILE-TIME DEBUG FEATURE SWITCHES ---
 // Set to 1 to compile the graph feature in, or 0 to strip it out completely.
+// Variant: built-in window projection graph + BT.2390-style reference rolloff overlay.
 #ifndef ENABLE_APL_GRAPH
     #define ENABLE_APL_GRAPH 0
+#endif
+
+#ifndef ENABLE_UI_TOOLTIPS
+    #define ENABLE_UI_TOOLTIPS 0
+#endif
+
+#if ENABLE_UI_TOOLTIPS
+    #define UI_TOOLTIP(text) ui_tooltip = text;
+#else
+    #define UI_TOOLTIP(text)
 #endif
 
 // --- UI SETTINGS ---
@@ -39,57 +50,58 @@ uniform int APLInputMode <
     ui_type = "combo";
     ui_items = "scRGB Normalized\0PQ Decoded Normalized\0";
     ui_label = "APL Input Mode";
-    ui_tooltip = "Selects how the shader interprets scene luminance for the APL metric. scRGB uses BT.709 luma scaled by Reference White. PQ uses ST.2084-decoded BT.2020 luma scaled by Reference White.";
+    UI_TOOLTIP("Selects how the shader interprets scene luminance for the APL metric. scRGB uses BT.709 luma scaled by Reference White. PQ uses ST.2084-decoded BT.2020 luma scaled by Reference White.")
 > = 1;
-
-uniform float APLReferenceWhiteNits <
-    ui_type = "slider";
-    ui_min = 10.0; ui_max = 1000.0;
-    ui_label = "APL Reference White (nits)";
-    ui_tooltip = "Reference white used only for the APL metric normalization. It does not directly clamp output nits or change the graph axes.";
-> = 250.0;
 
 uniform int APLGridSize <
     ui_type = "slider";
     ui_min = 4; ui_max = 32;
     ui_label = "APL Grid Size";
-    ui_tooltip = "APL sample grid resolution. Total samples = Grid Size x Grid Size. Higher values are more stable but cost more.";
+    UI_TOOLTIP("APL sample grid resolution. Total samples = Grid Size x Grid Size. Higher values are more stable but cost more.")
 > = 32;
+
+uniform float APLReferenceWhiteNits <
+    ui_type = "slider";
+    ui_min = 10.0; ui_max = 1500.0;
+    ui_label = "APL Reference White (nits)";
+    UI_TOOLTIP("Reference white used only for the APL metric normalization. It does not directly clamp output nits or change the graph axes.")
+> = 1000.0;
 
 uniform float APLTrigger <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 0.95;
     ui_label = "APL Trigger";
-    ui_tooltip = "Fade-in threshold for the boost based on the smoothed APL metric. Below this level the effect is reduced or disabled. 10% APL on the graph is exactly the threshold when this is set to 0.10.";
-> = 0.12;
+    UI_TOOLTIP("Fade-in threshold for the boost based on the smoothed APL metric. Below this level the effect is reduced or disabled. 10% APL on the graph is exactly the threshold when this is set to 0.10.")
+> = 0.00;
 
 uniform float MaxAPLBoostStrength <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0;
     ui_label = "Max APL Boost Strength";
-    ui_tooltip = "Scales the measured APL compensation in log-gain space before per-pixel participation is applied. 1.0 means full measured compensation at maximum LUT weight. Values below 1.0 under-compensate. Values above 1.0 intentionally over-compensate.";
-> = 0.5;
+    UI_TOOLTIP("Scales the measured APL compensation in log-gain space before per-pixel participation is applied. 1.0 means full measured compensation at maximum LUT weight. Values below 1.0 under-compensate. Values above 1.0 intentionally over-compensate.")
+> = 0.4;
 
 uniform float BoostTGamma <
     ui_type = "slider";
-    ui_min = 0.25; ui_max = 2.50;
+    ui_min = 0.0; ui_max = 2.50;
     ui_label = "Boost LUT Gamma";
-    ui_tooltip = "Reshapes the LUT-derived boost weight before Max APL Boost Strength is applied. Values below 1.0 increase lower-weight regions more. Values above 1.0 reduce them more.";
-> = 1.0;
+    UI_TOOLTIP("Reshapes the LUT-derived boost weight before Max APL Boost Strength is applied. Values below 1.0 increase lower-weight regions more. Values above 1.0 reduce them more. 0 = Disabled.")
+> = 0.0;
 
 uniform float BoostRollOff <
     ui_type = "slider";
-    ui_min = 1000.0; ui_max = 1500.0;
+    ui_min = 500.0; ui_max = 1500.0;
     ui_label = "Boost roll off end";
-    ui_tooltip = "Desired output anchor of the PQ rational highlight shoulder in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels.";
+    UI_TOOLTIP("Desired output anchor of the PQ highlight rolloff in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels. 0 = Disabled.")
 > = 1000.0;
 
-uniform float BoostRollOffLogFactor <
+uniform float BoostRollOffShape <
     ui_type = "slider";
-    ui_min = 0; ui_max = 1.0;
-    ui_label = "Boost roll off softness";
-    ui_tooltip = "Controls the PQ rational shoulder softness after boost. Lower values place the knee later and preserve highlight separation more strongly. Higher values start the shoulder earlier and make the compression more gradual.";
-> = 1.0;
+    ui_min = 0.25; ui_max = 4.0;
+    ui_label = "BT.2390 roll off shape";
+    UI_TOOLTIP("Adjusts the live roll off character by moving the roll off start together with the shoulder curvature so the transition stays smooth and monotonic. 1.0 = standard BT.2390. Values below 1.0 start later and hold highlights higher longer. Values above 1.0 start earlier and compress highlights harder.")
+> = 1.25;
+
 
 static const float PixelParticipationStartNits = 1.0;
 
@@ -101,40 +113,40 @@ uniform float PixelParticipationFloor <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 1.0;
     ui_label = "Shadow Protection Floor";
-    ui_tooltip = "Minimum share of the APL-derived scene compensation applied to every pixel before the luminance-weighted participation ramp adds the remainder. Higher values track the measured ABL behavior more faithfully. Lower values behave more like a perceptual shadow-protection model.";
+    UI_TOOLTIP("Minimum share of the APL-derived scene compensation applied to every pixel before the luminance-weighted participation ramp adds the remainder. Higher values track the measured ABL behavior more faithfully. Lower values behave more like a perceptual shadow-protection model.")
 > = 1.0;
 
 uniform float TransitionSpeed <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0;
     ui_label = "APL Smoothing Time (s)";
-    ui_tooltip = "Temporal smoothing time constant for the live APL metric in seconds. 0 = disabled. FPS-independent. This affects live boosting and OSD values, but the graph uses its own Graph APL % slider.";
+    UI_TOOLTIP("Temporal smoothing time constant for the live APL metric in seconds. 0 = disabled. FPS-independent. This affects live boosting and OSD values, but the graph uses its own Graph APL % slider.")
 > = 0.25;
 
 uniform float SaturationComp <
     ui_type = "slider";
     ui_min = 0.5; ui_max = 1.5;
     ui_label = "Saturation Compensation";
-    ui_tooltip = "Scales chroma reinjection after luma boosting. 1.0 = neutral. Values above 1.0 restore or exaggerate saturation in boosted regions.";
+    UI_TOOLTIP("Scales chroma reinjection after luma boosting. 1.0 = neutral. Values above 1.0 restore or exaggerate saturation in boosted regions.")
 > = 1.0;
 
 uniform float SIGNAL_REFERENCE_NITS <
     ui_type = "slider";
     ui_min = 1.0; ui_max = 200.0;
     ui_label = "scRGB Signal Reference (nits)";
-    ui_tooltip = "Reference nits for scRGB signal conversion. Standard scRGB uses 80 nits per 1.0 signal. Used only when APL Input Mode = scRGB Normalized.";
+    UI_TOOLTIP("Reference nits for scRGB signal conversion. Standard scRGB uses 80 nits per 1.0 signal. Used only when APL Input Mode = scRGB Normalized.")
 > = 80.0;
 
 uniform bool ShowOSD <
     ui_label = "Show APL / Metric Stats";
-    ui_tooltip = "Displays the current smoothed APL percentage and the maximum sampled raw luma value from the APL analysis pass.";
+    UI_TOOLTIP("Displays the current smoothed APL percentage and the maximum sampled raw luma value from the APL analysis pass.")
 > = false;
 
 uniform float OSDBrightness <
     ui_type = "slider";
     ui_min = 0.01; ui_max = 1.0;
     ui_label = "OSD Brightness";
-    ui_tooltip = "Controls OSD and graph overlay brightness.";
+    UI_TOOLTIP("Controls OSD and graph overlay brightness.")
 > = 0.5;
 
 uniform float FrameTime < source = "frametime"; >;
@@ -142,33 +154,50 @@ uniform float FrameTime < source = "frametime"; >;
 #if ENABLE_APL_GRAPH
 uniform bool ShowAPLGraph <
     ui_label = "Show APL EOTF Debug Graph";
-    ui_tooltip = "Shows the analysis graph. Blue dashed = reference, Light blue = real 2D measured LUT output, Green = shader remapped target using the live 1D nits-domain multiplicative model with the PQ rational shoulder, Gray = projected measured output after that compensation using the real 2D table.";
+    UI_TOOLTIP("Shows the analysis graph. Standard mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the projected measured peak for the selected raw APL input, Light blue = real 2D measured LUT output for that raw input APL, Green = shader remapped target after the closed-loop APL solve, Gray = projected measured output at the solved display-side operating point. Window projection mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF for the raw input, Gray = projected window output after the closed-loop APL solve, Green = overlap between both curves.")
+> = true;
+
+uniform bool GraphShowBT2390Reference <
+    ui_label = "Graph Show BT.2390 Reference";
+    UI_TOOLTIP("Shows or hides the optional BT.2390-style Hermite rolloff reference overlay. It uses the measured peak for the selected APL or selected window size.")
 > = false;
+
+uniform bool GraphUseFullFieldWindowProjection <
+    ui_label = "Graph Use Window Projection";
+    UI_TOOLTIP("Switches the debug graph to the built-in window PQ measurement projection overlay. In this mode, Graph APL (%) is ignored. Use the window selector below to choose between the built-in 100%, 50%, 25%, 15%, and 10% window measurements. Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF only, Gray = projected window output only, Green = overlap between both curves.")
+> = true;
+
+uniform int GraphProjectionWindowSize <
+    ui_type = "combo";
+    ui_items = "100% Window\0 50% Window\0 25% Window\0 15% Window\0 10% Window\0";
+    ui_label = "Graph Projection Window Size";
+    UI_TOOLTIP("Selects which built-in measured window set is used by the full-field projection graph mode.")
+> = 0;
 
 uniform float GraphAPLIndex <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 100.0;
     ui_label = "Graph APL (%)";
-    ui_tooltip = "Continuous APL value used only by the graph overlay. The graph interpolates between measured LUT rows like the live shader instead of snapping to discrete APL rows.";
+    UI_TOOLTIP("Continuous raw / pre-boost input APL value used by the standard APL-slice graph mode. Light blue = measured curve for that raw input APL. Green = shader remapped target projected from that raw input through the closed-loop APL solve. Gray = projected measured output at the solved display-side operating point. Ignored when Graph Use Window Projection is enabled.")
 > = 50.0;
 
 uniform float GraphAxisMaxNits <
     ui_type = "slider";
-    ui_min = 1000.0; ui_max = 10000.0;
+    ui_min = 500.0; ui_max = 10000.0;
     ui_label = "Graph Axis Max (nits)";
-    ui_tooltip = "Maximum nits shown on both graph axes. Raising it lets you inspect curve behavior beyond 1000-nit input without changing the live shader.";
+    UI_TOOLTIP("Maximum nits shown on both graph axes. Raising it lets you inspect curve behavior beyond 1000-nit input without changing the live shader.")
 > = 1000.0;
 
 uniform float GraphOpacity <
     ui_type = "slider";
     ui_min = 0.05; ui_max = 1.0;
     ui_label = "Graph Opacity";
-    ui_tooltip = "Opacity of the graph overlay background and curves.";
+    UI_TOOLTIP("Opacity of the graph overlay background and curves.")
 > = 0.5;
 
 uniform bool GraphUsePQSpace <
     ui_label = "Graph PQ-Encoded Axes";
-    ui_tooltip = "Renders the graph in PQ-encoded space instead of linear nits. Axis labels remain in nits.";
+    UI_TOOLTIP("Renders the graph in PQ-encoded space instead of linear nits. Axis labels remain in nits.")
 > = true;
 #endif
 
@@ -208,6 +237,21 @@ sampler SamplerAPLPrev
 };
 
 #if ENABLE_APL_GRAPH
+// Curve-precompute constants — must match DrawAPLGraphOverlay.
+// Defined here (not as a const int inside the function) so the texture Width attribute
+// can reference it at compile time and both the precompute pass and the draw pass agree.
+#define GRAPH_CURVE_SAMPLES 64
+
+// Row indices inside TexGraphCurves (height = 4).
+// Each texel stores float4(ax, ay, bx, by) in p-space screen coords
+// (texcoord with p.x *= aspect).  The precompute pass converts from nits
+// to screen space so the per-pixel draw loop needs zero NitsToPQ / pow calls.
+// Texels with x < 0 are sentinels: the segment should be skipped.
+#define GCURVE_REMAPPED  0   // green re-mapped curve (APL mode only)
+#define GCURVE_CORRECTED 1   // gray projected-output / corrected curve
+#define GCURVE_MEASURED  2   // light-blue measured raw curve
+#define GCURVE_BT2390REF 3   // magenta BT.2390 reference (optional)
+
 texture TexGraphParams
 {
     Width = 1;
@@ -217,6 +261,46 @@ texture TexGraphParams
 sampler SamplerGraphParams
 {
     Texture = TexGraphParams;
+};
+
+// Precomputed per-segment screen-space endpoints for all four curve rows.
+// Width = GRAPH_CURVE_SAMPLES (one texel per segment), Height = 4 (one row per curve).
+texture TexGraphCurves
+{
+    Width  = GRAPH_CURVE_SAMPLES;
+    Height = 4;
+    Format = RGBA32F;
+};
+sampler SamplerGraphCurves
+{
+    Texture   = TexGraphCurves;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+
+// Precomputed grid/tick/ref line endpoints.  All positions are purely uniform-derived —
+// computing them per-pixel with NitsToPQ (2 pow calls each) wastes ~200 pow calls per
+// inGraphCore pixel.  Layout (one float4(ax,ay,bx,by) per texel in p-space):
+//   0–8:   grid vertical lines   (i = 1..9)
+//   9–17:  grid horizontal lines (i = 1..9)
+//   18–23: x-tick marks          (i = 0..5)
+//   24–29: y-tick marks          (i = 0..5)
+//   30:    identity reference dashed line
+//   31:    (padding / sentinel)
+#define GRAPH_LINE_COUNT 32
+texture TexGraphLines
+{
+    Width  = GRAPH_LINE_COUNT;
+    Height = 1;
+    Format = RGBA32F;
+};
+sampler SamplerGraphLines
+{
+    Texture   = TexGraphLines;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
 };
 
 texture TexBoosted
@@ -275,9 +359,120 @@ float LinearToPQBT2100(float linearValue)
     return pow(num / max(den, 1e-6), m2);
 }
 
+// Scalar version of PQ EOTF — avoids float3 construction overhead in scalar-only contexts.
+float PQToLinearScalar(float v)
+{
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+
+    float vp = pow(saturate(v), 1.0 / m2);
+    float num = max(vp - c1, 0.0);
+    float den = c2 - c3 * vp;
+    return pow(num / max(den, 1e-6), 1.0 / m1);
+}
+
 float NitsToPQ(float nits)
 {
     return LinearToPQBT2100(saturate(nits / 10000.0));
+}
+
+// NitsToPQ(0.0) = LinearToPQBT2100(0.0) = c1^m2 — pure compile-time constant.
+// Replaces two NitsToPQ(0.0) calls per ComputeBT2390ReferenceOutputNits invocation.
+static const float PQ_BLACK = 7.309559025783966e-07;
+
+// BT.2390 highlight rolloff in PQ space.
+// This follows the Report ITU-R BT.2390 EETF construction when shapeControl = 1.0.
+// For other values we keep the same normalized source/target endpoints, then move the
+// knee and rebuild the shoulder with a monotonic power form that preserves a slope of 1
+// where the rolloff begins and a slope of 0 at the peak. This avoids the S-shaped bend
+// that appears when only the Hermite parameterization is warped.
+float ComputeBT2390ShapedKneeStart(float maxLum, float shapeControl)
+{
+    float standardKneeStart = saturate(1.5 * maxLum - 0.5);
+
+    // Standard BT.2390 fast path: avoid log2() and extra shaping math when the control
+    // is effectively at its neutral value.
+    if (abs(shapeControl - 1.0) <= 1e-4)
+        return standardKneeStart;
+
+    float safeShapeControl = max(shapeControl, 1e-4);
+    float shapeBias = log2(safeShapeControl);
+
+    if (shapeBias > 0.0)
+    {
+        float hardT = saturate(shapeBias * 0.5);
+        float aggressiveKneeStart = standardKneeStart * 0.15;
+        return saturate(lerp(standardKneeStart, aggressiveKneeStart, hardT));
+    }
+
+    if (shapeBias < 0.0)
+    {
+        float softT = saturate(-shapeBias * 0.5);
+        float softerKneeStart = standardKneeStart + (maxLum - standardKneeStart) * 0.85;
+        return min(lerp(standardKneeStart, softerKneeStart, softT), maxLum - 1e-6);
+    }
+
+    return standardKneeStart;
+}
+
+float ApplyBT2390EETFToPQWithShape(float inputPQ, float sourcePeakNits, float targetPeakNits, float shapeControl)
+{
+    float safeSourcePeakNits = max(sourcePeakNits, 1e-4);
+    float safeTargetPeakNits = max(targetPeakNits, 0.0);
+
+    if (safeTargetPeakNits <= 0.0)
+        return PQ_BLACK;
+
+    if (safeTargetPeakNits >= safeSourcePeakNits - 1e-4)
+        return saturate(inputPQ);
+
+    float sourceBlackPQ = PQ_BLACK;
+    float sourceWhitePQ = max(NitsToPQ(safeSourcePeakNits), sourceBlackPQ + 1e-6);
+    float targetWhitePQ = min(NitsToPQ(safeTargetPeakNits), sourceWhitePQ - 1e-6);
+
+    float pqRange = max(sourceWhitePQ - sourceBlackPQ, 1e-6);
+    float e1 = saturate((saturate(inputPQ) - sourceBlackPQ) / pqRange);
+    float maxLum = saturate((targetWhitePQ - sourceBlackPQ) / pqRange);
+
+    if (maxLum >= 1.0 - 1e-6)
+        return saturate(inputPQ);
+
+    float kneeStart = ComputeBT2390ShapedKneeStart(maxLum, shapeControl);
+    float e2 = e1;
+
+    if (e1 >= kneeStart)
+    {
+        float shoulderSpan = max(1.0 - kneeStart, 1e-6);
+        float compressionSpan = max(maxLum - kneeStart, 1e-6);
+        float u = saturate((e1 - kneeStart) / shoulderSpan);
+        float shoulderPower = max(shoulderSpan / compressionSpan, 1.0);
+
+        e2 = kneeStart + compressionSpan * (1.0 - pow(1.0 - u, shoulderPower));
+    }
+
+    // In this shader the source and target black levels are both PQ black, so the BT.2390
+    // black-lift tail stage is mathematically a no-op and can be skipped.
+    return saturate(e2 * pqRange + sourceBlackPQ);
+}
+
+float ApplyBT2390EETFToPQ(float inputPQ, float sourcePeakNits, float targetPeakNits)
+{
+    return ApplyBT2390EETFToPQWithShape(inputPQ, sourcePeakNits, targetPeakNits, 1.0);
+}
+
+float ApplyBT2390EETFToNitsWithShape(float inputNits, float sourcePeakNits, float targetPeakNits, float shapeExponent)
+{
+    float safeInputNits = max(inputNits, 0.0);
+    float outputPQ = ApplyBT2390EETFToPQWithShape(NitsToPQ(safeInputNits), sourcePeakNits, targetPeakNits, shapeExponent);
+    return max(PQToLinearScalar(outputPQ) * 10000.0, 0.0);
+}
+
+float ApplyBT2390EETFToNits(float inputNits, float sourcePeakNits, float targetPeakNits)
+{
+    return ApplyBT2390EETFToNitsWithShape(inputNits, sourcePeakNits, targetPeakNits, 1.0);
 }
 
 float GetSignalLuma(float3 color)
@@ -384,16 +579,13 @@ static const float COMP_MAX = 3.345667;
 
 int FindAPLIndex(float aplPct)
 {
+    // Branchless: all APL_COUNT-1 comparisons are independent and emit in parallel.
+    // [loop]+branch forces a serial dependency chain; [unroll]+step() removes it.
     int idx = 0;
-
-    [loop]
+    [unroll]
     for (int i = 0; i < APL_COUNT - 1; ++i)
-    {
-        if (aplPct >= APL_POINTS[i + 1])
-            idx = i + 1;
-    }
-
-    return clamp(idx, 0, APL_COUNT - 2);
+        idx += int(step(APL_POINTS[i + 1], aplPct));
+    return min(idx, APL_COUNT - 2);
 }
 
 float LookupMeasuredComp1D(float aplPct)
@@ -418,6 +610,9 @@ float MeasuredCompToBoostT(float comp)
 float ShapeBoostT(float t)
 {
     float safeT = saturate(t);
+
+    if (BoostTGamma <= 1e-6)  // default 0.0 → pow(t, 0) = 1.0 for any t
+        return 1.0;
 
     if (abs(BoostTGamma - 1.0) <= 1e-6)
         return safeT;
@@ -444,18 +639,19 @@ float ComputeTemporalBlendFactor(float smoothingSeconds)
     return saturate(1.0 - exp(-dtSeconds / max(smoothingSeconds, 1e-6)));
 }
 
+// Precomputed participation ramp constants.
+// PixelParticipationStartNits = 1.0 → log2(1.0) = 0.0
+// PixelParticipationFullNits  = 40.0 → log2(40.0) ≈ 5.32193
+// PixelParticipationGamma     = 1.0 → pow(t, 1.0) = t (identity, no pow needed)
+static const float _PP_LOG_START     = 0.0;
+static const float _PP_LOG_FULL      = 5.321928094887362;   // log2(40.0)
+static const float _PP_LOG_RANGE_INV = 0.18796897749577098; // 1.0 / (log2(40.0) - 0.0)
+
 float ComputePixelParticipationWeight(float inputNits)
 {
-    float safeInputNits = max(inputNits, 1e-4);
-    float startNits = max(PixelParticipationStartNits, 1e-4);
-    float fullNits = max(PixelParticipationFullNits, startNits + 1e-4);
-
-    float logStart = log2(startNits);
-    float logFull = log2(fullNits);
-    float t = (log2(safeInputNits) - logStart) / max(logFull - logStart, 1e-6);
-    t = SmootherStep01(t);
-
-    return pow(saturate(t), PixelParticipationGamma);
+    float t = saturate((log2(max(inputNits, 1e-4)) - _PP_LOG_START) * _PP_LOG_RANGE_INV);
+    return SmootherStep01(t);
+    // PixelParticipationGamma == 1.0 → pow(t, 1.0) == t; omitted.
 }
 
 float ComputePixelParticipation(float inputNits)
@@ -474,67 +670,9 @@ float ComputePixelGainFromSceneLogGain(float sceneLogGain, float inputNits)
     return exp2(sceneLogGain * ComputePixelParticipation(inputNits));
 }
 
-static const float RATIONAL_SHOULDER_MIN_SPAN_FACTOR = 0.08;
 
-float ComputeRationalShoulderStartPQ(float anchorBoostedPQ, float anchorOutPQ)
+float ComputeSceneGainExponentFromMeasuredComp(float measuredComp, float currentAPL, float pixelBoostT)
 {
-    float compressionPQ = max(anchorBoostedPQ - anchorOutPQ, 0.0);
-    float spanFactor = lerp(RATIONAL_SHOULDER_MIN_SPAN_FACTOR, 1.0, saturate(BoostRollOffLogFactor));
-    float startPQ = anchorOutPQ - compressionPQ * spanFactor;
-
-    return min(max(startPQ, 0.0), max(anchorOutPQ - 1e-6, 0.0));
-}
-
-float EvaluateRationalShoulderPQ(float boostedPQ, float rollOffStartPQ, float anchorBoostedPQ, float anchorOutPQ)
-{
-    if (rollOffStartPQ <= 0.0 || boostedPQ <= rollOffStartPQ)
-        return boostedPQ;
-
-    float inSpan = max(anchorBoostedPQ - rollOffStartPQ, 1e-6);
-    float outSpan = max(anchorOutPQ - rollOffStartPQ, 1e-6);
-
-    if (anchorBoostedPQ <= rollOffStartPQ + 1e-6 || anchorOutPQ <= rollOffStartPQ + 1e-6)
-        return min(boostedPQ, 1.0);
-
-    // Anchored Michaelis-Menten style shoulder in PQ space.
-    // u = 1 lands exactly on the chosen output anchor and the slope at the knee stays at 1.
-    float q = saturate(outSpan / inSpan);
-    float a = max(1.0 / max(q, 1e-6) - 1.0, 0.0);
-    float u = max((boostedPQ - rollOffStartPQ) / inSpan, 0.0);
-    float v = u / (1.0 + a * u);
-
-    return min(rollOffStartPQ + inSpan * v, 1.0);
-}
-
-float EvaluateRationalShoulderNits(float boostedNits, float rollOffStartNits, float anchorBoostedNits, float anchorOutNits)
-{
-    float safeBoostedNits = max(boostedNits, 0.0);
-    float safeRollOffStartNits = max(rollOffStartNits, 0.0);
-    float safeAnchorBoostedNits = max(anchorBoostedNits, 0.0);
-    float safeAnchorOutNits = max(anchorOutNits, 0.0);
-
-    if (safeRollOffStartNits <= 0.0 || safeBoostedNits <= safeRollOffStartNits)
-        return safeBoostedNits;
-
-    float boostedPQ = NitsToPQ(safeBoostedNits);
-    float rollOffStartPQ = NitsToPQ(safeRollOffStartNits);
-    float anchorBoostedPQ = NitsToPQ(safeAnchorBoostedNits);
-    float anchorOutPQ = NitsToPQ(safeAnchorOutNits);
-    float rolledPQ = EvaluateRationalShoulderPQ(boostedPQ, rollOffStartPQ, anchorBoostedPQ, anchorOutPQ);
-
-    return max(PQToLinearBT2100(rolledPQ.xxx).x * 10000.0, 0.0);
-}
-
-float ApplyRationalShoulderToNits(float boostedNits, float originalNits, float rollOffStartNits, float anchorBoostedNits, float anchorOutNits)
-{
-    float rolledNits = EvaluateRationalShoulderNits(boostedNits, rollOffStartNits, anchorBoostedNits, anchorOutNits);
-    return max(rolledNits, originalNits);
-}
-
-float ComputeSceneGainNoRolloff(float currentAPL, float pixelBoostT)
-{
-    float aplPct = saturate(currentAPL) * 100.0;
-    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
     float fader = ComputeAPLBoostFader(currentAPL);
 
     // Build scene compensation in log-gain space so:
@@ -542,8 +680,66 @@ float ComputeSceneGainNoRolloff(float currentAPL, float pixelBoostT)
     //   - strength = 1.0      -> full measured compensation at maximum LUT weight
     //   - strength < 1.0      -> partial compensation
     //   - strength > 1.0      -> intentional over-compensation
-    float gainExponent = max(MaxAPLBoostStrength * pixelBoostT * fader, 0.0);
-    return exp2(log2(measuredComp) * gainExponent);
+    return max(MaxAPLBoostStrength * pixelBoostT * fader, 0.0);
+}
+
+float ComputeSceneLogGainFromMeasuredComp(float measuredComp, float currentAPL, float pixelBoostT)
+{
+    float safeMeasuredComp = max(measuredComp, 1.0);
+    float gainExponent = ComputeSceneGainExponentFromMeasuredComp(safeMeasuredComp, currentAPL, pixelBoostT);
+    return log2(safeMeasuredComp) * gainExponent;
+}
+
+float ComputeSceneLogGainFromAPL(float currentAPL)
+{
+    float aplPct = saturate(currentAPL) * 100.0;
+    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
+    float pixelBoostT = LookupMeasuredBoostT1D(aplPct);
+    return ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL, pixelBoostT);
+}
+
+float EstimateAverageParticipationFromRawAPL(float rawAPL)
+{
+    float meanSceneNits = saturate(rawAPL) * max(APLReferenceWhiteNits, 1.0);
+    return ComputePixelParticipation(max(meanSceneNits, 0.0));
+}
+
+float SolveClosedLoopDisplayAPLFromRaw(float rawAPL)
+{
+    float safeRawAPL = saturate(rawAPL);
+
+    if (safeRawAPL <= 1e-6)
+        return 0.0;
+
+    float avgParticipation = EstimateAverageParticipationFromRawAPL(safeRawAPL);
+    float displayAPL = safeRawAPL;
+
+    [unroll]
+    for (int i = 0; i < 3; ++i)
+    {
+        float sceneLogGain = ComputeSceneLogGainFromAPL(displayAPL);
+        float estimatedDisplayAPL = saturate(safeRawAPL * exp2(sceneLogGain * avgParticipation));
+
+        // Mild damping keeps the closed-loop estimate stable with very short smoothing times.
+        displayAPL = lerp(displayAPL, estimatedDisplayAPL, 0.85);
+    }
+
+    return displayAPL;
+}
+
+
+float ComputeGraphClosedLoopAPLFromRawPercent(float rawAPLPercent)
+{
+    float rawAPL = saturate(rawAPLPercent * 0.01);
+    return SolveClosedLoopDisplayAPLFromRaw(rawAPL);
+}
+
+float ComputeSceneGainNoRolloff(float currentAPL, float pixelBoostT)
+{
+    float aplPct = saturate(currentAPL) * 100.0;
+    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
+    float sceneLogGain = ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL, pixelBoostT);
+    return exp2(sceneLogGain);
 }
 
 float ComputePixelGainNoRolloff(float currentAPL, float inputNits, float pixelBoostT)
@@ -559,7 +755,7 @@ float ComputePixelGainNoRolloff(float currentAPL, float inputNits, float pixelBo
 float SignalLumaToNits(float signalLuma)
 {
     if (APLInputMode == 1)
-        return max(PQToLinearBT2100(signalLuma.xxx).x * 10000.0, 0.0);
+        return max(PQToLinearScalar(signalLuma) * 10000.0, 0.0);
 
     return max(signalLuma, 0.0) * SIGNAL_REFERENCE_NITS;
 }
@@ -610,38 +806,83 @@ float SolveDynamicRollOffStartNits(float currentAPL)
     if (referenceBoostedNits <= referenceInputNits + 1e-4)
         return referenceBoostedNits;
 
-    float anchorOutPQ = NitsToPQ(referenceInputNits);
-    float anchorBoostedPQ = NitsToPQ(referenceBoostedNits);
-    float rollOffStartPQ = ComputeRationalShoulderStartPQ(anchorBoostedPQ, anchorOutPQ);
+    float sourceBlackPQ = PQ_BLACK;
+    float sourceWhitePQ = max(NitsToPQ(referenceBoostedNits), sourceBlackPQ + 1e-6);
+    float targetWhitePQ = min(NitsToPQ(referenceInputNits), sourceWhitePQ - 1e-6);
+    float pqRange = max(sourceWhitePQ - sourceBlackPQ, 1e-6);
+    float maxLum = saturate((targetWhitePQ - sourceBlackPQ) / pqRange);
+    float kneeStart = ComputeBT2390ShapedKneeStart(maxLum, BoostRollOffShape);
+    float rollOffStartPQ = saturate(kneeStart * pqRange + sourceBlackPQ);
 
-    return max(PQToLinearBT2100(rollOffStartPQ.xxx).x * 10000.0, 0.0);
+    return max(PQToLinearScalar(rollOffStartPQ) * 10000.0, 0.0);
 }
 
-float ApplyBoostWithRationalRolloff(float signalLuma, float currentAPL, float pixelBoostT, float rollOffStartNits, float anchorBoostedNits)
+float ApplyBoostWithBT2390Rolloff(float signalLuma, float currentAPL, float pixelBoostT, float anchorBoostedNits)
 {
     float originalNits = SignalLumaToNits(signalLuma);
     float fullyBoostedNits = ComputeBoostedTargetNitsFromBoostTNoRolloff(currentAPL, originalNits, pixelBoostT);
-    float rolledNits = ApplyRationalShoulderToNits(fullyBoostedNits, originalNits, rollOffStartNits, anchorBoostedNits, BoostRollOff);
+    float rollOffEndNits = max(BoostRollOff, 0.0);
+
+    if (rollOffEndNits <= 0.0)
+        return NitsToSignalLuma(fullyBoostedNits);
+
+    float sourcePeakNits = max(anchorBoostedNits, rollOffEndNits + 1e-4);
+    float rolledNits = max(ApplyBT2390EETFToNitsWithShape(fullyBoostedNits, sourcePeakNits, rollOffEndNits, BoostRollOffShape), originalNits);
 
     return NitsToSignalLuma(rolledNits);
 }
 
-float ApplyBoostWithRationalRolloffFromSceneLogGain(float signalLuma, float sceneLogGain, float rollOffStartNits, float anchorBoostedNits)
+float ApplyBoostWithBT2390RolloffFromSceneLogGain(float signalLuma, float sceneLogGain, float anchorBoostedNits)
 {
     float originalNits = SignalLumaToNits(signalLuma);
     float safeOriginalNits = max(originalNits, 0.0);
     float fullyBoostedNits = safeOriginalNits * ComputePixelGainFromSceneLogGain(sceneLogGain, safeOriginalNits);
-    float rolledNits = ApplyRationalShoulderToNits(fullyBoostedNits, safeOriginalNits, rollOffStartNits, anchorBoostedNits, BoostRollOff);
+    float rollOffEndNits = max(BoostRollOff, 0.0);
+
+    if (rollOffEndNits <= 0.0)
+        return NitsToSignalLuma(fullyBoostedNits);
+
+    float sourcePeakNits = max(anchorBoostedNits, rollOffEndNits + 1e-4);
+    float rolledNits = max(ApplyBT2390EETFToNitsWithShape(fullyBoostedNits, sourcePeakNits, rollOffEndNits, BoostRollOffShape), safeOriginalNits);
 
     return NitsToSignalLuma(rolledNits);
 }
 
-float ComputeBoostedTargetNitsFromBoostT(float currentAPL, float inputNits, float pixelBoostT, float rollOffStartNits, float anchorBoostedNits)
+float ApplyBoostWithSelectedRolloff(float signalLuma, float currentAPL, float pixelBoostT, float anchorBoostedNits)
+{
+    return ApplyBoostWithBT2390Rolloff(signalLuma, currentAPL, pixelBoostT, anchorBoostedNits);
+}
+
+float ApplyBoostWithSelectedRolloffFromSceneLogGain(float signalLuma, float sceneLogGain, float anchorBoostedNits)
+{
+    if (APLInputMode == 1)
+    {
+        float originalNits     = PQToLinearScalar(signalLuma) * 10000.0;
+        float safeOriginalNits = max(originalNits, 0.0);
+        float pixelGain        = ComputePixelGainFromSceneLogGain(sceneLogGain, safeOriginalNits);
+        float fullyBoostedNits = safeOriginalNits * pixelGain;
+        float rollOffEndNits   = max(BoostRollOff, 0.0);
+
+        if (rollOffEndNits <= 0.0)
+            return NitsToPQ(fullyBoostedNits);
+
+        float sourcePeakNits   = max(anchorBoostedNits, rollOffEndNits + 1e-4);
+        float rolledPQ = ApplyBT2390EETFToPQWithShape(NitsToPQ(fullyBoostedNits), sourcePeakNits, rollOffEndNits, BoostRollOffShape);
+
+        // The BT.2390 mapping is monotonic in PQ space, so the original-signal floor
+        // can still be enforced directly on the encoded value.
+        return max(rolledPQ, signalLuma);
+    }
+
+    return ApplyBoostWithBT2390RolloffFromSceneLogGain(signalLuma, sceneLogGain, anchorBoostedNits);
+}
+
+float ComputeBoostedTargetNitsFromBoostT(float currentAPL, float inputNits, float pixelBoostT, float anchorBoostedNits)
 {
     float safeInputNits = max(inputNits, 0.0);
     float signalLuma = NitsToSignalLuma(safeInputNits);
 
-    return SignalLumaToNits(ApplyBoostWithRationalRolloff(signalLuma, currentAPL, pixelBoostT, rollOffStartNits, anchorBoostedNits));
+    return SignalLumaToNits(ApplyBoostWithSelectedRolloff(signalLuma, currentAPL, pixelBoostT, anchorBoostedNits));
 }
 
 
@@ -703,6 +944,296 @@ static const float GRAPH_COMP_TABLE_2D[APL_COUNT * NIT_COUNT] =
     3.338411, 3.331323, 3.321922, 3.330550, 3.342307, 3.347892, 3.376754, 3.407354
 };
 
+
+static const int FULLFIELD_100_COUNT = 33;
+
+static const float FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT] =
+{
+    0.000000, 0.011931, 0.054452, 0.138304, 0.282443, 0.521309, 0.865680, 1.384067,
+    2.082348, 3.035066, 4.374848, 6.086059, 8.324707, 11.363916, 15.134164, 19.949442,
+    26.352272, 34.156536, 43.978027, 56.870362, 72.413132, 92.698470, 117.036078, 147.265282,
+    186.502536, 233.369755, 291.383762, 366.488542, 456.037005, 566.771366, 710.083776, 881.023134,
+    998.932000
+};
+
+static const float FULLFIELD_100_MEASURED_NITS[FULLFIELD_100_COUNT] =
+{
+    0.000000, 0.000000, 0.025553, 0.118012, 0.288831, 0.591004, 0.975432, 1.522651,
+    2.381936, 3.378590, 5.068168, 6.945428, 9.627818, 12.967435, 16.961642, 20.195403,
+    23.503979, 30.959431, 35.582524, 38.937325, 42.492201, 45.812047, 49.682839, 59.134684,
+    70.803150, 84.266779, 100.396451, 118.819227, 140.396332, 166.118513, 196.873554, 230.232825,
+    252.021011
+};
+
+
+static const int FULLFIELD_50_COUNT = 33;
+
+static const float FULLFIELD_50_MEASURED_NITS[FULLFIELD_50_COUNT] =
+{
+    0.000000, 0.000000, 0.019611, 0.097831, 0.249949, 0.526106, 0.889249, 1.411673,
+    2.227720, 3.168462, 4.802616, 6.558748, 9.185429, 12.424980, 16.227606, 19.369587,
+    23.859118, 31.436385, 40.137642, 53.197343, 65.392805, 74.547320, 80.127169, 85.519747,
+    92.611297, 100.748551, 119.449653, 140.743873, 167.553173, 195.406956, 234.022413, 272.116401,
+    298.507285
+};
+
+static const int FULLFIELD_25_COUNT = 33;
+
+static const float FULLFIELD_25_MEASURED_NITS[FULLFIELD_25_COUNT] =
+{
+    0.000000, 0.000000, 0.020193, 0.098958, 0.253351, 0.530072, 0.894046, 1.417652,
+    2.236172, 3.175224, 4.814092, 6.578921, 9.210201, 12.453936, 16.233701, 19.360823,
+    24.324769, 31.664910, 40.662945, 53.441695, 68.002699, 88.193059, 111.606274, 135.299708,
+    149.261837, 161.082050, 170.971315, 185.138530, 201.136027, 234.942743, 280.942968, 325.624744,
+    356.448525
+};
+
+static const int FULLFIELD_15_COUNT = 33;
+
+static const float FULLFIELD_15_MEASURED_NITS[FULLFIELD_15_COUNT] =
+{
+    0.000000, 0.000000, 0.024520, 0.114708, 0.280640, 0.581359, 0.958295, 1.494907,
+    2.323773, 3.286472, 4.984005, 6.824739, 9.518044, 12.823650, 16.687334, 19.874191,
+    24.870417, 32.192746, 41.126911, 53.811406, 68.639696, 88.228024, 111.933290, 142.016629,
+    178.322722, 218.856152, 244.621474, 264.975028, 281.601565, 303.076471, 321.154317, 374.958739,
+    407.885700
+};
+
+static const int FULLFIELD_10_COUNT = 33;
+
+static const float FULLFIELD_10_MEASURED_NITS[FULLFIELD_10_COUNT] =
+{
+    0.000000, 0.000000, 0.023311, 0.111391, 0.276822, 0.572010, 0.949903, 1.489990,
+    2.313793, 3.300262, 4.981862, 6.854603, 9.544428, 12.853254, 16.722919, 20.305498,
+    26.128305, 33.665465, 42.636117, 55.207774, 69.932789, 89.672005, 112.739759, 141.994701,
+    180.269676, 227.876442, 287.603899, 341.189386, 373.286063, 401.007822, 427.822267, 459.211151,
+    465.045533
+};
+
+int FindFullFieldWindowInputIndex(float inputNits)
+{
+    int idx = 0;
+    [unroll]
+    for (int i = 0; i < FULLFIELD_100_COUNT - 1; ++i)
+        idx += int(step(FULLFIELD_100_INPUT_NITS[i + 1], inputNits));
+    return min(idx, FULLFIELD_100_COUNT - 2);
+}
+
+float SampleMeasuredOutputNitsFullField100(float targetNits)
+{
+    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
+    int i0 = FindFullFieldWindowInputIndex(clampedNits);
+    int i1 = min(i0 + 1, FULLFIELD_100_COUNT - 1);
+
+    return SegmentLerp(
+        clampedNits,
+        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_100_MEASURED_NITS[i0],
+        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_100_MEASURED_NITS[i1]
+    );
+}
+
+float SampleMeasuredOutputNitsFullField50(float targetNits)
+{
+    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
+    int i0 = FindFullFieldWindowInputIndex(clampedNits);
+    int i1 = min(i0 + 1, FULLFIELD_50_COUNT - 1);
+
+    return SegmentLerp(
+        clampedNits,
+        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_50_MEASURED_NITS[i0],
+        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_50_MEASURED_NITS[i1]
+    );
+}
+
+float SampleMeasuredOutputNitsFullField25(float targetNits)
+{
+    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
+    int i0 = FindFullFieldWindowInputIndex(clampedNits);
+    int i1 = min(i0 + 1, FULLFIELD_25_COUNT - 1);
+
+    return SegmentLerp(
+        clampedNits,
+        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_25_MEASURED_NITS[i0],
+        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_25_MEASURED_NITS[i1]
+    );
+}
+
+float GetFullField100MeasuredMaxInputNits()
+{
+    return FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1];
+}
+
+float GetFullField100MeasuredMaxOutputNits()
+{
+    return FULLFIELD_100_MEASURED_NITS[FULLFIELD_100_COUNT - 1];
+}
+
+float GetFullField50MeasuredMaxInputNits()
+{
+    return FULLFIELD_100_INPUT_NITS[FULLFIELD_50_COUNT - 1];
+}
+
+float GetFullField50MeasuredMaxOutputNits()
+{
+    return FULLFIELD_50_MEASURED_NITS[FULLFIELD_50_COUNT - 1];
+}
+
+float GetFullField25MeasuredMaxInputNits()
+{
+    return FULLFIELD_100_INPUT_NITS[FULLFIELD_25_COUNT - 1];
+}
+
+float GetFullField25MeasuredMaxOutputNits()
+{
+    return FULLFIELD_25_MEASURED_NITS[FULLFIELD_25_COUNT - 1];
+}
+
+float GetFullField15MeasuredMaxInputNits()
+{
+    return FULLFIELD_100_INPUT_NITS[FULLFIELD_15_COUNT - 1];
+}
+
+float GetFullField15MeasuredMaxOutputNits()
+{
+    return FULLFIELD_15_MEASURED_NITS[FULLFIELD_15_COUNT - 1];
+}
+
+float GetFullField10MeasuredMaxInputNits()
+{
+    return FULLFIELD_100_INPUT_NITS[FULLFIELD_10_COUNT - 1];
+}
+
+float GetFullField10MeasuredMaxOutputNits()
+{
+    return FULLFIELD_10_MEASURED_NITS[FULLFIELD_10_COUNT - 1];
+}
+
+float ComputeFullField100APLFromInputNits(float inputNits)
+{
+    return saturate(max(inputNits, 0.0) / max(APLReferenceWhiteNits, 1e-4));
+}
+
+float ComputeFullField50APLFromInputNits(float inputNits)
+{
+    return saturate(max(inputNits, 0.0) * 0.5 / max(APLReferenceWhiteNits, 1e-4));
+}
+
+float ComputeFullField25APLFromInputNits(float inputNits)
+{
+    return saturate(max(inputNits, 0.0) * 0.25 / max(APLReferenceWhiteNits, 1e-4));
+}
+
+float ComputeFullField15APLFromInputNits(float inputNits)
+{
+    return saturate(max(inputNits, 0.0) * 0.15 / max(APLReferenceWhiteNits, 1e-4));
+}
+
+float ComputeFullField10APLFromInputNits(float inputNits)
+{
+    return saturate(max(inputNits, 0.0) * 0.10 / max(APLReferenceWhiteNits, 1e-4));
+}
+
+float ComputeFullField100RemappedTargetNits(float inputNits)
+{
+    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField100APLFromInputNits(inputNits));
+    float pixelBoostT = LookupMeasuredBoostT1D(currentAPL * 100.0);
+    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
+
+    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), pixelBoostT, anchorBoostedNits);
+}
+
+float ComputeFullField50RemappedTargetNits(float inputNits)
+{
+    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField50APLFromInputNits(inputNits));
+    float pixelBoostT = LookupMeasuredBoostT1D(currentAPL * 100.0);
+    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
+
+    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), pixelBoostT, anchorBoostedNits);
+}
+
+float ComputeFullField25RemappedTargetNits(float inputNits)
+{
+    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField25APLFromInputNits(inputNits));
+    float pixelBoostT = LookupMeasuredBoostT1D(currentAPL * 100.0);
+    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
+
+    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), pixelBoostT, anchorBoostedNits);
+}
+
+float ComputeFullField15RemappedTargetNits(float inputNits)
+{
+    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField15APLFromInputNits(inputNits));
+    float pixelBoostT = LookupMeasuredBoostT1D(currentAPL * 100.0);
+    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
+
+    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), pixelBoostT, anchorBoostedNits);
+}
+
+float ComputeFullField10RemappedTargetNits(float inputNits)
+{
+    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField10APLFromInputNits(inputNits));
+    float pixelBoostT = LookupMeasuredBoostT1D(currentAPL * 100.0);
+    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
+
+    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), pixelBoostT, anchorBoostedNits);
+}
+
+float SampleProjectedOutputNitsFullField100(float inputNits)
+{
+    float remappedTargetNits = ComputeFullField100RemappedTargetNits(inputNits);
+    return SampleMeasuredOutputNitsFullField100(remappedTargetNits);
+}
+
+float SampleProjectedOutputNitsFullField50(float inputNits)
+{
+    float remappedTargetNits = ComputeFullField50RemappedTargetNits(inputNits);
+    return SampleMeasuredOutputNitsFullField50(remappedTargetNits);
+}
+
+float SampleProjectedOutputNitsFullField25(float inputNits)
+{
+    float remappedTargetNits = ComputeFullField25RemappedTargetNits(inputNits);
+    return SampleMeasuredOutputNitsFullField25(remappedTargetNits);
+}
+
+float SampleMeasuredOutputNitsFullField15(float targetNits)
+{
+    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
+    int i0 = FindFullFieldWindowInputIndex(clampedNits);
+    int i1 = min(i0 + 1, FULLFIELD_15_COUNT - 1);
+
+    return SegmentLerp(
+        clampedNits,
+        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_15_MEASURED_NITS[i0],
+        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_15_MEASURED_NITS[i1]
+    );
+}
+
+float SampleProjectedOutputNitsFullField15(float inputNits)
+{
+    float remappedTargetNits = ComputeFullField15RemappedTargetNits(inputNits);
+    return SampleMeasuredOutputNitsFullField15(remappedTargetNits);
+}
+
+float SampleMeasuredOutputNitsFullField10(float targetNits)
+{
+    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
+    int i0 = FindFullFieldWindowInputIndex(clampedNits);
+    int i1 = min(i0 + 1, FULLFIELD_10_COUNT - 1);
+
+    return SegmentLerp(
+        clampedNits,
+        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_10_MEASURED_NITS[i0],
+        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_10_MEASURED_NITS[i1]
+    );
+}
+
+float SampleProjectedOutputNitsFullField10(float inputNits)
+{
+    float remappedTargetNits = ComputeFullField10RemappedTargetNits(inputNits);
+    return SampleMeasuredOutputNitsFullField10(remappedTargetNits);
+}
+
 float GraphTableComp2D(int aplIdx, int nitIdx)
 {
     return GRAPH_COMP_TABLE_2D[aplIdx * NIT_COUNT + nitIdx];
@@ -716,15 +1247,10 @@ float GetGraphMeasuredMaxInputNits()
 int FindNitIndex(float inputNits)
 {
     int idx = 0;
-
-    [loop]
+    [unroll]
     for (int i = 0; i < NIT_COUNT - 1; ++i)
-    {
-        if (inputNits >= NIT_POINTS[i + 1])
-            idx = i + 1;
-    }
-
-    return clamp(idx, 0, NIT_COUNT - 2);
+        idx += int(step(NIT_POINTS[i + 1], inputNits));
+    return min(idx, NIT_COUNT - 2);
 }
 
 float LookupGraphCompForAPLRow2D(int aplIdx, float inputNits)
@@ -765,13 +1291,13 @@ float SampleApproxMeasuredOutputNitsForAPL(float aplPct, float targetNits)
     return targetNits / comp;
 }
 
-float ComputeGraphBoostedTargetNitsWithStart(float aplPct, float inputNits, float rollOffStartNits, float anchorBoostedNits)
+float ComputeGraphBoostedTargetNits(float aplPct, float inputNits, float anchorBoostedNits)
 {
     float currentAPL = saturate(aplPct / 100.0);
     float safeInputNits = max(inputNits, 0.0);
     float pixelBoostT = LookupMeasuredBoostT1D(aplPct);
 
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, safeInputNits, pixelBoostT, rollOffStartNits, anchorBoostedNits);
+    return ComputeBoostedTargetNitsFromBoostT(currentAPL, safeInputNits, pixelBoostT, anchorBoostedNits);
 }
 
 float GetAPLMaxMeasuredNits(float aplPct)
@@ -792,6 +1318,11 @@ float SampleCorrectedOutputNitsForAPL(float aplPct, float boostedTargetNits, flo
 {
     float comp = max(LookupMeasuredComp2DGraph(aplPct, boostedTargetNits), 1e-6);
     return min(boostedTargetNits / comp, maxMeasuredNits);
+}
+
+float ComputeBT2390ReferenceOutputNits(float inputNits, float sourcePeakNits, float targetPeakNits)
+{
+    return ApplyBT2390EETFToNits(inputNits, sourcePeakNits, targetPeakNits);
 }
 
 float GraphAxisCoordinateWithPQMax(float nits, float axisMaxNits, float axisMaxPQ)
@@ -821,7 +1352,7 @@ float GraphTickValueFromFractionWithPQMax(float frac, float axisMaxNits, float a
         return safeAxisMaxNits * safeFrac;
 
     float tickPQ = axisMaxPQ * safeFrac;
-    return max(PQToLinearBT2100(tickPQ.xxx).x * 10000.0, 0.0);
+    return max(PQToLinearScalar(tickPQ) * 10000.0, 0.0);
 }
 
 float GraphTickValueFromFraction(float frac, float axisMaxNits)
@@ -959,7 +1490,6 @@ float DrawNumberCentered(float2 texcoord, float2 centerTop, float scale, float a
 
 float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 {
-    const int GRAPH_CURVE_SAMPLES = 64;
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float2 p = texcoord;
     p.x *= aspect;
@@ -980,12 +1510,16 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
     float digitStepScaled = labelScale * 0.82;
     float margin = thickness * 5.0;
 
-    float graphAPLPercent = clamp(GraphAPLIndex, 0.0, 100.0);
-    float graphCurrentAPL = saturate(graphAPLPercent / 100.0);
-    float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1000.0, 10000.0);
+    float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
+    bool useFullFieldWindowProjection = GraphUseFullFieldWindowProjection;
+    bool useFullField50Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 1);
+    bool useFullField25Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 2);
+    bool useFullField15Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 3);
+    bool useFullField10Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 4);
     float4 graphParams = tex2Dlod(SamplerGraphParams, float4(0.5, 0.5, 0.0, 0.0));
-    float graphRollOffStartNits = graphParams.r;
-    float graphMaxMeasuredNits = graphParams.g;
+    float graphMaxMeasuredNits = useFullFieldWindowProjection
+        ? (useFullField10Projection ? GetFullField10MeasuredMaxOutputNits() : (useFullField15Projection ? GetFullField15MeasuredMaxOutputNits() : (useFullField25Projection ? GetFullField25MeasuredMaxOutputNits() : (useFullField50Projection ? GetFullField50MeasuredMaxOutputNits() : GetFullField100MeasuredMaxOutputNits()))))
+        : graphParams.g;
     float graphAxisMaxPQ = GraphUsePQSpace ? max(graphParams.b, 1e-6) : 0.0;
 
     float graphXMin = graphMin.x - margin;
@@ -1006,17 +1540,7 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
     if (p.x < min(yLabelMinX, xLabelMinX) || p.x > max(graphXMax, xLabelMaxX))
         return sceneColor;
 
-    float maxRemappedNits = graphAxisMaxNits;
-    float graphAnchorBoostedNits = graphParams.a;
-
     bool inGraphX = (p.x >= graphXMin && p.x <= graphXMax);
-
-    if (inGraphX)
-    {
-        maxRemappedNits = ComputeGraphBoostedTargetNitsWithStart(graphAPLPercent, graphAxisMaxNits, graphRollOffStartNits, graphAnchorBoostedNits);
-        float overflowCoord = max(GraphAxisCoordinateWithPQMax(maxRemappedNits, graphAxisMaxNits, graphAxisMaxPQ) - 1.0, 0.0);
-        float overflowHeight = graphSize.y * overflowCoord;
-    }
 
     bool inGraphCore = inGraphX && (p.y >= graphMin.y - margin) && (p.y <= graphMax.y + margin);
     bool inXLabelRegion = (p.x >= xLabelMinX) && (p.x <= xLabelMaxX) && (p.y >= xLabelMinY) && (p.y <= xLabelMaxY);
@@ -1032,6 +1556,7 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
     float tickMask = 0.0;
     float labelMask = 0.0;
     float refMask = 0.0;
+    float idealPQRefMask = 0.0;
     float measuredMask = 0.0;
     float remappedMask = 0.0;
     float correctedMask = 0.0;
@@ -1040,53 +1565,61 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
     {
         frameMask = DrawGraphRect(p, graphMin, graphMax, thickness);
 
+        // Grid lines: indices 0–8 (vertical) and 9–17 (horizontal).
+        // All endpoints precomputed in PS_CalcGraphLines — zero NitsToPQ/pow here.
         [unroll]
-        for (int i = 1; i < 10; i++)
+        for (int i = 0; i < 9; i++)
         {
-            float tickValue = GraphTickValueFromFractionWithPQMax(float(i) / 10.0, graphAxisMaxNits, graphAxisMaxPQ);
-            float2 v0 = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, tickValue, 0.0);
-            float2 v1 = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, tickValue, graphAxisMaxNits);
-            float2 h0 = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, 0.0, tickValue);
-            float2 h1 = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, graphAxisMaxNits, tickValue);
-
-            gridMask += DrawGraphLine(p, v0, v1, gridThickness) * 0.32;
-            gridMask += DrawGraphLine(p, h0, h1, gridThickness) * 0.32;
+            float uV = (float(i)     + 0.5) / float(GRAPH_LINE_COUNT);
+            float uH = (float(i + 9) + 0.5) / float(GRAPH_LINE_COUNT);
+            float4 segV = tex2Dlod(SamplerGraphLines, float4(uV, 0.5, 0.0, 0.0));
+            float4 segH = tex2Dlod(SamplerGraphLines, float4(uH, 0.5, 0.0, 0.0));
+            gridMask += DrawGraphLine(p, segV.xy, segV.zw, gridThickness) * 0.32;
+            gridMask += DrawGraphLine(p, segH.xy, segH.zw, gridThickness) * 0.32;
         }
 
+        // Tick marks: x-ticks at indices 18–23, y-ticks at 24–29.
         [unroll]
-        for (int i = 0; i <= 5; i++)
+        for (int i = 0; i < 6; i++)
         {
-            float tickFrac = float(i) / 5.0;
-            float tickValue = GraphTickValueFromFractionWithPQMax(tickFrac, graphAxisMaxNits, graphAxisMaxPQ);
-            int tickLabel = (int)round(tickValue);
-
-            float2 xTick = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, tickValue, 0.0);
-            float2 yTick = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, 0.0, tickValue);
-
-            tickMask += DrawGraphLine(p, xTick + float2(0.0, -tickLen), xTick, tickThickness);
-            tickMask += DrawGraphLine(p, yTick, yTick + float2(tickLen, 0.0), tickThickness);
+            float uX = (float(i + 18) + 0.5) / float(GRAPH_LINE_COUNT);
+            float uY = (float(i + 24) + 0.5) / float(GRAPH_LINE_COUNT);
+            float4 segX = tex2Dlod(SamplerGraphLines, float4(uX, 0.5, 0.0, 0.0));
+            float4 segY = tex2Dlod(SamplerGraphLines, float4(uY, 0.5, 0.0, 0.0));
+            tickMask += DrawGraphLine(p, segX.xy, segX.zw, tickThickness);
+            tickMask += DrawGraphLine(p, segY.xy, segY.zw, tickThickness);
         }
 
-        refMask = DrawGraphDashedLine(
-            p,
-            ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, 0.0, 0.0),
-            ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, graphAxisMaxNits, graphAxisMaxNits),
-            refThickness,
-            22.0
-        );
+        // Identity reference dashed line: index 30.
+        {
+            float uRef = (30.0 + 0.5) / float(GRAPH_LINE_COUNT);
+            float4 segRef = tex2Dlod(SamplerGraphLines, float4(uRef, 0.5, 0.0, 0.0));
+            refMask = DrawGraphDashedLine(p, segRef.xy, segRef.zw, refThickness, 22.0);
+        }
+
     }
 
     if (inXLabelRegion || inYLabelRegion)
     {
         [unroll]
-        for (int i = 0; i <= 5; i++)
+        for (int i = 0; i < 6; i++)
         {
-            float tickFrac = float(i) / 5.0;
-            float tickValue = GraphTickValueFromFractionWithPQMax(tickFrac, graphAxisMaxNits, graphAxisMaxPQ);
-            int tickLabel = (int)round(tickValue);
+            // Fetch x-tick (idx 18+i) and y-tick (idx 24+i) endpoints from precomputed texture.
+            // xTick = segX.zw (the 'b' endpoint = the tick base on the axis).
+            // yTick = segY.xy (the 'a' endpoint = the tick base on the axis).
+            float uX = (float(i + 18) + 0.5) / float(GRAPH_LINE_COUNT);
+            float uY = (float(i + 24) + 0.5) / float(GRAPH_LINE_COUNT);
+            float4 segX = tex2Dlod(SamplerGraphLines, float4(uX, 0.5, 0.0, 0.0));
+            float4 segY = tex2Dlod(SamplerGraphLines, float4(uY, 0.5, 0.0, 0.0));
+            float2 xTick = segX.zw; // 'b' endpoint is the base of the x-tick (on the axis line)
+            float2 yTick = segY.xy; // 'a' endpoint is the base of the y-tick (on the axis line)
 
-            float2 xTick = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, tickValue, 0.0);
-            float2 yTick = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, 0.0, tickValue);
+            // tickValue in nits is needed only for the integer label.
+            // GraphTickValueFromFractionWithPQMax is cheap in linear-space mode; in PQ mode
+            // it calls PQToLinearScalar but this block is gated by inXLabelRegion/inYLabelRegion
+            // which is a small strip — the pow cost here is acceptable and unavoidable.
+            float tickValue = GraphTickValueFromFractionWithPQMax(float(i) / 5.0, graphAxisMaxNits, graphAxisMaxPQ);
+            int tickLabel = (int)round(tickValue);
 
             if (inXLabelRegion)
             {
@@ -1104,45 +1637,51 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
     if (inGraphCore)
     {
+        // -------------------------------------------------------------------
+        // Curve drawing — all segment endpoints precomputed in PS_CalcGraphCurves.
+        // Each texel = float4(ax, ay, bx, by) in p-space (texcoord with x*=aspect).
+        // Sentinels (x < 0) mark segments to skip (invalid range or disabled curve).
+        // Per-pixel cost: GRAPH_CURVE_SAMPLES tex fetches + DrawGraphLine bbox tests.
+        // All expensive LUT math + NitsToPQ/pow moved to the 64x4 precompute pass.
+        // -------------------------------------------------------------------
         [loop]
         for (int s = 0; s < GRAPH_CURVE_SAMPLES - 1; ++s)
         {
-            float t0 = float(s) / float(GRAPH_CURVE_SAMPLES - 1);
-            float t1 = float(s + 1) / float(GRAPH_CURVE_SAMPLES - 1);
+            float u = (float(s) + 0.5) / float(GRAPH_CURVE_SAMPLES);
 
-            float x0 = GraphSampleNitsFromFraction(t0, graphAxisMaxNits, graphAxisMaxPQ);
-            float x1 = GraphSampleNitsFromFraction(t1, graphAxisMaxNits, graphAxisMaxPQ);
-
-            float y0Remapped = ComputeGraphBoostedTargetNitsWithStart(graphAPLPercent, x0, graphRollOffStartNits, graphAnchorBoostedNits);
-            float y1Remapped = ComputeGraphBoostedTargetNitsWithStart(graphAPLPercent, x1, graphRollOffStartNits, graphAnchorBoostedNits);
-
-            float2 aRemapped = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0Remapped);
-            float2 bRemapped = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1Remapped);
-            remappedMask = max(remappedMask, DrawGraphLine(p, aRemapped, bRemapped, curveThickness * 0.95));
-
-            if (inGraphCore)
+            // Remapped (green) curve — APL mode only; precompute stores sentinel in window mode
+            if (!useFullFieldWindowProjection)
             {
-                float y0Corrected = SampleCorrectedOutputNitsForAPL(graphAPLPercent, y0Remapped, graphMaxMeasuredNits);
-                float y1Corrected = SampleCorrectedOutputNitsForAPL(graphAPLPercent, y1Remapped, graphMaxMeasuredNits);
+                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.125, 0.0, 0.0));
+                if (seg.x >= 0.0)
+                    remappedMask = max(remappedMask, DrawGraphLine(p, seg.xy, seg.zw, curveThickness * 0.95));
+            }
 
-                float measuredMaxInputNits = GetGraphMeasuredMaxInputNits();
+            // Corrected / gray projected-output curve
+            {
+                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.375, 0.0, 0.0));
+                if (seg.x >= 0.0)
+                    correctedMask = max(correctedMask, DrawGraphLine(p, seg.xy, seg.zw, curveThickness));
+            }
 
-                if (x0 < measuredMaxInputNits)
-                {
-                    float mx0 = x0;
-                    float mx1 = min(x1, measuredMaxInputNits);
-                    float my0 = SampleRealMeasuredOutputNitsForAPL(graphAPLPercent, mx0);
-                    float my1 = SampleRealMeasuredOutputNitsForAPL(graphAPLPercent, mx1);
+            // Measured raw / light-blue curve
+            {
+                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.625, 0.0, 0.0));
+                if (seg.x >= 0.0)
+                    measuredMask = max(measuredMask, DrawGraphLine(p, seg.xy, seg.zw, curveThickness));
+            }
+        }
 
-                    float2 aMeasured = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, mx0, my0);
-                    float2 bMeasured = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, mx1, my1);
-                    measuredMask = max(measuredMask, DrawGraphLine(p, aMeasured, bMeasured, curveThickness));
-                }
-
-                float2 aCorrected = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0Corrected);
-                float2 bCorrected = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1Corrected);
-
-                correctedMask = max(correctedMask, DrawGraphLine(p, aCorrected, bCorrected, curveThickness));
+        // BT.2390 reference (magenta dashed) — row 3; precompute stores sentinels when disabled
+        if (GraphShowBT2390Reference && max(graphMaxMeasuredNits, 0.0) > 0.0)
+        {
+            [loop]
+            for (int s = 0; s < GRAPH_CURVE_SAMPLES - 1; ++s)
+            {
+                float u = (float(s) + 0.5) / float(GRAPH_CURVE_SAMPLES);
+                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.875, 0.0, 0.0));
+                if (seg.x >= 0.0)
+                    idealPQRefMask = max(idealPQRefMask, DrawGraphDashedLine(p, seg.xy, seg.zw, refThickness * 0.95, 18.0));
             }
         }
     }
@@ -1154,10 +1693,22 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
     graphColor = lerp(graphColor, float3(0.90, 0.90, 0.90) * OSDBrightness * 1.45, saturate(tickMask) * GraphOpacity);
     graphColor = lerp(graphColor, float3(1.0, 1.0, 1.0) * OSDBrightness * 1.8, saturate(frameMask) * GraphOpacity);
     graphColor = lerp(graphColor, float3(0.85, 0.85, 0.85) * OSDBrightness * 1.7, saturate(labelMask) * saturate(GraphOpacity + 0.05));
+    float measuredMaskSat = saturate(measuredMask);
+    float correctedMaskSat = saturate(correctedMask);
+    float overlapMask = useFullFieldWindowProjection ? min(measuredMaskSat, correctedMaskSat) : 0.0;
+    float measuredExclusiveMask = useFullFieldWindowProjection ? saturate(measuredMaskSat - overlapMask) : measuredMaskSat;
+    float correctedExclusiveMask = useFullFieldWindowProjection ? saturate(correctedMaskSat - overlapMask) : correctedMaskSat;
+
+    float3 measuredCurveColor = float3(0.62, 0.82, 1.00);
+    float3 correctedCurveColor = float3(0.62, 0.62, 0.62);
+    float3 overlapCurveColor = float3(0.30, 0.88, 0.42);
+
     graphColor = lerp(graphColor, float3(0.40, 0.65, 1.00) * OSDBrightness * 2.0, saturate(refMask) * GraphOpacity);
-    graphColor = lerp(graphColor, float3(0.62, 0.82, 1.00) * OSDBrightness * 1.95, saturate(measuredMask) * saturate(GraphOpacity * 0.95));
+    graphColor = lerp(graphColor, float3(1.00, 0.35, 0.92) * OSDBrightness * 2.0, saturate(idealPQRefMask) * saturate(GraphOpacity + 0.02));
+    graphColor = lerp(graphColor, measuredCurveColor * OSDBrightness * 1.95, measuredExclusiveMask * saturate(GraphOpacity * 0.95));
     graphColor = lerp(graphColor, float3(0.30, 0.88, 0.42) * OSDBrightness * 1.55, saturate(remappedMask) * saturate(GraphOpacity + 0.06));
-    graphColor = lerp(graphColor, float3(0.62, 0.62, 0.62) * OSDBrightness * 1.65, saturate(correctedMask) * saturate(GraphOpacity + 0.20));
+    graphColor = lerp(graphColor, correctedCurveColor * OSDBrightness * 1.85, correctedExclusiveMask * saturate(GraphOpacity + 0.20));
+    graphColor = lerp(graphColor, overlapCurveColor * OSDBrightness * 1.95, overlapMask * saturate(GraphOpacity + 0.20));
 
     return saturate(graphColor);
 }
@@ -1174,8 +1725,8 @@ float4 PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Ta
     float invSteps = 1.0 / float(steps);
 
     float totalMetric = 0.0;
-    float totalSamples = 0.0;
     float maxSampledRawLuma = 0.0;
+    float invTotalSamples = invSteps * invSteps; // steps*steps samples total; multiply is cheaper than divide per-loop
 
     [loop]
     for (int x = 0; x < MAX_GRID_SIZE; ++x)
@@ -1192,13 +1743,25 @@ float4 PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Ta
             float2 sampleUV = (float2(float(x), float(y)) + 0.5) * invSteps;
             float3 color = tex2Dlod(ReShade::BackBuffer, float4(sampleUV, 0.0, 0.0)).rgb;
 
-            maxSampledRawLuma = max(maxSampledRawLuma, GetLuma709(max(color, 0.0.xxx)));
-            totalMetric += GetAPLMetricSample(color);
-            totalSamples += 1.0;
+            if (APLInputMode == 1)
+            {
+                // PQ mode: maxSampledRawLuma tracks 709 luma of the raw PQ-encoded signal
+                // (intentionally different from the decoded metric). No redundancy.
+                maxSampledRawLuma = max(maxSampledRawLuma, GetLuma709(max(color, 0.0.xxx)));
+                totalMetric += GetAPLMetricSample(color);
+            }
+            else
+            {
+                // scRGB mode: both maxSampledRawLuma and GetAPLMetricSample use
+                // GetLuma709(max(color,0)) — compute once and reuse.
+                float luma709 = GetLuma709(max(color, 0.0.xxx));
+                maxSampledRawLuma = max(maxSampledRawLuma, luma709);
+                totalMetric += saturate(luma709 * SIGNAL_REFERENCE_NITS / max(APLReferenceWhiteNits, 1.0));
+            }
         }
     }
 
-    float apl = totalMetric / max(totalSamples, 1.0);
+    float apl = totalMetric * invTotalSamples;
 
     // r = raw current-frame APL metric, g = max sampled raw luma, a = valid
     return float4(apl, maxSampledRawLuma, 0.0, 1.0);
@@ -1214,18 +1777,20 @@ float4 PS_SmoothAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_
     float4 currentData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
     float4 prevData = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0));
 
-    float currentAPL = saturate(currentData.r);
+    float rawAPL = saturate(currentData.r);
+    float closedLoopCurrentAPL = SolveClosedLoopDisplayAPLFromRaw(rawAPL);
     float prevAPLRaw = prevData.r;
     float prevSmoothedAPL = saturate(prevAPLRaw);
 
     float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
     float hasPrev = (prevData.a > 0.5 && prevAPLRaw >= 0.0 && prevAPLRaw <= 1.0) ? 1.0 : 0.0;
 
-    float smoothedAPL = lerp(currentAPL, lerp(prevSmoothedAPL, currentAPL, alpha), hasPrev);
+    float smoothedAPL = lerp(closedLoopCurrentAPL, lerp(prevSmoothedAPL, closedLoopCurrentAPL, alpha), hasPrev);
     float dynamicRollOffStartNits = SolveDynamicRollOffStartNits(smoothedAPL);
     float rollOffAnchorBoostedNits = ComputeRollOffAnchorBoostedNits(smoothedAPL);
 
-    // r = smoothed APL metric, g = current max sampled raw luma, b = dynamic roll off start from smoothed APL, a = boosted anchor nits used by the PQ rational shoulder
+    // r = smoothed closed-loop display-side APL metric, g = current max sampled raw luma,
+    // b = dynamic roll off start from smoothed APL, a = boosted anchor nits used by the PQ rational shoulder
     return float4(smoothedAPL, currentData.g, dynamicRollOffStartNits, rollOffAnchorBoostedNits);
 }
 
@@ -1301,28 +1866,27 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float currentAPL, fl
     return lerp(sceneColor, textColor, saturate(textMask));
 }
 
-// PASS 2: Main Rendering (1D APL-only measured scene gain + hybrid luminance participation)
+// PASS 2b: Main Rendering (1D APL-only measured scene gain + hybrid luminance participation)
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
     float pixelLuma = GetSignalLuma(color);
     float safePixelLuma = (APLInputMode == 1) ? pixelLuma : max(pixelLuma, 0.0);
 
-    float4 aplData = tex2D(SamplerAPL, float2(0.5, 0.5));
+    float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
     float currentAPL = aplData.r;
-    float dynamicRollOffStartNits = aplData.b;
 
     float aplPct = saturate(currentAPL) * 100.0;
     float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
     float pixelBoostT = ShapeBoostT(MeasuredCompToBoostT(measuredComp));
     float fader = ComputeAPLBoostFader(currentAPL);
-    float sceneGainExponent = max(MaxAPLBoostStrength * pixelBoostT * fader, 0.0);
-    float sceneLogGain = log2(measuredComp) * sceneGainExponent;
+    float sceneGainExponent = ComputeSceneGainExponentFromMeasuredComp(measuredComp, currentAPL, pixelBoostT);
+    float sceneLogGain = ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL, pixelBoostT);
 
     if (sceneGainExponent <= 0.0 && abs(SaturationComp - 1.0) <= 1e-6 && (ShowOSD == false))
         return float4(color, 1.0);
 
-    float boostedLuma = ApplyBoostWithRationalRolloffFromSceneLogGain(safePixelLuma, sceneLogGain, dynamicRollOffStartNits, aplData.a);
+    float boostedLuma = ApplyBoostWithSelectedRolloffFromSceneLogGain(safePixelLuma, sceneLogGain, aplData.a);
 
     float chromaScale = lerp(1.0, SaturationComp, fader);
     float3 chroma = (color - safePixelLuma.xxx) * chromaScale;
@@ -1341,15 +1905,230 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
 #if ENABLE_APL_GRAPH
 float4 PS_CalcGraphParams(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
-    float graphAPLPercent = clamp(GraphAPLIndex, 0.0, 100.0);
-    float graphCurrentAPL = saturate(graphAPLPercent / 100.0);
-    float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1000.0, 10000.0);
+    float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
     float graphAxisMaxPQ = GraphUsePQSpace ? max(NitsToPQ(graphAxisMaxNits), 1e-6) : 0.0;
-    float graphRollOffStartNits = SolveDynamicRollOffStartNits(graphCurrentAPL);
-    float maxMeasuredNits = GetAPLMaxMeasuredNits(graphAPLPercent);
-    float graphAnchorBoostedNits = ComputeRollOffAnchorBoostedNits(graphCurrentAPL);
+
+    if (GraphUseFullFieldWindowProjection)
+    {
+        return float4(0.0, 0.0, graphAxisMaxPQ, 0.0);
+    }
+
+    float graphRawAPLPercent = clamp(GraphAPLIndex, 0.0, 100.0);
+    float graphClosedLoopAPL = ComputeGraphClosedLoopAPLFromRawPercent(graphRawAPLPercent);
+    float graphClosedLoopAPLPercent = graphClosedLoopAPL * 100.0;
+    float graphRollOffStartNits = SolveDynamicRollOffStartNits(graphClosedLoopAPL);
+    float maxMeasuredNits = GetAPLMaxMeasuredNits(graphClosedLoopAPLPercent);
+    float graphAnchorBoostedNits = ComputeRollOffAnchorBoostedNits(graphClosedLoopAPL);
 
     return float4(graphRollOffStartNits, maxMeasuredNits, graphAxisMaxPQ, graphAnchorBoostedNits);
+}
+
+// GRAPH PASS 1b: Precompute grid/tick/ref line screen-space endpoints (32 pixels — free).
+// Eliminates ~200 NitsToPQ/pow calls per inGraphCore pixel in the fullscreen draw pass.
+float4 PS_CalcGraphLines(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    int idx = int(vpos.x);
+
+    float aspect       = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
+    float2 graphPos    = float2(0.055 * aspect, 0.48);
+    float2 graphSize   = float2(0.43  * aspect, 0.44);
+    float2 graphMin    = graphPos;
+    float2 graphMax    = graphPos + graphSize;
+    float  thickness   = 0.00105;
+    float  tickLen     = graphSize.y * 0.018;
+
+    float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
+    float4 graphParams     = tex2Dlod(SamplerGraphParams, float4(0.5, 0.5, 0.0, 0.0));
+    float  graphAxisMaxPQ  = GraphUsePQSpace ? max(graphParams.b, 1e-6) : 0.0;
+
+    float2 a = 0.0, b = 0.0;
+
+    if (idx < 9) // grid vertical lines i=1..9
+    {
+        int i = idx + 1;
+        float tickValue = GraphTickValueFromFractionWithPQMax(float(i) / 10.0, graphAxisMaxNits, graphAxisMaxPQ);
+        a = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, tickValue, 0.0);
+        b = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, tickValue, graphAxisMaxNits);
+    }
+    else if (idx < 18) // grid horizontal lines i=1..9
+    {
+        int i = idx - 9 + 1;
+        float tickValue = GraphTickValueFromFractionWithPQMax(float(i) / 10.0, graphAxisMaxNits, graphAxisMaxPQ);
+        a = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, 0.0,           tickValue);
+        b = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, graphAxisMaxNits, tickValue);
+    }
+    else if (idx < 24) // x-tick marks i=0..5
+    {
+        int i = idx - 18;
+        float tickValue = GraphTickValueFromFractionWithPQMax(float(i) / 5.0, graphAxisMaxNits, graphAxisMaxPQ);
+        float2 xTick = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, tickValue, 0.0);
+        a = xTick + float2(0.0, -tickLen);
+        b = xTick;
+    }
+    else if (idx < 30) // y-tick marks i=0..5
+    {
+        int i = idx - 24;
+        float tickValue = GraphTickValueFromFractionWithPQMax(float(i) / 5.0, graphAxisMaxNits, graphAxisMaxPQ);
+        float2 yTick = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, 0.0, tickValue);
+        a = yTick;
+        b = yTick + float2(tickLen, 0.0);
+    }
+    else if (idx == 30) // identity reference dashed line
+    {
+        a = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, 0.0,             0.0);
+        b = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, graphAxisMaxNits, graphAxisMaxNits);
+    }
+    else // idx == 31 — padding sentinel
+    {
+        return float4(-1.0, -1.0, -1.0, -1.0);
+    }
+
+    return float4(a, b);
+}
+
+// GRAPH PASS 2: Precompute all curve segment endpoints (64 x 4 = 256 pixels — free).
+//
+// Each texel (s, row) stores float4(ax, ay, bx, by) in p-space screen coords
+// (texcoord with p.x *= aspect) for curve segment s, row = GCURVE_* index.
+// Sentinel float4(-1,-1,-1,-1) marks segments to skip in the draw pass.
+//
+// This removes all expensive LUT math + NitsToPQ/pow calls from the fullscreen
+// PS_DebugOverlay pass.  The per-pixel draw loop only does tex fetches + DrawGraphLine.
+float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    static const float4 SENTINEL = float4(-1.0, -1.0, -1.0, -1.0);
+
+    int s   = int(vpos.x);   // 0 .. GRAPH_CURVE_SAMPLES-1
+    int row = int(vpos.y);   // 0 .. 3
+
+    // Only segments 0..62 are valid; column 63 is a pad, never fetched by the draw pass.
+    if (s >= GRAPH_CURVE_SAMPLES - 1)
+        return SENTINEL;
+
+    // --- Shared graph layout (must exactly match DrawAPLGraphOverlay) ---
+    float aspect       = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
+    float2 graphPos    = float2(0.055 * aspect, 0.48);
+    float2 graphSize   = float2(0.43  * aspect, 0.44);
+    float thickness    = 0.00105;
+    float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
+
+    float4 graphParams               = tex2Dlod(SamplerGraphParams, float4(0.5, 0.5, 0.0, 0.0));
+    float  graphAxisMaxPQ            = GraphUsePQSpace ? max(graphParams.b, 1e-6) : 0.0;
+    float  graphRawAPLPercent        = clamp(GraphAPLIndex, 0.0, 100.0);
+    float  graphClosedLoopAPL        = ComputeGraphClosedLoopAPLFromRawPercent(graphRawAPLPercent);
+    float  graphClosedLoopAPLPercent = graphClosedLoopAPL * 100.0;
+    float  graphRollOffStartNits     = graphParams.r;
+    float  graphAnchorBoostedNits    = graphParams.a;
+
+    bool useFF   = GraphUseFullFieldWindowProjection;
+    bool useFF50 = useFF && (GraphProjectionWindowSize == 1);
+    bool useFF25 = useFF && (GraphProjectionWindowSize == 2);
+    bool useFF15 = useFF && (GraphProjectionWindowSize == 3);
+    bool useFF10 = useFF && (GraphProjectionWindowSize == 4);
+
+    // --- Sample the two nits x-values for this segment ---
+    float t0 = float(s)     / float(GRAPH_CURVE_SAMPLES - 1);
+    float t1 = float(s + 1) / float(GRAPH_CURVE_SAMPLES - 1);
+    float x0 = GraphSampleNitsFromFraction(t0, graphAxisMaxNits, graphAxisMaxPQ);
+    float x1 = GraphSampleNitsFromFraction(t1, graphAxisMaxNits, graphAxisMaxPQ);
+
+    // Helper macro: nits → p-space screen point
+    // (avoids repeating the 5-arg call)
+    #define TO_SCREEN(xN, yN) ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, (xN), (yN))
+
+    // Helper: select the right remapped-target function for this window size
+    #define REMAPPED(xVal) (useFF \
+        ? (useFF10 ? ComputeFullField10RemappedTargetNits(xVal) \
+         : (useFF15 ? ComputeFullField15RemappedTargetNits(xVal) \
+         : (useFF25 ? ComputeFullField25RemappedTargetNits(xVal) \
+         : (useFF50 ? ComputeFullField50RemappedTargetNits(xVal) \
+                    : ComputeFullField100RemappedTargetNits(xVal))))) \
+        : ComputeGraphBoostedTargetNits(graphClosedLoopAPLPercent, xVal, graphAnchorBoostedNits))
+
+    // Helper: select the right measured-output function for a remapped y
+    #define CORRECTED(yRemap) (useFF \
+        ? (useFF10 ? SampleMeasuredOutputNitsFullField10(yRemap) \
+         : (useFF15 ? SampleMeasuredOutputNitsFullField15(yRemap) \
+         : (useFF25 ? SampleMeasuredOutputNitsFullField25(yRemap) \
+         : (useFF50 ? SampleMeasuredOutputNitsFullField50(yRemap) \
+                    : SampleMeasuredOutputNitsFullField100(yRemap))))) \
+        : SampleCorrectedOutputNitsForAPL(graphClosedLoopAPLPercent, yRemap, graphMaxMeasuredNits))
+
+    // Helper: measured raw output for a direct x nits value
+    #define MEASURED_RAW(xVal) (useFF \
+        ? (useFF10 ? SampleMeasuredOutputNitsFullField10(xVal) \
+         : (useFF15 ? SampleMeasuredOutputNitsFullField15(xVal) \
+         : (useFF25 ? SampleMeasuredOutputNitsFullField25(xVal) \
+         : (useFF50 ? SampleMeasuredOutputNitsFullField50(xVal) \
+                    : SampleMeasuredOutputNitsFullField100(xVal))))) \
+        : SampleRealMeasuredOutputNitsForAPL(graphRawAPLPercent, xVal))
+
+    float graphMaxMeasuredNits = useFF
+        ? (useFF10 ? GetFullField10MeasuredMaxOutputNits() : (useFF15 ? GetFullField15MeasuredMaxOutputNits() : (useFF25 ? GetFullField25MeasuredMaxOutputNits() : (useFF50 ? GetFullField50MeasuredMaxOutputNits() : GetFullField100MeasuredMaxOutputNits()))))
+        : graphParams.g;
+
+    float4 result = SENTINEL;
+
+    if (row == GCURVE_REMAPPED)
+    {
+        // Green re-mapped curve: standard APL mode only, using the closed-loop display-side APL solved from the selected raw input APL.
+        if (!useFF)
+        {
+            float y0 = REMAPPED(x0);
+            float y1 = REMAPPED(x1);
+            float2 a = TO_SCREEN(x0, y0);
+            float2 b = TO_SCREEN(x1, y1);
+            result = float4(a, b);
+        }
+    }
+    else if (row == GCURVE_CORRECTED)
+    {
+        // Gray projected / corrected output curve (both modes).
+        float y0r = REMAPPED(x0);
+        float y1r = REMAPPED(x1);
+        float y0  = CORRECTED(y0r);
+        float y1  = CORRECTED(y1r);
+        float2 a  = TO_SCREEN(x0, y0);
+        float2 b  = TO_SCREEN(x1, y1);
+        result = float4(a, b);
+    }
+    else if (row == GCURVE_MEASURED)
+    {
+        // Light-blue measured raw curve at the selected raw input APL / window set (clamped to measuredMaxInputNits).
+        float measuredMaxInputNits = useFF
+            ? (useFF10 ? GetFullField10MeasuredMaxInputNits() : (useFF15 ? GetFullField15MeasuredMaxInputNits() : (useFF25 ? GetFullField25MeasuredMaxInputNits() : (useFF50 ? GetFullField50MeasuredMaxInputNits() : GetFullField100MeasuredMaxInputNits()))))
+            : GetGraphMeasuredMaxInputNits();
+
+        if (x0 < measuredMaxInputNits)
+        {
+            float mx1 = min(x1, measuredMaxInputNits);
+            float y0   = MEASURED_RAW(x0);
+            float y1   = MEASURED_RAW(mx1);
+            float2 a   = TO_SCREEN(x0,  y0);
+            float2 b   = TO_SCREEN(mx1, y1);
+            result = float4(a, b);
+        }
+    }
+    else // row == GCURVE_BT2390REF (row 3)
+    {
+        // Magenta dashed BT.2390 reference curve (optional).
+        float idealReferencePeakNits = max(graphMaxMeasuredNits, 0.0);
+        if (GraphShowBT2390Reference && idealReferencePeakNits > 0.0)
+        {
+            float y0  = ComputeBT2390ReferenceOutputNits(x0, graphAxisMaxNits, idealReferencePeakNits);
+            float y1  = ComputeBT2390ReferenceOutputNits(x1, graphAxisMaxNits, idealReferencePeakNits);
+            float2 a  = TO_SCREEN(x0, y0);
+            float2 b  = TO_SCREEN(x1, y1);
+            result = float4(a, b);
+        }
+    }
+
+    #undef TO_SCREEN
+    #undef REMAPPED
+    #undef CORRECTED
+    #undef MEASURED_RAW
+
+    return result;
 }
 
 float4 PS_DebugOverlay(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
@@ -1403,6 +2182,20 @@ technique EOTF_Boost_1D_APL_LUT
         VertexShader = PostProcessVS;
         PixelShader = PS_CalcGraphParams;
         RenderTarget = TexGraphParams;
+    }
+
+    pass Graph_Lines
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = PS_CalcGraphLines;
+        RenderTarget = TexGraphLines;
+    }
+
+    pass Graph_Curves
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = PS_CalcGraphCurves;
+        RenderTarget = TexGraphCurves;
     }
 
     pass Debug_Overlay
