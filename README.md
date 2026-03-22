@@ -208,6 +208,7 @@ For basic retuning, you only need to replace:
 
 - `APL_POINTS`
 - `COMP_APL_1D`
+- `COMP_MAX`
 
 That is enough to change the shader’s live APL-based boosting behavior.
 
