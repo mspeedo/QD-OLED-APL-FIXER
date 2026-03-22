@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.1 - 1D APL-Only Lookup
+    EOTF Boost v8.1 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
     =================================
 
     Purpose
