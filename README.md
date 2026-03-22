@@ -248,7 +248,7 @@ It is not meant as a one-size-fits-all HDR preset, but it can be adapted for oth
 
 ## PQ EOTF Measurements BEFORE/AFTER
 
-Here are measurements for Samsung Odyssey OLED G8 G85SB in Peak Brightness HIGH mode and with default shader settings. We can see how this shadder affects monitor real HDR brigthness tracking with various boost strength settings.
+Here are measurements for Samsung Odyssey OLED G8 G85SB in Peak Brightness HIGH mode and with default shader settings. We can see how this shader affects monitor real HDR brightness tracking with various boost strength settings.
 
 **No boost**   vs   **Max APL Boost Strength: 0.4 (default)**   vs   **Max APL Boost Strength: 1.0**
 
