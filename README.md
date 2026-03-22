@@ -2,7 +2,7 @@
 
 This shader is based on the original [QD-OLED-APL-FIXER](https://github.com/DespairArdor/QD-OLED-APL-FIXER) project by **DespairArdor**.
 
-This version is made for **QD-OLED monitors running in Peak 1000 / High Brightness mode**, and it is **modeled around the measured behavior of the specific monitor**.
+This version is made for **QD-OLED monitors running in Peak 1000 / High Brightness mode**, and it is **modeled around the measured behavior of the specific monitor (Samsung Odyssey OLED G8 G85SB)**.
 
 It is meant to help compensate for the stronger brightness limiting / ABL behavior that happens in this mode, especially in brighter HDR scenes.
 
