@@ -43,7 +43,6 @@ These are the default settings in this release and are a good place to start:
 - **APL Reference White (nits):** 1000
 - **APL Trigger:** 0.00
 - **Max APL Boost Strength:** 0.4
-- **Boost LUT Gamma:** 0.0
 - **Boost roll off end:** 1000
 - **BT.2390 roll off shape:** 1.25
 - **Shadow Protection Floor:** 1.0
@@ -91,14 +90,6 @@ This is the main strength slider.
 - **Lower value** = weaker effect
 
 If you only change one setting, this is usually the first one to try. I do not recommend values above 0.4 for 1000nit content, otherwise there is too much compression of HDR input vs real monitor brightness output, which causes overblown highlights.
-
-### Boost LUT Gamma
-Changes how the boost ramps in across different scene brightness levels.
-
-- **0.0** = effectively neutral in this preset
-- Lower or higher values change how the boost is distributed
-
-Most users can leave this at the default.
 
 ### Boost roll off end
 This sets the **target max nits for highlight roll-off**.
