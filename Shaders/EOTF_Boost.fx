@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.3 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
+    EOTF Boost v8.4 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
     =================================
 
     Purpose
@@ -120,7 +120,7 @@ uniform float SaturationComp <
     ui_type = "slider";
     ui_min = 0.5; ui_max = 1.5;
     ui_label = "Saturation Compensation";
-    UI_TOOLTIP("Scales chroma reinjection after luma boosting. 1.0 = neutral. Values above 1.0 restore or exaggerate saturation in boosted regions.")
+    UI_TOOLTIP("Adjusts color saturation after the color-preserving luminance boost. 1.0 = neutral. Lower values reduce saturation. Higher values increase saturation while preserving the boosted pixel luminance.")
 > = 1.0;
 
 uniform float SIGNAL_REFERENCE_NITS <
@@ -369,6 +369,23 @@ float LinearToPQBT2100(float linearValue)
     float Lm1 = pow(L, m1);
     float num = c1 + c2 * Lm1;
     float den = 1.0 + c3 * Lm1;
+    return pow(num / max(den, 1e-6), m2);
+}
+
+// float3 overload — encodes all three channels in one pair of vector pow calls instead of
+// three pairs of scalar calls.  Used by ApplyBoostPreserveColorFromSceneLogGain to re-encode
+// the boosted PQ output without serialising the per-channel work.
+float3 LinearToPQBT2100(float3 v)
+{
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+
+    float3 Lm1 = pow(saturate(v), m1);
+    float3 num = c1 + c2 * Lm1;
+    float3 den = 1.0 + c3 * Lm1;
     return pow(num / max(den, 1e-6), m2);
 }
 
@@ -864,6 +881,64 @@ float ApplyBoostWithSelectedRolloffFromSceneLogGain(float signalLuma, float scen
     }
 
     return ApplyBoostWithBT2390RolloffFromSceneLogGain(signalLuma, sceneLogGain, anchorBoostedNits);
+}
+
+float ComputeBoostedLumaNitsFromSceneLogGain(float inputLumaNits, float sceneLogGain, float anchorBoostedNits)
+{
+    float safeInputLumaNits = max(inputLumaNits, 0.0);
+    float fullyBoostedNits = safeInputLumaNits * ComputePixelGainFromSceneLogGain(sceneLogGain, safeInputLumaNits);
+    float rollOffEndNits = max(BoostRollOff, 0.0);
+
+    if (rollOffEndNits <= 0.0)
+        return fullyBoostedNits;
+
+    float sourcePeakNits = max(anchorBoostedNits, rollOffEndNits + 1e-4);
+    return max(ApplyBT2390EETFToNitsWithShape(fullyBoostedNits, sourcePeakNits, rollOffEndNits, BoostRollOffShape), safeInputLumaNits);
+}
+
+float3 ApplySaturationAdjustment709(float3 linearColor, float saturation)
+{
+    float luma = GetLuma709(linearColor);
+    return luma.xxx + (linearColor - luma.xxx) * saturation;
+}
+
+float3 ApplySaturationAdjustment2020Nits(float3 linearColorNits, float saturation)
+{
+    float lumaNits = GetLuma2020(linearColorNits);
+    return lumaNits.xxx + (linearColorNits - lumaNits.xxx) * saturation;
+}
+
+float3 ApplyBoostPreserveColorFromSceneLogGain(float3 color, float sceneLogGain, float anchorBoostedNits)
+{
+    if (APLInputMode == 1)
+    {
+        float3 linearColorNits = PQToLinearBT2100(saturate(color)) * 10000.0;
+        float originalLumaNits = max(GetLuma2020(linearColorNits), 0.0);
+
+        if (originalLumaNits <= 1e-6)
+            return color;
+
+        float boostedLumaNits = ComputeBoostedLumaNitsFromSceneLogGain(originalLumaNits, sceneLogGain, anchorBoostedNits);
+        float colorScale = boostedLumaNits / originalLumaNits;
+        float3 boostedColorNits = linearColorNits * colorScale;
+        float3 saturatedColorNits = ApplySaturationAdjustment2020Nits(boostedColorNits, SaturationComp);
+
+        // Re-encode all three channels in one vector call (2 vector pow) instead of
+        // three separate scalar calls (6 scalar pow).
+        return LinearToPQBT2100(saturate(max(saturatedColorNits, 0.0) / 10000.0));
+    }
+
+    float3 linearColor = color;
+    float originalLumaNits = max(GetLuma709(max(linearColor, 0.0.xxx)) * SIGNAL_REFERENCE_NITS, 0.0);
+
+    if (originalLumaNits <= 1e-6)
+        return color;
+
+    float boostedLumaNits = ComputeBoostedLumaNitsFromSceneLogGain(originalLumaNits, sceneLogGain, anchorBoostedNits);
+    float colorScale = boostedLumaNits / originalLumaNits;
+    float3 boostedColor = linearColor * colorScale;
+
+    return ApplySaturationAdjustment709(boostedColor, SaturationComp);
 }
 
 float ComputeBoostedTargetNitsFromBoostT(float currentAPL, float inputNits, float anchorBoostedNits)
@@ -1809,38 +1884,38 @@ float DrawOSDPercentAt(float2 texcoord, float2 topRight, float scale, float aspe
 
 float DrawOSDRow3(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
 {
-    int v = clamp(value, 0, 999);
+    uint v = (uint)clamp(value, 0, 999);
     float mask = 0.0;
 
-    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, v % 10);
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, (int)(v % 10));
 
     if (v >= 10)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (v / 10) % 10);
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (int)((v / 10) % 10));
 
     if (v >= 100)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (v / 100) % 10);
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (int)((v / 100) % 10));
 
     return saturate(mask);
 }
 
 float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
 {
-    int v = clamp(value, 0, 99999);
+    uint v = (uint)clamp(value, 0, 99999);
     float mask = 0.0;
 
-    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, v % 10);
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, (int)(v % 10));
 
     if (v >= 10)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (v / 10) % 10);
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (int)((v / 10) % 10));
 
     if (v >= 100)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (v / 100) % 10);
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (int)((v / 100) % 10));
 
     if (v >= 1000)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, (v / 1000) % 10);
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, (int)((v / 1000) % 10));
 
     if (v >= 10000)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (v / 10000) % 10);
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (int)((v / 10000) % 10));
 
     return saturate(mask);
 }
@@ -1896,8 +1971,6 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float currentAPL, fl
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
-    float pixelLuma = GetSignalLuma(color);
-    float safePixelLuma = (APLInputMode == 1) ? pixelLuma : max(pixelLuma, 0.0);
 
     float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
     float currentAPL = aplData.r;
@@ -1906,27 +1979,18 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
     // It is precomputed once in PS_SmoothAPL and stored in aplData.b,
     // eliminating the LUT lookup + log2 + conditional pow chain per pixel.
     float sceneLogGain = aplData.b;
-    // fader is a single smoothstep on a scalar — cheap enough to keep per-pixel
-    // (needed for chromaScale and DrawStatsOverlay independent of sceneLogGain).
-    float fader = ComputeAPLBoostFader(currentAPL);
-
-    // sceneLogGain <= 0 iff gainExponent <= 0 (since log2(measuredComp) >= 0 always),
-    // so this replaces the previous sceneGainExponent guard without any extra computation.
-    if (sceneLogGain <= 0.0 && abs(SaturationComp - 1.0) <= 1e-6 && (ShowOSD == false))
+    if (sceneLogGain <= 0.0 && (ShowOSD == false))
         return float4(color, 1.0);
 
-    float boostedLuma = ApplyBoostWithSelectedRolloffFromSceneLogGain(safePixelLuma, sceneLogGain, aplData.a);
-
-    float chromaScale = lerp(1.0, SaturationComp, fader);
-    float3 chroma = (color - safePixelLuma.xxx) * chromaScale;
-    float3 finalColorLumaChroma = boostedLuma.xxx + chroma;
-    float scale = (safePixelLuma > 1e-4) ? (boostedLuma / safePixelLuma) : 1.0;
-    float3 finalColorScaled = color * scale;
-    float darkBlend = ((APLInputMode == 0) && (pixelLuma <= 0.0)) ? 1.0 : smoothstep(0.003, 0.015, max(safePixelLuma, 0.0));
-    float3 finalColor = lerp(finalColorScaled, finalColorLumaChroma, darkBlend);
+    float3 finalColor = ApplyBoostPreserveColorFromSceneLogGain(color, sceneLogGain, aplData.a);
 
     if (ShowOSD)
+    {
+        // fader is only needed for the OSD tint; compute it here rather than before the
+        // early exit above so it isn't evaluated on every pixel when ShowOSD is off.
+        float fader = ComputeAPLBoostFader(currentAPL);
         finalColor = DrawStatsOverlay(texcoord, finalColor, currentAPL, aplData.g, fader);
+    }
 
     return float4(finalColor, 1.0);
 }
