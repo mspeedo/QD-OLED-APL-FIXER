@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.4 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
+    EOTF Boost v8.5 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
     =================================
 
     Purpose
@@ -62,35 +62,36 @@ uniform int APLInputMode <
 
 uniform float APLReferenceWhiteNits <
     ui_type = "slider";
-    ui_min = 10.0; ui_max = 1500.0;
+    ui_min = 10.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "APL Reference White (nits)";
     UI_TOOLTIP("Reference white used only for the APL metric normalization. It does not directly clamp output nits or change the graph axes.")
 > = 1000.0;
 
 uniform float APLTrigger <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 0.95;
+    ui_min = 0.0; ui_max = 0.95; ui_step = 0.01;
     ui_label = "APL Trigger";
     UI_TOOLTIP("Fade-in threshold for the boost based on the smoothed APL metric. Below this level the effect is reduced or disabled. 10% APL on the graph is exactly the threshold when this is set to 0.10.")
 > = 0.00;
 
+
 uniform float MaxAPLBoostStrength <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0;
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "Max APL Boost Strength";
     UI_TOOLTIP("Scales the measured APL compensation in log-gain space before per-pixel participation is applied. 1.0 means full measured compensation at maximum LUT weight. Values below 1.0 under-compensate. Values above 1.0 intentionally over-compensate.")
 > = 0.4;
 
 uniform float BoostRollOff <
     ui_type = "slider";
-    ui_min = 500.0; ui_max = 1500.0;
+    ui_min = 500.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "Boost roll off end";
     UI_TOOLTIP("Desired output anchor of the PQ highlight rolloff in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels. 0 = Disabled.")
 > = 1000.0;
 
 uniform float BoostRollOffShape <
     ui_type = "slider";
-    ui_min = 0.25; ui_max = 4.0;
+    ui_min = 0.25; ui_max = 4.0; ui_step = 0.01;
     ui_label = "BT.2390 roll off shape";
     UI_TOOLTIP("Adjusts the live roll off character by moving the roll off start together with the shoulder curvature so the transition stays smooth and monotonic. 1.0 = standard BT.2390. Values below 1.0 start later and hold highlights higher longer. Values above 1.0 start earlier and compress highlights harder.")
 > = 1.25;
@@ -104,28 +105,28 @@ static const float PixelParticipationGamma = 1.0;
 
 uniform float PixelParticipationFloor <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 1.0;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_label = "Shadow Protection Floor";
     UI_TOOLTIP("Minimum share of the APL-derived scene compensation applied to every pixel before the luminance-weighted participation ramp adds the remainder. Higher values track the measured ABL behavior more faithfully. Lower values behave more like a perceptual shadow-protection model.")
 > = 1.0;
 
 uniform float TransitionSpeed <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0;
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "APL Smoothing Time (s)";
     UI_TOOLTIP("Temporal smoothing time constant for the live APL metric in seconds. 0 = disabled. FPS-independent. This affects live boosting and OSD values, but the graph uses its own Graph APL % slider.")
 > = 0.25;
 
 uniform float SaturationComp <
     ui_type = "slider";
-    ui_min = 0.5; ui_max = 1.5;
+    ui_min = 0.5; ui_max = 1.5; ui_step = 0.01;
     ui_label = "Saturation Compensation";
     UI_TOOLTIP("Adjusts color saturation after the color-preserving luminance boost. 1.0 = neutral. Lower values reduce saturation. Higher values increase saturation while preserving the boosted pixel luminance.")
 > = 1.0;
 
 uniform float SIGNAL_REFERENCE_NITS <
     ui_type = "slider";
-    ui_min = 1.0; ui_max = 200.0;
+    ui_min = 1.0; ui_max = 200.0; ui_step = 1.0;
     ui_label = "scRGB Signal Reference (nits)";
     UI_TOOLTIP("Reference nits for scRGB signal conversion. Standard scRGB uses 80 nits per 1.0 signal. Used only when APL Input Mode = scRGB Normalized.")
 > = 80.0;
@@ -137,7 +138,7 @@ uniform bool ShowOSD <
 
 uniform float OSDBrightness <
     ui_type = "slider";
-    ui_min = 0.01; ui_max = 1.0;
+    ui_min = 0.01; ui_max = 1.0; ui_step = 0.01;
     ui_label = "OSD Brightness";
     UI_TOOLTIP("Controls OSD and graph overlay brightness.")
 > = 0.5;
@@ -169,21 +170,21 @@ uniform int GraphProjectionWindowSize <
 
 uniform float GraphAPLIndex <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 100.0;
+    ui_min = 0.0; ui_max = 100.0; ui_step = 0.01;
     ui_label = "Graph APL (%)";
     UI_TOOLTIP("Continuous raw / pre-boost input APL value used by the standard APL-slice graph mode. Light blue = measured curve for that raw input APL. Green = shader remapped target projected from that raw input through the closed-loop APL solve. Gray = projected measured output at the solved display-side operating point. Ignored when Graph Use Window Projection is enabled.")
 > = 50.0;
 
 uniform float GraphAxisMaxNits <
     ui_type = "slider";
-    ui_min = 500.0; ui_max = 10000.0;
+    ui_min = 500.0; ui_max = 10000.0; ui_step = 1.0;
     ui_label = "Graph Axis Max (nits)";
     UI_TOOLTIP("Maximum nits shown on both graph axes. Raising it lets you inspect curve behavior beyond 1000-nit input without changing the live shader.")
 > = 1000.0;
 
 uniform float GraphOpacity <
     ui_type = "slider";
-    ui_min = 0.05; ui_max = 1.0;
+    ui_min = 0.05; ui_max = 1.0; ui_step = 0.01;
     ui_label = "Graph Opacity";
     UI_TOOLTIP("Opacity of the graph overlay background and curves.")
 > = 0.5;
@@ -641,7 +642,7 @@ float MeasuredCompToBoostT(float comp)
 
 float ComputeAPLBoostFader(float currentAPL)
 {
-    return smoothstep(APLTrigger, min(APLTrigger + 0.05, 1.0), currentAPL);
+    return step(APLTrigger, currentAPL);
 }
 
 float ComputeTemporalBlendFactor(float smoothingSeconds)
