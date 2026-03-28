@@ -39,7 +39,7 @@ It also includes built-in APL compensation points from **3% to 50% APL**.
 These are the default settings in this release and are a good place to start:
 
 - **APL Input Mode:** PQ Decoded Normalized
-- **APL Grid Size:** 32
+- **APL_DECODE_SIZE:** 32
 - **APL Reference White (nits):** 1000
 - **APL Trigger:** 0.00
 - **Max APL Boost Strength:** 0.4
@@ -59,7 +59,7 @@ Choose how the shader reads HDR brightness.
 
 For most users, leave this on **PQ Decoded Normalized**.
 
-### APL Grid Size
+### APL_DECODE_SIZE
 Controls how many points the shader checks to estimate overall screen brightness.
 
 - **Higher value** = more stable result
