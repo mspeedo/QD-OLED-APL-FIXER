@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.5 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
+    EOTF Boost v8.6 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
     =================================
 
     Purpose
@@ -74,25 +74,128 @@ uniform float APLTrigger <
     UI_TOOLTIP("Fade-in threshold for the boost based on the smoothed APL metric. Below this level the effect is reduced or disabled. 10% APL on the graph is exactly the threshold when this is set to 0.10.")
 > = 0.00;
 
+uniform float CompensationFreezeAPLPercent <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 50.0; ui_step = 0.1;
+    ui_label = "Compensation Freeze APL %";
+    UI_TOOLTIP("Freezes the measured compensation lookup above the selected APL percentage. Example: 10.0 means APL values above 10% keep using the 10% compensation row. 0 = disabled.")
+> = 0.0;
 
 uniform float MaxAPLBoostStrength <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
-    ui_label = "Max APL Boost Strength";
+    ui_label = "Global APL Boost Strength";
     UI_TOOLTIP("Scales the measured APL compensation in log-gain space before per-pixel participation is applied. 1.0 means full measured compensation at maximum LUT weight. Values below 1.0 under-compensate. Values above 1.0 intentionally over-compensate.")
 > = 0.4;
+
+
+uniform bool EnablePerAPLBoostStrength <
+    ui_label = "Enable Per-APL Boost Strength";
+    UI_TOOLTIP("Enables the advanced per-APL boost-strength controls below. When disabled, the shader behaves exactly like before and uses only Max APL Boost Strength globally.")
+> = false;
+
+uniform float APLBoostStrength03 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 3% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 3% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.4;
+
+uniform float APLBoostStrength05 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 5% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 5% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.7;
+
+uniform float APLBoostStrength07 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 7% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 7% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.7;
+
+uniform float APLBoostStrength10 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 10% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 10% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.7;
+
+uniform float APLBoostStrength14 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 14% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 14% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.6;
+
+uniform float APLBoostStrength18 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 18% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 18% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.54;
+
+uniform float APLBoostStrength22 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 22% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 22% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.5;
+
+uniform float APLBoostStrength25 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 25% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 25% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.5;
+
+uniform float APLBoostStrength35 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 35% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 35% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.5;
+
+uniform float APLBoostStrength50 <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Per-APL Boost Strength";
+    ui_category_closed = true;
+    ui_label = "APL 50% Boost Strength";
+    UI_TOOLTIP("Per-APL boost strength override for the measured 50% APL point. Used only when Enable Per-APL Boost Strength is enabled.")
+> = 0.5;
+
 
 uniform float BoostRollOff <
     ui_type = "slider";
     ui_min = 500.0; ui_max = 1500.0; ui_step = 1.0;
-    ui_label = "Boost roll off end";
+    ui_label = "Boost roll off target (nits)";
     UI_TOOLTIP("Desired output anchor of the PQ highlight rolloff in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels. 0 = Disabled.")
 > = 1000.0;
 
 uniform float BoostRollOffShape <
     ui_type = "slider";
     ui_min = 0.25; ui_max = 4.0; ui_step = 0.01;
-    ui_label = "BT.2390 roll off shape";
+    ui_label = "Boost roll off shape";
     UI_TOOLTIP("Adjusts the live roll off character by moving the roll off start together with the shoulder curvature so the transition stays smooth and monotonic. 1.0 = standard BT.2390. Values below 1.0 start later and hold highlights higher longer. Values above 1.0 start earlier and compress highlights harder.")
 > = 1.25;
 
@@ -131,6 +234,7 @@ uniform float SIGNAL_REFERENCE_NITS <
     UI_TOOLTIP("Reference nits for scRGB signal conversion. Standard scRGB uses 80 nits per 1.0 signal. Used only when APL Input Mode = scRGB Normalized.")
 > = 80.0;
 
+
 uniform bool ShowOSD <
     ui_label = "Show APL / Metric Stats";
     UI_TOOLTIP("Displays the current smoothed APL percentage and the maximum sampled decoded scene luminance in nits from the APL analysis pass.")
@@ -142,6 +246,8 @@ uniform float OSDBrightness <
     ui_label = "OSD Brightness";
     UI_TOOLTIP("Controls OSD and graph overlay brightness.")
 > = 0.5;
+
+
 
 uniform float FrameTime < source = "frametime"; >;
 
@@ -558,7 +664,8 @@ float GetDot(float2 uv)
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
         return 0.0;
 
-    return (uv.x > 0.35 && uv.x < 0.65 && uv.y > 0.00 && uv.y < 0.20) ? 1.0 : 0.0;
+    float y = 1.0 - uv.y;
+    return (uv.x > 0.35 && uv.x < 0.65 && y > 0.00 && y < 0.20) ? 1.0 : 0.0;
 }
 
 float Remap01(float x, float a, float b)
@@ -621,9 +728,19 @@ int FindAPLIndex(float aplPct)
     return min(idx, APL_COUNT - 2);
 }
 
+float ApplyCompensationFreezeAPL(float aplPct)
+{
+    float freezeAPL = CompensationFreezeAPLPercent;
+    if (freezeAPL > 0.0)
+        aplPct = min(aplPct, freezeAPL);
+
+    return aplPct;
+}
+
 float LookupMeasuredComp1D(float aplPct)
 {
-    float clampedAPL = clamp(aplPct, APL_POINTS[0], APL_POINTS[APL_COUNT - 1]);
+    float lookupAPL = ApplyCompensationFreezeAPL(aplPct);
+    float clampedAPL = clamp(lookupAPL, APL_POINTS[0], APL_POINTS[APL_COUNT - 1]);
     int a0 = FindAPLIndex(clampedAPL);
     int a1 = min(a0 + 1, APL_COUNT - 1);
 
@@ -631,6 +748,36 @@ float LookupMeasuredComp1D(float aplPct)
         clampedAPL,
         APL_POINTS[a0], COMP_APL_1D[a0],
         APL_POINTS[a1], COMP_APL_1D[a1]
+    );
+}
+
+float GetPerAPLBoostStrengthAtIndex(int idx)
+{
+    if (idx == 0) return APLBoostStrength03;
+    if (idx == 1) return APLBoostStrength05;
+    if (idx == 2) return APLBoostStrength07;
+    if (idx == 3) return APLBoostStrength10;
+    if (idx == 4) return APLBoostStrength14;
+    if (idx == 5) return APLBoostStrength18;
+    if (idx == 6) return APLBoostStrength22;
+    if (idx == 7) return APLBoostStrength25;
+    if (idx == 8) return APLBoostStrength35;
+    return APLBoostStrength50;
+}
+
+float LookupPerAPLBoostStrength(float aplPct)
+{
+    if (!EnablePerAPLBoostStrength)
+        return MaxAPLBoostStrength;
+
+    float clampedAPL = clamp(aplPct, APL_POINTS[0], APL_POINTS[APL_COUNT - 1]);
+    int a0 = FindAPLIndex(clampedAPL);
+    int a1 = min(a0 + 1, APL_COUNT - 1);
+
+    return SegmentLerp(
+        clampedAPL,
+        APL_POINTS[a0], GetPerAPLBoostStrengthAtIndex(a0),
+        APL_POINTS[a1], GetPerAPLBoostStrengthAtIndex(a1)
     );
 }
 
@@ -689,7 +836,9 @@ float ComputePixelGainFromSceneLogGain(float sceneLogGain, float inputNits)
 float ComputeSceneGainExponentFromMeasuredComp(float measuredComp, float currentAPL)
 {
     float fader = ComputeAPLBoostFader(currentAPL);
-    return max(MaxAPLBoostStrength * fader, 0.0);
+    float aplPct = saturate(currentAPL) * 100.0;
+    float boostStrength = LookupPerAPLBoostStrength(aplPct);
+    return max(boostStrength * fader, 0.0);
 }
 
 float ComputeSceneLogGainFromMeasuredComp(float measuredComp, float currentAPL)
@@ -1075,223 +1224,94 @@ static const float FULLFIELD_10_MEASURED_NITS[FULLFIELD_10_COUNT] =
     465.045533
 };
 
+
+static const int GRAPH_WINDOW_MODE_100 = 0;
+static const int GRAPH_WINDOW_MODE_50  = 1;
+static const int GRAPH_WINDOW_MODE_25  = 2;
+static const int GRAPH_WINDOW_MODE_15  = 3;
+static const int GRAPH_WINDOW_MODE_10  = 4;
+
 int FindFullFieldWindowInputIndex(float inputNits)
 {
-    int idx = 0;
-    [unroll]
+    [loop]
     for (int i = 0; i < FULLFIELD_100_COUNT - 1; ++i)
-        idx += int(step(FULLFIELD_100_INPUT_NITS[i + 1], inputNits));
-    return min(idx, FULLFIELD_100_COUNT - 2);
+    {
+        if (inputNits < FULLFIELD_100_INPUT_NITS[i + 1])
+            return i;
+    }
+
+    return FULLFIELD_100_COUNT - 2;
 }
 
-float SampleMeasuredOutputNitsFullField100(float targetNits)
+int GetFullFieldWindowCountByMode(int mode)
+{
+    switch (mode)
+    {
+        case GRAPH_WINDOW_MODE_10: return FULLFIELD_10_COUNT;
+        case GRAPH_WINDOW_MODE_15: return FULLFIELD_15_COUNT;
+        case GRAPH_WINDOW_MODE_25: return FULLFIELD_25_COUNT;
+        case GRAPH_WINDOW_MODE_50: return FULLFIELD_50_COUNT;
+        default:                   return FULLFIELD_100_COUNT;
+    }
+}
+
+float GetFullFieldWindowScaleByMode(int mode)
+{
+    switch (mode)
+    {
+        case GRAPH_WINDOW_MODE_10: return 0.10;
+        case GRAPH_WINDOW_MODE_15: return 0.15;
+        case GRAPH_WINDOW_MODE_25: return 0.25;
+        case GRAPH_WINDOW_MODE_50: return 0.50;
+        default:                   return 1.00;
+    }
+}
+
+float GetFullFieldMeasuredNitsByModeAndIndex(int mode, int idx)
+{
+    switch (mode)
+    {
+        case GRAPH_WINDOW_MODE_10: return FULLFIELD_10_MEASURED_NITS[idx];
+        case GRAPH_WINDOW_MODE_15: return FULLFIELD_15_MEASURED_NITS[idx];
+        case GRAPH_WINDOW_MODE_25: return FULLFIELD_25_MEASURED_NITS[idx];
+        case GRAPH_WINDOW_MODE_50: return FULLFIELD_50_MEASURED_NITS[idx];
+        default:                   return FULLFIELD_100_MEASURED_NITS[idx];
+    }
+}
+
+float SampleMeasuredOutputNitsFullFieldByMode(int mode, float targetNits)
 {
     float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
     int i0 = FindFullFieldWindowInputIndex(clampedNits);
-    int i1 = min(i0 + 1, FULLFIELD_100_COUNT - 1);
+    int i1 = min(i0 + 1, GetFullFieldWindowCountByMode(mode) - 1);
 
     return SegmentLerp(
         clampedNits,
-        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_100_MEASURED_NITS[i0],
-        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_100_MEASURED_NITS[i1]
+        FULLFIELD_100_INPUT_NITS[i0], GetFullFieldMeasuredNitsByModeAndIndex(mode, i0),
+        FULLFIELD_100_INPUT_NITS[i1], GetFullFieldMeasuredNitsByModeAndIndex(mode, i1)
     );
 }
 
-float SampleMeasuredOutputNitsFullField50(float targetNits)
+float GetFullFieldMeasuredMaxInputNitsByMode(int mode)
 {
-    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
-    int i0 = FindFullFieldWindowInputIndex(clampedNits);
-    int i1 = min(i0 + 1, FULLFIELD_50_COUNT - 1);
+    return FULLFIELD_100_INPUT_NITS[GetFullFieldWindowCountByMode(mode) - 1];
+}
 
-    return SegmentLerp(
-        clampedNits,
-        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_50_MEASURED_NITS[i0],
-        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_50_MEASURED_NITS[i1]
+float GetFullFieldMeasuredMaxOutputNitsByMode(int mode)
+{
+    int last = GetFullFieldWindowCountByMode(mode) - 1;
+    return GetFullFieldMeasuredNitsByModeAndIndex(mode, last);
+}
+
+float ComputeFullFieldRemappedTargetNitsByMode(int mode, float inputNits)
+{
+    float safeInputNits = max(inputNits, 0.0);
+    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(
+        saturate(safeInputNits * GetFullFieldWindowScaleByMode(mode) / max(APLReferenceWhiteNits, 1e-4))
     );
-}
-
-float SampleMeasuredOutputNitsFullField25(float targetNits)
-{
-    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
-    int i0 = FindFullFieldWindowInputIndex(clampedNits);
-    int i1 = min(i0 + 1, FULLFIELD_25_COUNT - 1);
-
-    return SegmentLerp(
-        clampedNits,
-        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_25_MEASURED_NITS[i0],
-        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_25_MEASURED_NITS[i1]
-    );
-}
-
-float GetFullField100MeasuredMaxInputNits()
-{
-    return FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1];
-}
-
-float GetFullField100MeasuredMaxOutputNits()
-{
-    return FULLFIELD_100_MEASURED_NITS[FULLFIELD_100_COUNT - 1];
-}
-
-float GetFullField50MeasuredMaxInputNits()
-{
-    return FULLFIELD_100_INPUT_NITS[FULLFIELD_50_COUNT - 1];
-}
-
-float GetFullField50MeasuredMaxOutputNits()
-{
-    return FULLFIELD_50_MEASURED_NITS[FULLFIELD_50_COUNT - 1];
-}
-
-float GetFullField25MeasuredMaxInputNits()
-{
-    return FULLFIELD_100_INPUT_NITS[FULLFIELD_25_COUNT - 1];
-}
-
-float GetFullField25MeasuredMaxOutputNits()
-{
-    return FULLFIELD_25_MEASURED_NITS[FULLFIELD_25_COUNT - 1];
-}
-
-float GetFullField15MeasuredMaxInputNits()
-{
-    return FULLFIELD_100_INPUT_NITS[FULLFIELD_15_COUNT - 1];
-}
-
-float GetFullField15MeasuredMaxOutputNits()
-{
-    return FULLFIELD_15_MEASURED_NITS[FULLFIELD_15_COUNT - 1];
-}
-
-float GetFullField10MeasuredMaxInputNits()
-{
-    return FULLFIELD_100_INPUT_NITS[FULLFIELD_10_COUNT - 1];
-}
-
-float GetFullField10MeasuredMaxOutputNits()
-{
-    return FULLFIELD_10_MEASURED_NITS[FULLFIELD_10_COUNT - 1];
-}
-
-float ComputeFullField100APLFromInputNits(float inputNits)
-{
-    return saturate(max(inputNits, 0.0) / max(APLReferenceWhiteNits, 1e-4));
-}
-
-float ComputeFullField50APLFromInputNits(float inputNits)
-{
-    return saturate(max(inputNits, 0.0) * 0.5 / max(APLReferenceWhiteNits, 1e-4));
-}
-
-float ComputeFullField25APLFromInputNits(float inputNits)
-{
-    return saturate(max(inputNits, 0.0) * 0.25 / max(APLReferenceWhiteNits, 1e-4));
-}
-
-float ComputeFullField15APLFromInputNits(float inputNits)
-{
-    return saturate(max(inputNits, 0.0) * 0.15 / max(APLReferenceWhiteNits, 1e-4));
-}
-
-float ComputeFullField10APLFromInputNits(float inputNits)
-{
-    return saturate(max(inputNits, 0.0) * 0.10 / max(APLReferenceWhiteNits, 1e-4));
-}
-
-float ComputeFullField100RemappedTargetNits(float inputNits)
-{
-    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField100APLFromInputNits(inputNits));
     float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
 
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), anchorBoostedNits);
-}
-
-float ComputeFullField50RemappedTargetNits(float inputNits)
-{
-    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField50APLFromInputNits(inputNits));
-    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
-
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), anchorBoostedNits);
-}
-
-float ComputeFullField25RemappedTargetNits(float inputNits)
-{
-    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField25APLFromInputNits(inputNits));
-    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
-
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), anchorBoostedNits);
-}
-
-float ComputeFullField15RemappedTargetNits(float inputNits)
-{
-    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField15APLFromInputNits(inputNits));
-    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
-
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), anchorBoostedNits);
-}
-
-float ComputeFullField10RemappedTargetNits(float inputNits)
-{
-    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(ComputeFullField10APLFromInputNits(inputNits));
-    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
-
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, max(inputNits, 0.0), anchorBoostedNits);
-}
-
-float SampleProjectedOutputNitsFullField100(float inputNits)
-{
-    float remappedTargetNits = ComputeFullField100RemappedTargetNits(inputNits);
-    return SampleMeasuredOutputNitsFullField100(remappedTargetNits);
-}
-
-float SampleProjectedOutputNitsFullField50(float inputNits)
-{
-    float remappedTargetNits = ComputeFullField50RemappedTargetNits(inputNits);
-    return SampleMeasuredOutputNitsFullField50(remappedTargetNits);
-}
-
-float SampleProjectedOutputNitsFullField25(float inputNits)
-{
-    float remappedTargetNits = ComputeFullField25RemappedTargetNits(inputNits);
-    return SampleMeasuredOutputNitsFullField25(remappedTargetNits);
-}
-
-float SampleMeasuredOutputNitsFullField15(float targetNits)
-{
-    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
-    int i0 = FindFullFieldWindowInputIndex(clampedNits);
-    int i1 = min(i0 + 1, FULLFIELD_15_COUNT - 1);
-
-    return SegmentLerp(
-        clampedNits,
-        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_15_MEASURED_NITS[i0],
-        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_15_MEASURED_NITS[i1]
-    );
-}
-
-float SampleProjectedOutputNitsFullField15(float inputNits)
-{
-    float remappedTargetNits = ComputeFullField15RemappedTargetNits(inputNits);
-    return SampleMeasuredOutputNitsFullField15(remappedTargetNits);
-}
-
-float SampleMeasuredOutputNitsFullField10(float targetNits)
-{
-    float clampedNits = clamp(targetNits, FULLFIELD_100_INPUT_NITS[0], FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT - 1]);
-    int i0 = FindFullFieldWindowInputIndex(clampedNits);
-    int i1 = min(i0 + 1, FULLFIELD_10_COUNT - 1);
-
-    return SegmentLerp(
-        clampedNits,
-        FULLFIELD_100_INPUT_NITS[i0], FULLFIELD_10_MEASURED_NITS[i0],
-        FULLFIELD_100_INPUT_NITS[i1], FULLFIELD_10_MEASURED_NITS[i1]
-    );
-}
-
-float SampleProjectedOutputNitsFullField10(float inputNits)
-{
-    float remappedTargetNits = ComputeFullField10RemappedTargetNits(inputNits);
-    return SampleMeasuredOutputNitsFullField10(remappedTargetNits);
+    return ComputeBoostedTargetNitsFromBoostT(currentAPL, safeInputNits, anchorBoostedNits);
 }
 
 float GraphTableComp2D(int aplIdx, int nitIdx)
@@ -1306,11 +1326,14 @@ float GetGraphMeasuredMaxInputNits()
 
 int FindNitIndex(float inputNits)
 {
-    int idx = 0;
-    [unroll]
+    [loop]
     for (int i = 0; i < NIT_COUNT - 1; ++i)
-        idx += int(step(NIT_POINTS[i + 1], inputNits));
-    return min(idx, NIT_COUNT - 2);
+    {
+        if (inputNits < NIT_POINTS[i + 1])
+            return i;
+    }
+
+    return NIT_COUNT - 2;
 }
 
 float LookupGraphCompForAPLRow2D(int aplIdx, float inputNits)
@@ -1363,7 +1386,7 @@ float GetAPLMaxMeasuredNits(float aplPct)
 {
     float maxMeasured = 0.0;
 
-    [unroll]
+    [loop]
     for (int i = 0; i < NIT_COUNT; ++i)
     {
         float targetNits = NIT_POINTS[i];
@@ -1378,6 +1401,33 @@ float SampleCorrectedOutputNitsForAPL(float aplPct, float boostedTargetNits, flo
     float comp = max(LookupMeasuredComp2DGraph(aplPct, boostedTargetNits), 1e-6);
     return min(boostedTargetNits / comp, maxMeasuredNits);
 }
+
+
+#if ENABLE_APL_GRAPH
+float ComputeGraphCurveRemappedTargetNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphClosedLoopAPLPercent, float graphAnchorBoostedNits, float inputNits)
+{
+    if (useFullFieldWindowProjection)
+        return ComputeFullFieldRemappedTargetNitsByMode(fullFieldWindowMode, inputNits);
+
+    return ComputeGraphBoostedTargetNits(graphClosedLoopAPLPercent, inputNits, graphAnchorBoostedNits);
+}
+
+float ComputeGraphCurveCorrectedOutputNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphClosedLoopAPLPercent, float graphMaxMeasuredNits, float remappedTargetNits)
+{
+    if (useFullFieldWindowProjection)
+        return SampleMeasuredOutputNitsFullFieldByMode(fullFieldWindowMode, remappedTargetNits);
+
+    return SampleCorrectedOutputNitsForAPL(graphClosedLoopAPLPercent, remappedTargetNits, graphMaxMeasuredNits);
+}
+
+float ComputeGraphCurveMeasuredRawOutputNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphRawAPLPercent, float inputNits)
+{
+    if (useFullFieldWindowProjection)
+        return SampleMeasuredOutputNitsFullFieldByMode(fullFieldWindowMode, inputNits);
+
+    return SampleRealMeasuredOutputNitsForAPL(graphRawAPLPercent, inputNits);
+}
+#endif
 
 float ComputeBT2390ReferenceOutputNits(float inputNits, float sourcePeakNits, float targetPeakNits)
 {
@@ -1571,13 +1621,10 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
     float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
     bool useFullFieldWindowProjection = GraphUseFullFieldWindowProjection;
-    bool useFullField50Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 1);
-    bool useFullField25Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 2);
-    bool useFullField15Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 3);
-    bool useFullField10Projection = useFullFieldWindowProjection && (GraphProjectionWindowSize == 4);
+    int fullFieldWindowMode = GraphProjectionWindowSize;
     float4 graphParams = tex2Dlod(SamplerGraphParams, float4(0.5, 0.5, 0.0, 0.0));
     float graphMaxMeasuredNits = useFullFieldWindowProjection
-        ? (useFullField10Projection ? GetFullField10MeasuredMaxOutputNits() : (useFullField15Projection ? GetFullField15MeasuredMaxOutputNits() : (useFullField25Projection ? GetFullField25MeasuredMaxOutputNits() : (useFullField50Projection ? GetFullField50MeasuredMaxOutputNits() : GetFullField100MeasuredMaxOutputNits()))))
+        ? GetFullFieldMeasuredMaxOutputNitsByMode(fullFieldWindowMode)
         : graphParams.g;
     float graphAxisMaxPQ = GraphUsePQSpace ? max(graphParams.b, 1e-6) : 0.0;
 
@@ -1626,7 +1673,7 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
         // Grid lines: indices 0–8 (vertical) and 9–17 (horizontal).
         // All endpoints precomputed in PS_CalcGraphLines — zero NitsToPQ/pow here.
-        [unroll]
+        [loop]
         for (int i = 0; i < 9; i++)
         {
             float uV = (float(i)     + 0.5) / float(GRAPH_LINE_COUNT);
@@ -1638,7 +1685,7 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
         }
 
         // Tick marks: x-ticks at indices 18–23, y-ticks at 24–29.
-        [unroll]
+        [loop]
         for (int i = 0; i < 6; i++)
         {
             float uX = (float(i + 18) + 0.5) / float(GRAPH_LINE_COUNT);
@@ -1660,7 +1707,7 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
     if (inXLabelRegion || inYLabelRegion)
     {
-        [unroll]
+        [loop]
         for (int i = 0; i < 6; i++)
         {
             // Fetch x-tick (idx 18+i) and y-tick (idx 24+i) endpoints from precomputed texture.
@@ -1883,18 +1930,40 @@ float DrawOSDPercentAt(float2 texcoord, float2 topRight, float scale, float aspe
     return GetPercent(uv / scale);
 }
 
-float DrawOSDRow3(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
+float DrawOSDDotAt(float2 texcoord, float2 topRight, float scale, float aspect)
 {
-    uint v = (uint)clamp(value, 0, 999);
+    float2 uv = texcoord;
+    uv.x *= aspect;
+
+    float2 anchor = topRight;
+    anchor.x *= aspect;
+
+    uv -= anchor;
+    uv.x = -uv.x;
+
+    return GetDot(uv / scale);
+}
+
+float DrawOSDAPLPercent2(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, float currentAPL)
+{
+    int aplPctX100 = clamp(int(floor(saturate(currentAPL) * 10000.0 + 0.5)), 0, 10000);
+    int integerPart = aplPctX100 / 100;
+    int fractionalPart = aplPctX100 % 100;
+
     float mask = 0.0;
 
-    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, (int)(v % 10));
+    // Fixed 2-decimal percent layout, right-aligned to the hundredths digit:
+    // [hundreds][tens][ones].[tenths][hundredths]
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, fractionalPart % 10);
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (fractionalPart / 10) % 10);
+    mask += DrawOSDDotAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect);
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, integerPart % 10);
 
-    if (v >= 10)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (int)((v / 10) % 10));
+    if (integerPart >= 10)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (integerPart / 10) % 10);
 
-    if (v >= 100)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (int)((v / 100) % 10));
+    if (integerPart >= 100)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 5.0, 0.0), scale, aspect, (integerPart / 100) % 10);
 
     return saturate(mask);
 }
@@ -1921,51 +1990,65 @@ float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, fl
     return saturate(mask);
 }
 
-float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float currentAPL, float maxSampledNits, float fader)
+float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSampledNits)
 {
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float invAspect = 1.0 / max(aspect, 1e-6);
-    float scale = 0.034;
+    float scale = 0.029;
     float glyphWidth = scale * invAspect;
-    float stepX = glyphWidth * 1.10;
-    float lineSpacing = scale * 1.28;
-    float percentGap = glyphWidth * 0.22;
+    float stepX = glyphWidth * 1.08;
+    float lineSpacing = scale * 1.22;
+    float percentGap = glyphWidth * 0.20;
 
-    // Compact two-row numeric OSD on the right.
-    // Row 1 = smoothed APL percent, Row 2 = max sampled decoded scene nits.
-    float rightMargin = 0.018;
-    float2 percentTopRight = float2(1.0 - rightMargin, 0.045);
-    float2 topRowRight = percentTopRight - float2(glyphWidth + percentGap, 0.0);
-    float2 bottomRowRight = topRowRight + float2(0.0, lineSpacing);
+    // Compact three-row numeric OSD on the right.
+    // Row 1 = raw input scene APL (%), Row 2 = smoothed output / display-side APL (%), Row 3 = max sampled decoded scene nits.
+    float rightMargin = 0.016;
+    float2 inputPercentRight = float2(1.0 - rightMargin, 0.040);
+    float2 inputRowRight = inputPercentRight - float2(glyphWidth + percentGap, 0.0);
+    float2 outputPercentRight = inputPercentRight + float2(0.0, lineSpacing);
+    float2 outputRowRight = inputRowRight + float2(0.0, lineSpacing);
+    float2 nitsRowRight = inputRowRight + float2(0.0, lineSpacing * 2.0);
 
-    float left = bottomRowRight.x - stepX * 4.0 - glyphWidth;
-    float right = percentTopRight.x;
-    float top = topRowRight.y;
-    float bottom = bottomRowRight.y + scale;
+    float left = inputRowRight.x - stepX * 5.0 - glyphWidth;
+    float right = inputPercentRight.x;
+    float top = inputRowRight.y;
+    float bottom = nitsRowRight.y + scale;
 
-    float padX = glyphWidth * 0.45;
-    float padY = scale * 0.22;
+    float padX = glyphWidth * 0.42;
+    float padY = scale * 0.18;
 
     if (texcoord.x < left - padX || texcoord.x > right + padX || texcoord.y < top - padY || texcoord.y > bottom + padY)
         return sceneColor;
 
-    int aplDisplay = clamp(int(floor(saturate(currentAPL) * 100.0 + 0.5)), 0, 100);
     int nitDisplay = clamp(int(floor(max(maxSampledNits, 0.0) + 0.5)), 0, 99999);
 
     float bgMask = (texcoord.x >= left - padX && texcoord.x <= right + padX && texcoord.y >= top - padY && texcoord.y <= bottom + padY) ? 1.0 : 0.0;
 
-    float textMask = 0.0;
-    textMask += DrawOSDRow3(texcoord, topRowRight, scale, stepX, aspect, aplDisplay);
-    textMask += DrawOSDPercentAt(texcoord, percentTopRight, scale, aspect);
-    textMask += DrawOSDRow5(texcoord, bottomRowRight, scale, stepX, aspect, nitDisplay);
-    textMask = saturate(textMask);
+    float inputMask = 0.0;
+    inputMask += DrawOSDAPLPercent2(texcoord, inputRowRight, scale, stepX, aspect, rawInputAPL);
+    inputMask += DrawOSDPercentAt(texcoord, inputPercentRight, scale, aspect);
+    inputMask = saturate(inputMask);
+
+    float outputMask = 0.0;
+    outputMask += DrawOSDAPLPercent2(texcoord, outputRowRight, scale, stepX, aspect, outputAPL);
+    outputMask += DrawOSDPercentAt(texcoord, outputPercentRight, scale, aspect);
+    outputMask = saturate(outputMask);
+
+    float nitsMask = DrawOSDRow5(texcoord, nitsRowRight, scale, stepX, aspect, nitDisplay);
 
     float bgAlpha = 0.18 * OSDBrightness * bgMask;
-    float3 baseColor = lerp(float3(1.0, 1.0, 1.0), float3(0.0, 1.0, 0.0), fader);
-    float3 textColor = baseColor * OSDBrightness;
     float3 shadedScene = sceneColor * (1.0 - bgAlpha);
 
-    return lerp(shadedScene, textColor, textMask);
+    float3 inputColor = float3(0.30, 1.00, 0.30) * OSDBrightness;
+    float3 outputColor = float3(1.00, 0.90, 0.18) * OSDBrightness;
+    float3 nitsColor = float3(0.60, 0.85, 1.00) * OSDBrightness;
+
+    float3 result = shadedScene;
+    result = lerp(result, inputColor, inputMask);
+    result = lerp(result, outputColor, outputMask);
+    result = lerp(result, nitsColor, nitsMask);
+
+    return result;
 }
 
 // PASS 2b: Main Rendering (1D APL-only measured scene gain + hybrid luminance participation)
@@ -1987,10 +2070,8 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
 
     if (ShowOSD)
     {
-        // fader is only needed for the OSD tint; compute it here rather than before the
-        // early exit above so it isn't evaluated on every pixel when ShowOSD is off.
-        float fader = ComputeAPLBoostFader(currentAPL);
-        finalColor = DrawStatsOverlay(texcoord, finalColor, currentAPL, aplData.g, fader);
+        float rawInputAPL = saturate(tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0)).r);
+        finalColor = DrawStatsOverlay(texcoord, finalColor, rawInputAPL, currentAPL, aplData.g);
     }
 
     return float4(finalColor, 1.0);
@@ -2103,7 +2184,6 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
     float aspect       = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float2 graphPos    = float2(0.055 * aspect, 0.48);
     float2 graphSize   = float2(0.43  * aspect, 0.44);
-    float thickness    = 0.00105;
     float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
 
     float4 graphParams               = tex2Dlod(SamplerGraphParams, float4(0.5, 0.5, 0.0, 0.0));
@@ -2114,11 +2194,8 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
     float  graphRollOffStartNits     = graphParams.r;
     float  graphAnchorBoostedNits    = graphParams.a;
 
-    bool useFF   = GraphUseFullFieldWindowProjection;
-    bool useFF50 = useFF && (GraphProjectionWindowSize == 1);
-    bool useFF25 = useFF && (GraphProjectionWindowSize == 2);
-    bool useFF15 = useFF && (GraphProjectionWindowSize == 3);
-    bool useFF10 = useFF && (GraphProjectionWindowSize == 4);
+    bool useFF = GraphUseFullFieldWindowProjection;
+    int fullFieldWindowMode = GraphProjectionWindowSize;
 
     // --- Sample the two nits x-values for this segment ---
     float t0 = float(s)     / float(GRAPH_CURVE_SAMPLES - 1);
@@ -2126,39 +2203,8 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
     float x0 = GraphSampleNitsFromFraction(t0, graphAxisMaxNits, graphAxisMaxPQ);
     float x1 = GraphSampleNitsFromFraction(t1, graphAxisMaxNits, graphAxisMaxPQ);
 
-    // Helper macro: nits → p-space screen point
-    // (avoids repeating the 5-arg call)
-    #define TO_SCREEN(xN, yN) ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, (xN), (yN))
-
-    // Helper: select the right remapped-target function for this window size
-    #define REMAPPED(xVal) (useFF \
-        ? (useFF10 ? ComputeFullField10RemappedTargetNits(xVal) \
-         : (useFF15 ? ComputeFullField15RemappedTargetNits(xVal) \
-         : (useFF25 ? ComputeFullField25RemappedTargetNits(xVal) \
-         : (useFF50 ? ComputeFullField50RemappedTargetNits(xVal) \
-                    : ComputeFullField100RemappedTargetNits(xVal))))) \
-        : ComputeGraphBoostedTargetNits(graphClosedLoopAPLPercent, xVal, graphAnchorBoostedNits))
-
-    // Helper: select the right measured-output function for a remapped y
-    #define CORRECTED(yRemap) (useFF \
-        ? (useFF10 ? SampleMeasuredOutputNitsFullField10(yRemap) \
-         : (useFF15 ? SampleMeasuredOutputNitsFullField15(yRemap) \
-         : (useFF25 ? SampleMeasuredOutputNitsFullField25(yRemap) \
-         : (useFF50 ? SampleMeasuredOutputNitsFullField50(yRemap) \
-                    : SampleMeasuredOutputNitsFullField100(yRemap))))) \
-        : SampleCorrectedOutputNitsForAPL(graphClosedLoopAPLPercent, yRemap, graphMaxMeasuredNits))
-
-    // Helper: measured raw output for a direct x nits value
-    #define MEASURED_RAW(xVal) (useFF \
-        ? (useFF10 ? SampleMeasuredOutputNitsFullField10(xVal) \
-         : (useFF15 ? SampleMeasuredOutputNitsFullField15(xVal) \
-         : (useFF25 ? SampleMeasuredOutputNitsFullField25(xVal) \
-         : (useFF50 ? SampleMeasuredOutputNitsFullField50(xVal) \
-                    : SampleMeasuredOutputNitsFullField100(xVal))))) \
-        : SampleRealMeasuredOutputNitsForAPL(graphRawAPLPercent, xVal))
-
     float graphMaxMeasuredNits = useFF
-        ? (useFF10 ? GetFullField10MeasuredMaxOutputNits() : (useFF15 ? GetFullField15MeasuredMaxOutputNits() : (useFF25 ? GetFullField25MeasuredMaxOutputNits() : (useFF50 ? GetFullField50MeasuredMaxOutputNits() : GetFullField100MeasuredMaxOutputNits()))))
+        ? GetFullFieldMeasuredMaxOutputNitsByMode(fullFieldWindowMode)
         : graphParams.g;
 
     float4 result = SENTINEL;
@@ -2168,38 +2214,38 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
         // Green re-mapped curve: standard APL mode only, using the closed-loop display-side APL solved from the selected raw input APL.
         if (!useFF)
         {
-            float y0 = REMAPPED(x0);
-            float y1 = REMAPPED(x1);
-            float2 a = TO_SCREEN(x0, y0);
-            float2 b = TO_SCREEN(x1, y1);
+            float y0 = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x0);
+            float y1 = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x1);
+            float2 a = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0);
+            float2 b = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1);
             result = float4(a, b);
         }
     }
     else if (row == GCURVE_CORRECTED)
     {
         // Gray projected / corrected output curve (both modes).
-        float y0r = REMAPPED(x0);
-        float y1r = REMAPPED(x1);
-        float y0  = CORRECTED(y0r);
-        float y1  = CORRECTED(y1r);
-        float2 a  = TO_SCREEN(x0, y0);
-        float2 b  = TO_SCREEN(x1, y1);
+        float y0r = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x0);
+        float y1r = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x1);
+        float y0  = ComputeGraphCurveCorrectedOutputNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphMaxMeasuredNits, y0r);
+        float y1  = ComputeGraphCurveCorrectedOutputNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphMaxMeasuredNits, y1r);
+        float2 a  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0);
+        float2 b  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1);
         result = float4(a, b);
     }
     else if (row == GCURVE_MEASURED)
     {
         // Light-blue measured raw curve at the selected raw input APL / window set (clamped to measuredMaxInputNits).
         float measuredMaxInputNits = useFF
-            ? (useFF10 ? GetFullField10MeasuredMaxInputNits() : (useFF15 ? GetFullField15MeasuredMaxInputNits() : (useFF25 ? GetFullField25MeasuredMaxInputNits() : (useFF50 ? GetFullField50MeasuredMaxInputNits() : GetFullField100MeasuredMaxInputNits()))))
+            ? GetFullFieldMeasuredMaxInputNitsByMode(fullFieldWindowMode)
             : GetGraphMeasuredMaxInputNits();
 
         if (x0 < measuredMaxInputNits)
         {
             float mx1 = min(x1, measuredMaxInputNits);
-            float y0   = MEASURED_RAW(x0);
-            float y1   = MEASURED_RAW(mx1);
-            float2 a   = TO_SCREEN(x0,  y0);
-            float2 b   = TO_SCREEN(mx1, y1);
+            float y0   = ComputeGraphCurveMeasuredRawOutputNits(useFF, fullFieldWindowMode, graphRawAPLPercent, x0);
+            float y1   = ComputeGraphCurveMeasuredRawOutputNits(useFF, fullFieldWindowMode, graphRawAPLPercent, mx1);
+            float2 a   = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0,  y0);
+            float2 b   = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, mx1, y1);
             result = float4(a, b);
         }
     }
@@ -2211,17 +2257,11 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
         {
             float y0  = ComputeBT2390ReferenceOutputNits(x0, graphAxisMaxNits, idealReferencePeakNits);
             float y1  = ComputeBT2390ReferenceOutputNits(x1, graphAxisMaxNits, idealReferencePeakNits);
-            float2 a  = TO_SCREEN(x0, y0);
-            float2 b  = TO_SCREEN(x1, y1);
+            float2 a  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0);
+            float2 b  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1);
             result = float4(a, b);
         }
     }
-
-    #undef TO_SCREEN
-    #undef REMAPPED
-    #undef CORRECTED
-    #undef MEASURED_RAW
-
     return result;
 }
 
