@@ -1,19 +1,22 @@
 /*
-    EOTF Boost v8.6 - 1D APL-Only Lookup for Samsung Odyssey OLED G8 G85SB
-    =================================
+    EOTF Boost v8.7 - 1D APL Lookup + Optional High APL Adaptive Boost
+    ================================================================
 
     Purpose
     -------
     This shader boosts HDR luminance to compensate for OLED / display ABL behavior
-    using a simplified measured 1D lookup table and a hybrid pixel participation model.
+    using a simplified measured 1D APL lookup table, a hybrid pixel participation model,
+    and an optional High APL adaptive boost modifier for lower-nit content.
 
     This version applies compensation as a multiplicative gain in absolute nits:
 
-        scene_gain = measured_compensation(APL) shaped by LUT weight and strength
-        pixel_gain = scene_gain ^ participation
+        base_scene_gain  = measured_compensation(APL) shaped by LUT weight and strength
+        final_scene_gain = base_scene_gain optionally modified by the High APL adaptive boost logic
+        pixel_gain       = final_scene_gain ^ participation
 
     where:
         - APL is the scene average picture level metric (0..1, shown as 0..100%)
+        - High APL % is a secondary bright-area coverage metric built from a configurable nit range
         - compensation > 1 means the display measured darker than the requested target
 
     This version collapses the original measured 2D APL x nits LUT into a single
@@ -21,7 +24,7 @@
     the per-row variation across target nits was small.
 
     The lookup table is NOT used as a direct inverse solve.
-    Instead, it is used as a SHAPE / WEIGHT map that drives a capped boost model.
+    Instead, it is used as a shape / weight map that drives a capped boost model.
 
 */
 
@@ -91,7 +94,7 @@ uniform float MaxAPLBoostStrength <
 
 uniform bool EnablePerAPLBoostStrength <
     ui_label = "Enable Per-APL Boost Strength";
-    UI_TOOLTIP("Enables the advanced per-APL boost-strength controls below. When disabled, the shader behaves exactly like before and uses only Max APL Boost Strength globally.")
+    UI_TOOLTIP("Enables the advanced per-APL boost-strength controls below. When disabled, the shader uses only Global APL Boost Strength.")
 > = false;
 
 uniform float APLBoostStrength03 <
@@ -185,17 +188,68 @@ uniform float APLBoostStrength50 <
 > = 0.5;
 
 
+
+uniform bool EnableHighAPLAdaptiveBoost <
+    ui_label = "Enable Adaptive Boost for Low-Nit Content";
+    UI_TOOLTIP("Allows higher boost strength in lower-nit scenes. A secondary High APL % metric is built from the configured nit range and reduces the final scene boost from the adaptive maximum back toward the normal APL-based boost strength as bright HDR area increases. It does not feed back into the base closed-loop APL solve.")
+> = false;
+
+uniform float HighAPLMetricMinNits <
+    ui_type = "slider";
+    ui_min = 1.0; ui_max = 1000.0; ui_step = 1.0;
+    ui_category = "Advanced Adaptive Boost Setup";
+    ui_category_closed = true;
+    ui_label = "High APL Metric Min (nits)";
+    UI_TOOLTIP("Per-pixel lower bound for the High APL % metric. Pixels at or below this level contribute 0.0 to the metric. Used only when Enable High APL Adaptive Boost is enabled.")
+> = 400.0;
+
+uniform float HighAPLMetricMaxNits <
+    ui_type = "slider";
+    ui_min = 1.0; ui_max = 1000.0; ui_step = 1.0;
+    ui_category = "Advanced Adaptive Boost Setup";
+    ui_category_closed = true;
+    ui_label = "High APL Metric Max (nits)";
+    UI_TOOLTIP("Per-pixel upper bound for the High APL % metric. Pixels at or above this level contribute 1.0 to the metric. Pixels in between are scaled linearly. Used only when Enable High APL Adaptive Boost is enabled.")
+> = 400.0;
+
+uniform float HighAPLReductionStartPercent <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 100.0; ui_step = 0.1;
+    ui_category = "Advanced Adaptive Boost Setup";
+    ui_category_closed = true;
+    ui_label = "High APL Reduction Start (%)";
+    UI_TOOLTIP("High APL % level where the adaptive boost begins reducing from the adaptive maximum back toward the normal APL-based boost strength. Used only when Enable High APL Adaptive Boost is enabled.")
+> = 0.0;
+
+uniform float HighAPLReductionEndPercent <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 100.0; ui_step = 0.1;
+    ui_category = "Advanced Adaptive Boost Setup";
+    ui_category_closed = true;
+    ui_label = "High APL Reduction End (%)";
+    UI_TOOLTIP("High APL % level where the adaptive boost has fully reduced back to the normal APL-based boost strength. Used only when Enable High APL Adaptive Boost is enabled.")
+> = 10.0;
+
+uniform float HighAPLAdaptiveMaxBoostStrength <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_category = "Advanced Adaptive Boost Setup";
+    ui_category_closed = true;
+    ui_label = "High APL Adaptive Max Boost Strength";
+    UI_TOOLTIP("Maximum boost strength allowed when the High APL % metric is very low. The actual scene boost then transitions from this value toward the normal APL-based boost strength over the configured High APL % reduction range. Used only when Enable High APL Adaptive Boost is enabled.")
+> = 0.9;
+
 uniform float BoostRollOff <
     ui_type = "slider";
     ui_min = 500.0; ui_max = 1500.0; ui_step = 1.0;
-    ui_label = "Boost roll off target (nits)";
-    UI_TOOLTIP("Desired output anchor of the PQ highlight rolloff in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels. 0 = Disabled.")
+    ui_label = "Boost Roll-Off Target (nits)";
+    UI_TOOLTIP("Desired output anchor of the PQ highlight rolloff in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels.")
 > = 1000.0;
 
 uniform float BoostRollOffShape <
     ui_type = "slider";
     ui_min = 0.25; ui_max = 4.0; ui_step = 0.01;
-    ui_label = "Boost roll off shape";
+    ui_label = "Boost Roll-Off Shape";
     UI_TOOLTIP("Adjusts the live roll off character by moving the roll off start together with the shoulder curvature so the transition stays smooth and monotonic. 1.0 = standard BT.2390. Values below 1.0 start later and hold highlights higher longer. Values above 1.0 start earlier and compress highlights harder.")
 > = 1.25;
 
@@ -217,7 +271,7 @@ uniform float TransitionSpeed <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "APL Smoothing Time (s)";
-    UI_TOOLTIP("Temporal smoothing time constant for the live APL metric in seconds. 0 = disabled. FPS-independent. This affects live boosting and OSD values, but the graph uses its own Graph APL % slider.")
+    UI_TOOLTIP("Temporal smoothing time constant for the live APL-related metrics in seconds. 0 = disabled. FPS-independent. This affects live boosting and OSD values, but the graph uses its own Graph APL % slider.")
 > = 0.25;
 
 uniform float SaturationComp <
@@ -237,7 +291,7 @@ uniform float SIGNAL_REFERENCE_NITS <
 
 uniform bool ShowOSD <
     ui_label = "Show APL / Metric Stats";
-    UI_TOOLTIP("Displays the current smoothed APL percentage and the maximum sampled decoded scene luminance in nits from the APL analysis pass.")
+    UI_TOOLTIP("Displays the current raw input APL (green), smoothed output/display-side APL (yellow), maximum sampled decoded scene luminance in nits (cyan), High APL % (orange), and current final scene boost strength (magenta).")
 > = false;
 
 uniform float OSDBrightness <
@@ -801,6 +855,41 @@ float ComputeTemporalBlendFactor(float smoothingSeconds)
     return saturate(1.0 - exp(-dtSeconds / max(smoothingSeconds, 1e-6)));
 }
 
+
+float ComputeHighAPLMetricSampleWeight(float sampleNits)
+{
+    float minNits = max(HighAPLMetricMinNits, 0.0);
+    float maxNits = max(HighAPLMetricMaxNits, minNits + 1e-4);
+    return saturate((sampleNits - minNits) / (maxNits - minNits));
+}
+
+float ComputeHighAPLReductionWeight(float highAPLMetric)
+{
+    float startMetric = saturate(HighAPLReductionStartPercent * 0.01);
+    float endMetric = max(HighAPLReductionEndPercent * 0.01, startMetric + 1e-4);
+    return Remap01(highAPLMetric, startMetric, endMetric);
+}
+
+float ComputeAdaptiveBoostStrength(float baseStrength, float highAPLMetric)
+{
+    if (!EnableHighAPLAdaptiveBoost)
+        return baseStrength;
+
+    float adaptiveMaxStrength = max(HighAPLAdaptiveMaxBoostStrength, baseStrength);
+    float reductionWeight = ComputeHighAPLReductionWeight(highAPLMetric);
+    return lerp(adaptiveMaxStrength, baseStrength, reductionWeight);
+}
+
+float ComputeSceneFinalBoostStrength(float currentAPL, float highAPLMetric)
+{
+    float fader = ComputeAPLBoostFader(currentAPL);
+    float aplPct = saturate(currentAPL) * 100.0;
+    float baseStrength = LookupPerAPLBoostStrength(aplPct);
+    float boostStrength = ComputeAdaptiveBoostStrength(baseStrength, highAPLMetric);
+    return max(boostStrength * fader, 0.0);
+}
+
+
 // Precomputed participation ramp constants.
 // PixelParticipationStartNits = 1.0 → log2(1.0) = 0.0
 // PixelParticipationFullNits  = 40.0 → log2(40.0) ≈ 5.32193
@@ -833,26 +922,39 @@ float ComputePixelGainFromSceneLogGain(float sceneLogGain, float inputNits)
 }
 
 
+
+float ComputeSceneGainExponentFromMeasuredComp(float measuredComp, float currentAPL, float highAPLMetric)
+{
+    return ComputeSceneFinalBoostStrength(currentAPL, highAPLMetric);
+}
+
 float ComputeSceneGainExponentFromMeasuredComp(float measuredComp, float currentAPL)
 {
-    float fader = ComputeAPLBoostFader(currentAPL);
-    float aplPct = saturate(currentAPL) * 100.0;
-    float boostStrength = LookupPerAPLBoostStrength(aplPct);
-    return max(boostStrength * fader, 0.0);
+    return ComputeSceneGainExponentFromMeasuredComp(measuredComp, currentAPL, 0.0);
+}
+
+float ComputeSceneLogGainFromMeasuredComp(float measuredComp, float currentAPL, float highAPLMetric)
+{
+    float safeMeasuredComp = max(measuredComp, 1.0);
+    float gainExponent = ComputeSceneGainExponentFromMeasuredComp(safeMeasuredComp, currentAPL, highAPLMetric);
+    return log2(safeMeasuredComp) * gainExponent;
 }
 
 float ComputeSceneLogGainFromMeasuredComp(float measuredComp, float currentAPL)
 {
-    float safeMeasuredComp = max(measuredComp, 1.0);
-    float gainExponent = ComputeSceneGainExponentFromMeasuredComp(safeMeasuredComp, currentAPL);
-    return log2(safeMeasuredComp) * gainExponent;
+    return ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL, 0.0);
+}
+
+float ComputeSceneLogGainFromAPL(float currentAPL, float highAPLMetric)
+{
+    float aplPct = saturate(currentAPL) * 100.0;
+    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
+    return ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL, highAPLMetric);
 }
 
 float ComputeSceneLogGainFromAPL(float currentAPL)
 {
-    float aplPct = saturate(currentAPL) * 100.0;
-    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
-    return ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL);
+    return ComputeSceneLogGainFromAPL(currentAPL, 0.0);
 }
 
 float EstimateAverageParticipationFromRawAPL(float rawAPL)
@@ -861,7 +963,7 @@ float EstimateAverageParticipationFromRawAPL(float rawAPL)
     return ComputePixelParticipation(max(meanSceneNits, 0.0));
 }
 
-float SolveClosedLoopDisplayAPLFromRaw(float rawAPL)
+float SolveClosedLoopDisplayAPLFromRaw(float rawAPL, float highAPLMetric)
 {
     float safeRawAPL = saturate(rawAPL);
 
@@ -874,7 +976,7 @@ float SolveClosedLoopDisplayAPLFromRaw(float rawAPL)
     [unroll]
     for (int i = 0; i < 3; ++i)
     {
-        float sceneLogGain = ComputeSceneLogGainFromAPL(displayAPL);
+        float sceneLogGain = ComputeSceneLogGainFromAPL(displayAPL, highAPLMetric);
         float estimatedDisplayAPL = saturate(safeRawAPL * exp2(sceneLogGain * avgParticipation));
 
         // Mild damping keeps the closed-loop estimate stable with very short smoothing times.
@@ -884,6 +986,10 @@ float SolveClosedLoopDisplayAPLFromRaw(float rawAPL)
     return displayAPL;
 }
 
+float SolveClosedLoopDisplayAPLFromRaw(float rawAPL)
+{
+    return SolveClosedLoopDisplayAPLFromRaw(rawAPL, 0.0);
+}
 
 float ComputeGraphClosedLoopAPLFromRawPercent(float rawAPLPercent)
 {
@@ -891,22 +997,32 @@ float ComputeGraphClosedLoopAPLFromRawPercent(float rawAPLPercent)
     return SolveClosedLoopDisplayAPLFromRaw(rawAPL);
 }
 
-float ComputeSceneGainNoRolloff(float currentAPL)
+float ComputeSceneGainNoRolloff(float currentAPL, float highAPLMetric)
 {
     float aplPct = saturate(currentAPL) * 100.0;
     float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
-    float sceneLogGain = ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL);
+    float sceneLogGain = ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL, highAPLMetric);
     return exp2(sceneLogGain);
 }
 
-float ComputePixelGainNoRolloff(float currentAPL, float inputNits)
+float ComputeSceneGainNoRolloff(float currentAPL)
 {
-    float sceneGain = max(ComputeSceneGainNoRolloff(currentAPL), 1.0);
+    return ComputeSceneGainNoRolloff(currentAPL, 0.0);
+}
+
+float ComputePixelGainNoRolloff(float currentAPL, float inputNits, float highAPLMetric)
+{
+    float sceneGain = max(ComputeSceneGainNoRolloff(currentAPL, highAPLMetric), 1.0);
     float participation = ComputePixelParticipation(inputNits);
 
     // Hybrid participation keeps some global compensation on all pixels, while
     // brighter pixels smoothly receive the remaining share.
     return exp2(log2(sceneGain) * participation);
+}
+
+float ComputePixelGainNoRolloff(float currentAPL, float inputNits)
+{
+    return ComputePixelGainNoRolloff(currentAPL, inputNits, 0.0);
 }
 
 float SignalLumaToNits(float signalLuma)
@@ -925,28 +1041,51 @@ float NitsToSignalLuma(float nits)
     return max(nits, 0.0) / SIGNAL_REFERENCE_NITS;
 }
 
-float ComputeBoostedTargetNitsFromBoostTNoRolloff(float currentAPL, float inputNits)
+float ComputeBoostedTargetNitsFromBoostTNoRolloff(float currentAPL, float inputNits, float highAPLMetric)
 {
     float safeInputNits = max(inputNits, 0.0);
-    float pixelGain = ComputePixelGainNoRolloff(currentAPL, safeInputNits);
+    float pixelGain = ComputePixelGainNoRolloff(currentAPL, safeInputNits, highAPLMetric);
 
     return safeInputNits * pixelGain;
 }
 
-float ComputeBoostedTargetNitsNoRolloff(float currentAPL, float inputNits)
+float ComputeBoostedTargetNitsFromBoostTNoRolloff(float currentAPL, float inputNits)
 {
-    float safeInputNits = max(inputNits, 0.0);
-    return ComputeBoostedTargetNitsFromBoostTNoRolloff(currentAPL, safeInputNits);
+    return ComputeBoostedTargetNitsFromBoostTNoRolloff(currentAPL, inputNits, 0.0);
 }
 
-float ComputeRollOffAnchorBoostedNits(float currentAPL)
+float ComputeBoostedTargetNitsNoRolloff(float currentAPL, float inputNits, float highAPLMetric)
+{
+    float safeInputNits = max(inputNits, 0.0);
+    return ComputeBoostedTargetNitsFromBoostTNoRolloff(currentAPL, safeInputNits, highAPLMetric);
+}
+
+float ComputeBoostedTargetNitsNoRolloff(float currentAPL, float inputNits)
+{
+    return ComputeBoostedTargetNitsNoRolloff(currentAPL, inputNits, 0.0);
+}
+
+
+float ComputeRollOffAnchorBoostedNitsFromSceneLogGain(float sceneLogGain)
 {
     float rollOffEndNits = max(BoostRollOff, 0.0);
 
     if (rollOffEndNits <= 0.0)
         return 0.0;
 
-    return ComputeBoostedTargetNitsNoRolloff(currentAPL, max(rollOffEndNits, 1e-4));
+    float referenceInputNits = max(rollOffEndNits, 1e-4);
+    return referenceInputNits * ComputePixelGainFromSceneLogGain(sceneLogGain, referenceInputNits);
+}
+
+float ComputeRollOffAnchorBoostedNits(float currentAPL, float highAPLMetric)
+{
+    float sceneLogGain = ComputeSceneLogGainFromAPL(currentAPL, highAPLMetric);
+    return ComputeRollOffAnchorBoostedNitsFromSceneLogGain(sceneLogGain);
+}
+
+float ComputeRollOffAnchorBoostedNits(float currentAPL)
+{
+    return ComputeRollOffAnchorBoostedNits(currentAPL, 0.0);
 }
 
 float SolveDynamicRollOffStartNits(float currentAPL)
@@ -1843,10 +1982,12 @@ float4 PS_DecodeAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_
 // the expensive decode work was done in parallel by PS_DecodeAPL above.
 // APLGridSize is no longer used here: since the decode cost is paid by the
 // parallel pass, all APL_DECODE_SIZE^2 samples are always accumulated.
+
 float4 PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
-    float totalMetric        = 0.0;
+    float totalMetric         = 0.0;
     float maxSampledSceneNits = 0.0;
+    float totalHighAPLMetric  = 0.0;
     static const float invTotalSamples = 1.0 / float(APL_DECODE_SIZE * APL_DECODE_SIZE);
 
     [loop]
@@ -1857,21 +1998,28 @@ float4 PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Ta
         {
             float2 uv   = (float2(x, y) + 0.5) * invTotalSamples * float(APL_DECODE_SIZE); // = (xy + 0.5) / APL_DECODE_SIZE
             float2 data = tex2Dlod(SamplerAPLDecoded, float4(uv, 0.0, 0.0)).rg;
+            float sampleNits = data.g;
+
             totalMetric         += data.r;
-            maxSampledSceneNits  = max(maxSampledSceneNits, data.g);
+            maxSampledSceneNits  = max(maxSampledSceneNits, sampleNits);
+
+            if (EnableHighAPLAdaptiveBoost)
+                totalHighAPLMetric += ComputeHighAPLMetricSampleWeight(sampleNits);
         }
     }
 
     float apl = totalMetric * invTotalSamples;
+    float highAPLMetric = EnableHighAPLAdaptiveBoost ? (totalHighAPLMetric * invTotalSamples) : 0.0;
 
-    // r = raw current-frame APL metric, g = max sampled decoded scene nits, a = valid
-    return float4(apl, maxSampledSceneNits, 0.0, 1.0);
+    // r = raw current-frame APL metric, g = max sampled decoded scene nits, b = raw current-frame High APL % metric, a = valid
+    return float4(apl, maxSampledSceneNits, highAPLMetric, 1.0);
 }
 
 float4 PS_CopyAPLState(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     return tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
 }
+
 
 float4 PS_SmoothAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
@@ -1880,26 +2028,34 @@ float4 PS_SmoothAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_
 
     float rawAPL = saturate(currentData.r);
     float currentMaxSampledNits = max(currentData.g, 0.0);
-    float closedLoopCurrentAPL = SolveClosedLoopDisplayAPLFromRaw(rawAPL);
-    float prevAPLRaw = prevData.r;
-    float prevSmoothedAPL = saturate(prevAPLRaw);
+    float currentHighAPLMetric = saturate(currentData.b);
+
+    float prevSmoothedAPL = saturate(prevData.r);
     float prevSmoothedMaxSampledNits = max(prevData.g, 0.0);
+    float prevSmoothedHighAPLMetric = saturate(prevData.b);
 
     float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
-    float hasPrev = (prevData.a > 0.5 && prevAPLRaw >= 0.0 && prevAPLRaw <= 1.0) ? 1.0 : 0.0;
+    float hasPrev = (prevData.r > 0.0 || prevData.g > 0.0 || prevData.b > 0.0 || prevData.a > 0.0) ? 1.0 : 0.0;
 
-    float smoothedAPL = lerp(closedLoopCurrentAPL, lerp(prevSmoothedAPL, closedLoopCurrentAPL, alpha), hasPrev);
     float smoothedMaxSampledNits = lerp(currentMaxSampledNits, lerp(prevSmoothedMaxSampledNits, currentMaxSampledNits, alpha), hasPrev);
+    float smoothedHighAPLMetric = lerp(currentHighAPLMetric, lerp(prevSmoothedHighAPLMetric, currentHighAPLMetric, alpha), hasPrev);
+
+    // Keep the original closed-loop APL solver independent from the High APL % overlay reduction.
+    // This avoids a second lag path where the smoothed High APL metric indirectly perturbs the
+    // already-smoothed base APL operating point. High APL % still reduces the final scene boost
+    // directly through ComputeSceneLogGainFromAPL(...) below.
+    float closedLoopCurrentAPL = SolveClosedLoopDisplayAPLFromRaw(rawAPL);
+    float smoothedAPL = lerp(closedLoopCurrentAPL, lerp(prevSmoothedAPL, closedLoopCurrentAPL, alpha), hasPrev);
+
     // Precompute scene-uniform sceneLogGain here (1x1 pass) so PS_MainPass reads it from the
     // texture instead of recomputing the LUT lookup + log2 + pow chain for every pixel.
-    // Note: dynamicRollOffStartNits previously stored here is only consumed by PS_CalcGraphParams
-    // (ENABLE_APL_GRAPH path), which recomputes it independently — so .b is free to repurpose.
-    float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
-    float rollOffAnchorBoostedNits = ComputeRollOffAnchorBoostedNits(smoothedAPL);
+    // .b is now the smoothed High APL % metric, so sceneLogGain moves to .a and the live pass
+    // recomputes the rolloff anchor from that value.
+    float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL, smoothedHighAPLMetric);
 
     // r = smoothed closed-loop display-side APL metric, g = smoothed max sampled decoded scene nits,
-    // b = precomputed scene log-gain (uniform across all pixels), a = boosted anchor nits used by the PQ rational shoulder
-    return float4(smoothedAPL, smoothedMaxSampledNits, sceneLogGain, rollOffAnchorBoostedNits);
+    // b = smoothed High APL % metric, a = precomputed scene log-gain (uniform across all pixels)
+    return float4(smoothedAPL, smoothedMaxSampledNits, smoothedHighAPLMetric, sceneLogGain);
 }
 
 float DrawOSDDigitAt(float2 texcoord, float2 topRight, float scale, float aspect, int digit)
@@ -1968,6 +2124,26 @@ float DrawOSDAPLPercent2(float2 texcoord, float2 topRight, float scale, float st
     return saturate(mask);
 }
 
+float DrawOSDFixed2(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, float value)
+{
+    int valueX100 = clamp(int(floor(max(value, 0.0) * 100.0 + 0.5)), 0, 9999);
+    int integerPart = valueX100 / 100;
+    int fractionalPart = valueX100 % 100;
+
+    float mask = 0.0;
+
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, fractionalPart % 10);
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (fractionalPart / 10) % 10);
+    mask += DrawOSDDotAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect);
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, integerPart % 10);
+
+    if (integerPart >= 10)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (integerPart / 10) % 10);
+
+    return saturate(mask);
+}
+
+
 float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
 {
     uint v = (uint)clamp(value, 0, 99999);
@@ -1990,7 +2166,8 @@ float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, fl
     return saturate(mask);
 }
 
-float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSampledNits)
+
+float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSampledNits, float highAPLMetric, float finalBoostStrength)
 {
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float invAspect = 1.0 / max(aspect, 1e-6);
@@ -2000,19 +2177,24 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float lineSpacing = scale * 1.22;
     float percentGap = glyphWidth * 0.20;
 
-    // Compact three-row numeric OSD on the right.
-    // Row 1 = raw input scene APL (%), Row 2 = smoothed output / display-side APL (%), Row 3 = max sampled decoded scene nits.
+    // Compact five-row numeric OSD on the right.
+    // Row 1 = raw input scene APL (%), Row 2 = smoothed output / display-side APL (%),
+    // Row 3 = smoothed max sampled decoded scene nits, Row 4 = smoothed High APL (%),
+    // Row 5 = current final scene boost strength.
     float rightMargin = 0.016;
     float2 inputPercentRight = float2(1.0 - rightMargin, 0.040);
     float2 inputRowRight = inputPercentRight - float2(glyphWidth + percentGap, 0.0);
     float2 outputPercentRight = inputPercentRight + float2(0.0, lineSpacing);
     float2 outputRowRight = inputRowRight + float2(0.0, lineSpacing);
     float2 nitsRowRight = inputRowRight + float2(0.0, lineSpacing * 2.0);
+    float2 highAPLPercentRight = inputPercentRight + float2(0.0, lineSpacing * 3.0);
+    float2 highAPLRowRight = inputRowRight + float2(0.0, lineSpacing * 3.0);
+    float2 boostStrengthRowRight = inputRowRight + float2(0.0, lineSpacing * 4.0);
 
     float left = inputRowRight.x - stepX * 5.0 - glyphWidth;
     float right = inputPercentRight.x;
     float top = inputRowRight.y;
-    float bottom = nitsRowRight.y + scale;
+    float bottom = boostStrengthRowRight.y + scale;
 
     float padX = glyphWidth * 0.42;
     float padY = scale * 0.18;
@@ -2036,42 +2218,58 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
 
     float nitsMask = DrawOSDRow5(texcoord, nitsRowRight, scale, stepX, aspect, nitDisplay);
 
+    float highAPLMask = 0.0;
+    highAPLMask += DrawOSDAPLPercent2(texcoord, highAPLRowRight, scale, stepX, aspect, highAPLMetric);
+    highAPLMask += DrawOSDPercentAt(texcoord, highAPLPercentRight, scale, aspect);
+    highAPLMask = saturate(highAPLMask);
+
+    float boostStrengthMask = DrawOSDFixed2(texcoord, boostStrengthRowRight, scale, stepX, aspect, finalBoostStrength);
+
     float bgAlpha = 0.18 * OSDBrightness * bgMask;
     float3 shadedScene = sceneColor * (1.0 - bgAlpha);
 
     float3 inputColor = float3(0.30, 1.00, 0.30) * OSDBrightness;
     float3 outputColor = float3(1.00, 0.90, 0.18) * OSDBrightness;
     float3 nitsColor = float3(0.60, 0.85, 1.00) * OSDBrightness;
+    float3 highAPLColor = float3(1.00, 0.55, 0.22) * OSDBrightness;
+    float3 boostStrengthColor = float3(0.95, 0.65, 1.00) * OSDBrightness;
 
     float3 result = shadedScene;
     result = lerp(result, inputColor, inputMask);
     result = lerp(result, outputColor, outputMask);
     result = lerp(result, nitsColor, nitsMask);
+    result = lerp(result, highAPLColor, highAPLMask);
+    result = lerp(result, boostStrengthColor, boostStrengthMask);
 
     return result;
 }
 
 // PASS 2b: Main Rendering (1D APL-only measured scene gain + hybrid luminance participation)
+
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
 
     float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
     float currentAPL = aplData.r;
+    float smoothedMaxSampledNits = aplData.g;
+    float smoothedHighAPLMetric = aplData.b;
 
     // sceneLogGain is scene-uniform (depends only on APL + uniforms).
-    // It is precomputed once in PS_SmoothAPL and stored in aplData.b,
+    // It is precomputed once in PS_SmoothAPL and stored in aplData.a,
     // eliminating the LUT lookup + log2 + conditional pow chain per pixel.
-    float sceneLogGain = aplData.b;
+    float sceneLogGain = aplData.a;
     if (sceneLogGain <= 0.0 && (ShowOSD == false))
         return float4(color, 1.0);
 
-    float3 finalColor = ApplyBoostPreserveColorFromSceneLogGain(color, sceneLogGain, aplData.a);
+    float rollOffAnchorBoostedNits = ComputeRollOffAnchorBoostedNitsFromSceneLogGain(sceneLogGain);
+    float3 finalColor = ApplyBoostPreserveColorFromSceneLogGain(color, sceneLogGain, rollOffAnchorBoostedNits);
 
     if (ShowOSD)
     {
         float rawInputAPL = saturate(tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0)).r);
-        finalColor = DrawStatsOverlay(texcoord, finalColor, rawInputAPL, currentAPL, aplData.g);
+        float finalBoostStrength = ComputeSceneFinalBoostStrength(currentAPL, smoothedHighAPLMetric);
+        finalColor = DrawStatsOverlay(texcoord, finalColor, rawInputAPL, currentAPL, smoothedMaxSampledNits, smoothedHighAPLMetric, finalBoostStrength);
     }
 
     return float4(finalColor, 1.0);
