@@ -1,5 +1,6 @@
 /*
     EOTF Boost v8.7 - 1D APL Lookup + Optional High APL Adaptive Boost
+    Calibrated for monitor SAMSUNG OLED G8 G85SB
     ================================================================
 
     Purpose
