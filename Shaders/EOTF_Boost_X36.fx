@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.8 - 1D APL Lookup + Optional High APL Adaptive Boost
+    EOTF Boost v8.9 - 1D APL Lookup + Optional High APL Adaptive Boost
 	Calibrated for monitor MSI MPG 341CQR QD-OLED X36
     ================================================================
 
@@ -42,6 +42,7 @@
     #define ENABLE_UI_TOOLTIPS 0
 #endif
 
+
 // APL decode grid resolution.  Total parallel decode threads = APL_DECODE_SIZE^2.
 // Must be a power of two between 8 and 64.  32 (1024 samples) is the recommended default.
 // Override at compile time with: #define APL_DECODE_SIZE 16
@@ -75,7 +76,14 @@ uniform float APLTrigger <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 0.95; ui_step = 0.01;
     ui_label = "APL Trigger";
-    UI_TOOLTIP("Fade-in threshold for the boost based on the smoothed APL metric. Below this level the effect is reduced or disabled. 10% APL on the graph is exactly the threshold when this is set to 0.10.")
+    UI_TOOLTIP("Boost fade-in start threshold based on the smoothed APL metric. Below this level the effect is disabled. With APL Trigger Fade Width = 0, this remains a hard on/off threshold. 10% APL on the graph is exactly the threshold when this is set to 0.10.")
+> = 0.00;
+
+uniform float APLTriggerFadeWidth <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 0.50; ui_step = 0.01;
+    ui_label = "APL Trigger Fade Width";
+    UI_TOOLTIP("Width of the APL Trigger fade-in range. 0 = original hard trigger. Example: Trigger 0.10 and Fade Width 0.05 means boost fades from 0 at 10% APL to full strength at 15% APL.")
 > = 0.00;
 
 uniform float CompensationFreezeAPLPercent <
@@ -242,7 +250,7 @@ uniform float HighAPLAdaptiveMaxBoostStrength <
 
 uniform float BoostRollOff <
     ui_type = "slider";
-    ui_min = 500.0; ui_max = 1500.0; ui_step = 1.0;
+    ui_min = 0.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "Boost Roll-Off Target (nits)";
     UI_TOOLTIP("Desired output anchor of the PQ highlight rolloff in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels.")
 > = 1350.0;
@@ -252,7 +260,7 @@ uniform float BoostRollOffShape <
     ui_min = 0.25; ui_max = 4.0; ui_step = 0.01;
     ui_label = "Boost Roll-Off Shape";
     UI_TOOLTIP("Adjusts the live roll off character by moving the roll off start together with the shoulder curvature so the transition stays smooth and monotonic. 1.0 = standard BT.2390. Values below 1.0 start later and hold highlights higher longer. Values above 1.0 start earlier and compress highlights harder.")
-> = 1.5;
+> = 1.25;
 
 
 static const float PixelParticipationStartNits = 1.0;
@@ -316,7 +324,7 @@ uniform float FrameTime < source = "frametime"; >;
 #if ENABLE_APL_GRAPH
 uniform bool ShowAPLGraph <
     ui_label = "Show APL EOTF Debug Graph";
-    UI_TOOLTIP("Shows the analysis graph. Standard mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the projected measured peak for the selected raw APL input, Light blue = real 2D measured LUT output for that raw input APL, Green = shader remapped target after the closed-loop APL solve, Gray = projected measured output at the solved display-side operating point. Window projection mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF for the raw input, Gray = projected window output after the closed-loop APL solve, Green = overlap between both curves.")
+    UI_TOOLTIP("Shows the analysis graph. Standard mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the projected measured peak for the selected raw APL input, Light blue = real 2D measured LUT output for that raw input APL, Green = shader remapped target after the closed-loop APL solve, Gray = projected measured output at the solved display-side operating point. Window projection mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF for the raw input, Gray = projected window output after the closed-loop APL solve.")
 > = true;
 
 uniform bool GraphShowBT2390Reference <
@@ -326,7 +334,7 @@ uniform bool GraphShowBT2390Reference <
 
 uniform bool GraphUseFullFieldWindowProjection <
     ui_label = "Graph Use Window Projection";
-    UI_TOOLTIP("Switches the debug graph to the built-in window PQ measurement projection overlay. In this mode, Graph APL (%) is ignored. Use the window selector below to choose between the built-in 100%, 50%, 25%, 15%, and 10% window measurements. Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF only, Gray = projected window output only, Green = overlap between both curves.")
+    UI_TOOLTIP("Switches the debug graph to the built-in window PQ measurement projection overlay. In this mode, Graph APL (%) is ignored. Use the window selector below to choose between the built-in 100%, 50%, 25%, 15%, and 10% window measurements. Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF only, Gray = projected window output only.")
 > = true;
 
 uniform int GraphProjectionWindowSize <
@@ -338,14 +346,21 @@ uniform int GraphProjectionWindowSize <
 
 uniform float GraphAPLIndex <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 100.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 50.0; ui_step = 0.01;
     ui_label = "Graph APL (%)";
     UI_TOOLTIP("Continuous raw / pre-boost input APL value used by the standard APL-slice graph mode. Light blue = measured curve for that raw input APL. Green = shader remapped target projected from that raw input through the closed-loop APL solve. Gray = projected measured output at the solved display-side operating point. Ignored when Graph Use Window Projection is enabled.")
 > = 50.0;
 
+uniform float GraphInputSignalLimitNits <
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 4000.0; ui_step = 1.0;
+    ui_label = "Graph Input Signal Limit (nits)";
+    UI_TOOLTIP("Graph-only input signal cap used for curve preview. 0 = disabled. When set above 0, the graph behaves as if input signal values above this nit level were clipped to the specified value. This affects only graph curves and references, not the live shader or OSD.")
+> = 0.0;
+
 uniform float GraphAxisMaxNits <
     ui_type = "slider";
-    ui_min = 500.0; ui_max = 10000.0; ui_step = 1.0;
+    ui_min = 100.0; ui_max = 10000.0; ui_step = 1.0;
     ui_label = "Graph Axis Max (nits)";
     UI_TOOLTIP("Maximum nits shown on both graph axes. Raising it lets you inspect curve behavior beyond 1000-nit input without changing the live shader.")
 > = 1350.0;
@@ -762,24 +777,24 @@ static const float NIT_POINTS[NIT_COUNT] =
 };
 
 // Original 2D table collapsed to one representative compensation value per APL row.
-// These anchors are taken near 109 nits, which tracks the row average very closely
+// These anchors are taken near 100 nits, which tracks the row average very closely
 // while preserving the stronger APL dependence that matters most.
 static const float COMP_APL_1D[APL_COUNT] =
 {
     1.000000, // APL 3
-    1.485507, // APL 5
-    1.937592, // APL 7
-    2.726513, // APL 10
-    2.975849, // APL 14
-    3.159946, // APL 18
-    3.315940, // APL 22
-    3.417932, // APL 25
-    3.685460, // APL 35
-    3.992070  // APL 50
+    1.438764, // APL 5
+    1.864640, // APL 7
+    2.594132, // APL 10
+    2.833818, // APL 14
+    3.005215, // APL 18
+    3.164954, // APL 22
+    3.255290, // APL 25
+    3.513427, // APL 35
+    3.805490  // APL 50
 };
 
 static const float COMP_MIN = 1.0;
-static const float COMP_MAX = 3.992070;
+static const float COMP_MAX = 3.805490;
 
 int FindAPLIndex(float aplPct)
 {
@@ -848,7 +863,14 @@ float LookupPerAPLBoostStrength(float aplPct)
 // LUT shapes the scene-compensation weight only. Final response is a nits-domain gain.
 float ComputeAPLBoostFader(float currentAPL)
 {
-    return step(APLTrigger, currentAPL);
+    float triggerStart = saturate(APLTrigger);
+    float fadeWidth = max(APLTriggerFadeWidth, 0.0);
+
+    if (fadeWidth <= 1e-6)
+        return step(triggerStart, currentAPL);
+
+    float triggerEnd = min(triggerStart + fadeWidth, 1.0);
+    return Remap01(currentAPL, triggerStart, max(triggerEnd, triggerStart + 1e-6));
 }
 
 float ComputeTemporalBlendFactor(float smoothingSeconds)
@@ -1303,50 +1325,50 @@ static const float GRAPH_COMP_TABLE_2D[APL_COUNT * NIT_COUNT] =
     1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
     1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
 
-    // APL 5
-    1.720651, 1.686332, 1.639477, 1.600348, 1.600708, 1.577878, 1.542435, 1.511557,
-    1.503835, 1.502406, 1.495001, 1.485507, 1.483857, 1.489657, 1.482153, 1.468116,
-    1.448344, 1.444867, 1.450962, 1.452448, 1.469464, 1.456834, 1.451324, 1.453880,
+    // APL 5.
+    1.426002, 1.418319, 1.418362, 1.408464, 1.446689, 1.439896, 1.430032, 1.417518,
+    1.426299, 1.433991, 1.438851, 1.438764, 1.444610, 1.457619, 1.461260, 1.451388,
+    1.439402, 1.439348, 1.449156, 1.454828, 1.475658, 1.465801, 1.461834, 1.465964,
 
-    // APL 7
-    2.386696, 2.301803, 2.208239, 2.142507, 2.140282, 2.077152, 2.038432, 1.991094,
-    1.993522, 1.968427, 1.989762, 1.937592, 1.929698, 1.925020, 1.945632, 1.946108,
-    1.925587, 1.902872, 1.901151, 1.913164, 1.899819, 1.886626, 1.878231, 1.890897,
+    // APL 7.
+    1.901008, 1.891043, 1.866986, 1.852415, 1.892284, 1.878469, 1.864525, 1.844185,
+    1.871305, 1.866372, 1.897690, 1.864640, 1.867602, 1.873403, 1.906579, 1.916905,
+    1.903288, 1.889973, 1.892973, 1.909843, 1.900878, 1.893409, 1.890150, 1.903270,
 
-    // APL 10
-    3.533441, 3.322778, 3.150550, 2.996933, 2.991533, 2.952331, 2.859779, 2.786477,
-    2.785140, 2.774786, 2.729192, 2.726513, 2.677344, 2.659034, 2.670534, 2.664711,
-    2.656535, 2.635426, 2.617849, 2.644629, 2.608929, 2.597025, 2.623546, 2.643980,
+    // APL 10.
+    2.696380, 2.656127, 2.571548, 2.531986, 2.572484, 2.587114, 2.581274, 2.553721,
+    2.578727, 2.589062, 2.576027, 2.594132, 2.565634, 2.567442, 2.589947, 2.602294,
+    2.608675, 2.599693, 2.594153, 2.625117, 2.597062, 2.594686, 2.627796, 2.652832,
 
-    // APL 14
-    3.944622, 3.742778, 3.486730, 3.316180, 3.278714, 3.241277, 3.170756, 3.107104,
-    3.048998, 3.033891, 3.007011, 2.975850, 2.967055, 2.930338, 2.894044, 2.877144,
-    2.871816, 2.870981, 2.843950, 2.836061, 2.828960, 2.824714, 2.810953, 2.860440,
+    // APL 14.
+    3.014935, 2.957599, 2.863537, 2.788778, 2.823049, 2.829380, 2.853258, 2.837809,
+    2.827572, 2.835808, 2.841031, 2.833818, 2.847280, 2.824416, 2.807268, 2.818432,
+    2.831186, 2.839942, 2.825752, 2.826951, 2.820289, 2.822078, 2.817427, 2.881472,
 
-    // APL 18
-    4.331250, 4.026790, 3.777349, 3.558558, 3.507555, 3.442118, 3.384474, 3.305192,
-    3.244043, 3.216516, 3.186545, 3.159946, 3.136808, 3.105590, 3.059186, 3.035061,
-    3.029201, 3.033312, 3.008409, 2.994243, 2.975847, 2.974065, 2.964559, 3.025595,
+    // APL 18.
+    3.261780, 3.193873, 3.084611, 2.979779, 3.016971, 3.011393, 3.028951, 3.025158,
+    3.010275, 3.016307, 3.016287, 3.005215, 3.010005, 3.005951, 2.977315, 2.976826,
+    2.990090, 3.010028, 2.998662, 2.990941, 2.983052, 2.984053, 2.983156, 3.050799,
 
-    // APL 22
-    4.643759, 4.306869, 4.014115, 3.780358, 3.693690, 3.622282, 3.573737, 3.487421,
-    3.425357, 3.371692, 3.345787, 3.315940, 3.279914, 3.244380, 3.207378, 3.189466,
-    3.174613, 3.166520, 3.153845, 3.131529, 3.105266, 3.106722, 3.107669, 3.162626,
+    // APL 22.
+    3.447681, 3.384312, 3.275227, 3.149785, 3.193180, 3.166548, 3.178603, 3.166691,
+    3.149251, 3.159883, 3.163959, 3.164954, 3.146424, 3.145451, 3.112629, 3.112500,
+    3.125895, 3.142294, 3.139984, 3.133374, 3.112062, 3.117090, 3.123962, 3.183895,
 
-    // APL 25
-    4.890135, 4.476783, 4.184533, 3.925642, 3.853435, 3.752898, 3.701382, 3.611937,
-    3.544263, 3.498814, 3.460554, 3.417932, 3.379274, 3.360057, 3.310112, 3.291375,
-    3.265695, 3.262604, 3.242291, 3.225440, 3.203959, 3.197273, 3.200682, 3.262033,
+    // APL 25.
+    3.581481, 3.477656, 3.383956, 3.274945, 3.311163, 3.272880, 3.270689, 3.271470,
+    3.238493, 3.255894, 3.252702, 3.255290, 3.245266, 3.237040, 3.207700, 3.208200,
+    3.209342, 3.225015, 3.219945, 3.227690, 3.204559, 3.204962, 3.212599, 3.278812,
 
-    // APL 35
-    5.417324, 5.035198, 4.643715, 4.309623, 4.221975, 4.075571, 4.022938, 3.914059,
-    3.842109, 3.779826, 3.737622, 3.685461, 3.643943, 3.617834, 3.570377, 3.528255,
-    3.503582, 3.500313, 3.490984, 3.471195, 3.427937, 3.423172, 3.433216, 3.502432,
+    // APL 35.
+    3.930382, 3.875004, 3.743497, 3.582293, 3.612637, 3.575576, 3.551885, 3.544735,
+    3.527227, 3.523647, 3.522499, 3.513427, 3.497814, 3.499382, 3.462916, 3.449010,
+    3.444877, 3.457831, 3.466321, 3.467338, 3.438985, 3.438391, 3.457077, 3.529337,
 
-    // APL 50
-    6.329473, 5.782274, 5.253617, 4.820496, 4.677353, 4.489843, 4.406326, 4.286695,
-    4.203659, 4.119237, 4.061790, 3.992070, 3.953981, 3.914708, 3.851887, 3.803306,
-    3.757446, 3.752999, 3.753410, 3.726083, 3.677635, 3.661738, 3.674132, 3.769405,
+    // APL 50.
+    4.419177, 4.341897, 4.162438, 3.959669, 3.972455, 3.940871, 3.907002, 3.879731,
+    3.879384, 3.844997, 3.833234, 3.805490, 3.812932, 3.811731, 3.775736, 3.739971,
+    3.720363, 3.743520, 3.761325, 3.752846, 3.717274, 3.713838, 3.738359, 3.835342,
 };
 
 
@@ -1589,12 +1611,24 @@ float SampleCorrectedOutputNitsForAPL(float aplPct, float boostedTargetNits, flo
 
 
 #if ENABLE_APL_GRAPH
+float ApplyGraphInputSignalLimitNits(float inputNits)
+{
+    float safeInputNits = max(inputNits, 0.0);
+
+    if (GraphInputSignalLimitNits > 0.0)
+        return min(safeInputNits, GraphInputSignalLimitNits);
+
+    return safeInputNits;
+}
+
 float ComputeGraphCurveRemappedTargetNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphClosedLoopAPLPercent, float graphAnchorBoostedNits, float inputNits)
 {
-    if (useFullFieldWindowProjection)
-        return ComputeFullFieldRemappedTargetNitsByMode(fullFieldWindowMode, inputNits);
+    float limitedInputNits = ApplyGraphInputSignalLimitNits(inputNits);
 
-    return ComputeGraphBoostedTargetNits(graphClosedLoopAPLPercent, inputNits, graphAnchorBoostedNits);
+    if (useFullFieldWindowProjection)
+        return ComputeFullFieldRemappedTargetNitsByMode(fullFieldWindowMode, limitedInputNits);
+
+    return ComputeGraphBoostedTargetNits(graphClosedLoopAPLPercent, limitedInputNits, graphAnchorBoostedNits);
 }
 
 float ComputeGraphCurveCorrectedOutputNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphClosedLoopAPLPercent, float graphMaxMeasuredNits, float remappedTargetNits)
@@ -1607,10 +1641,12 @@ float ComputeGraphCurveCorrectedOutputNits(bool useFullFieldWindowProjection, in
 
 float ComputeGraphCurveMeasuredRawOutputNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphRawAPLPercent, float inputNits)
 {
-    if (useFullFieldWindowProjection)
-        return SampleMeasuredOutputNitsFullFieldByMode(fullFieldWindowMode, inputNits);
+    float limitedInputNits = ApplyGraphInputSignalLimitNits(inputNits);
 
-    return SampleRealMeasuredOutputNitsForAPL(graphRawAPLPercent, inputNits);
+    if (useFullFieldWindowProjection)
+        return SampleMeasuredOutputNitsFullFieldByMode(fullFieldWindowMode, limitedInputNits);
+
+    return SampleRealMeasuredOutputNitsForAPL(graphRawAPLPercent, limitedInputNits);
 }
 #endif
 
@@ -1965,20 +2001,15 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
     graphColor = lerp(graphColor, float3(0.85, 0.85, 0.85) * OSDBrightness * 1.7, saturate(labelMask) * saturate(GraphOpacity + 0.05));
     float measuredMaskSat = saturate(measuredMask);
     float correctedMaskSat = saturate(correctedMask);
-    float overlapMask = useFullFieldWindowProjection ? min(measuredMaskSat, correctedMaskSat) : 0.0;
-    float measuredExclusiveMask = useFullFieldWindowProjection ? saturate(measuredMaskSat - overlapMask) : measuredMaskSat;
-    float correctedExclusiveMask = useFullFieldWindowProjection ? saturate(correctedMaskSat - overlapMask) : correctedMaskSat;
 
     float3 measuredCurveColor = float3(0.62, 0.82, 1.00);
     float3 correctedCurveColor = float3(0.62, 0.62, 0.62);
-    float3 overlapCurveColor = float3(0.30, 0.88, 0.42);
 
     graphColor = lerp(graphColor, float3(0.40, 0.65, 1.00) * OSDBrightness * 2.0, saturate(refMask) * GraphOpacity);
     graphColor = lerp(graphColor, float3(1.00, 0.35, 0.92) * OSDBrightness * 2.0, saturate(idealPQRefMask) * saturate(GraphOpacity + 0.02));
-    graphColor = lerp(graphColor, measuredCurveColor * OSDBrightness * 1.95, measuredExclusiveMask * saturate(GraphOpacity * 0.95));
+    graphColor = lerp(graphColor, measuredCurveColor * OSDBrightness * 1.95, measuredMaskSat * saturate(GraphOpacity * 0.95));
     graphColor = lerp(graphColor, float3(0.30, 0.88, 0.42) * OSDBrightness * 1.55, saturate(remappedMask) * saturate(GraphOpacity + 0.06));
-    graphColor = lerp(graphColor, correctedCurveColor * OSDBrightness * 1.85, correctedExclusiveMask * saturate(GraphOpacity + 0.20));
-    graphColor = lerp(graphColor, overlapCurveColor * OSDBrightness * 1.95, overlapMask * saturate(GraphOpacity + 0.20));
+    graphColor = lerp(graphColor, correctedCurveColor * OSDBrightness * 1.85, correctedMaskSat * saturate(GraphOpacity + 0.20));
 
     return saturate(graphColor);
 }
@@ -2056,13 +2087,12 @@ float4 PS_SmoothAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_
     float currentHighAPLMetric = saturate(currentData.b);
 
     float prevSmoothedAPL = saturate(prevData.r);
-    float prevSmoothedMaxSampledNits = max(prevData.g, 0.0);
+    float prevSmoothedDynamicAwareAPL = saturate(prevData.g);
     float prevSmoothedHighAPLMetric = saturate(prevData.b);
 
     float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
     float hasPrev = (prevData.r > 0.0 || prevData.g > 0.0 || prevData.b > 0.0 || prevData.a > 0.0) ? 1.0 : 0.0;
 
-    float smoothedMaxSampledNits = lerp(currentMaxSampledNits, lerp(prevSmoothedMaxSampledNits, currentMaxSampledNits, alpha), hasPrev);
     float smoothedHighAPLMetric = lerp(currentHighAPLMetric, lerp(prevSmoothedHighAPLMetric, currentHighAPLMetric, alpha), hasPrev);
 
     // Keep the original closed-loop APL solver independent from the High APL % overlay reduction.
@@ -2072,15 +2102,22 @@ float4 PS_SmoothAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_
     float closedLoopCurrentAPL = SolveClosedLoopDisplayAPLFromRaw(rawAPL);
     float smoothedAPL = lerp(closedLoopCurrentAPL, lerp(prevSmoothedAPL, closedLoopCurrentAPL, alpha), hasPrev);
 
+    // OSD-only display-side APL estimate that includes the current adaptive reduction state.
+    // This is stored separately so the yellow OSD row reflects the final dynamic-aware display APL
+    // without feeding the High APL reduction back into the base smoothed APL operating point.
+    float dynamicAwareAPL = SolveClosedLoopDisplayAPLFromRaw(rawAPL, smoothedHighAPLMetric);
+    float smoothedDynamicAwareAPL = lerp(dynamicAwareAPL, lerp(prevSmoothedDynamicAwareAPL, dynamicAwareAPL, alpha), hasPrev);
+
     // Precompute scene-uniform sceneLogGain here (1x1 pass) so PS_MainPass reads it from the
     // texture instead of recomputing the LUT lookup + log2 + pow chain for every pixel.
-    // .b is now the smoothed High APL % metric, so sceneLogGain moves to .a.
     // The following Boost_Params pass derives the rolloff anchor and BT.2390 shoulder constants from it.
     float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL, smoothedHighAPLMetric);
 
-    // r = smoothed closed-loop display-side APL metric, g = smoothed max sampled decoded scene nits,
-    // b = smoothed High APL % metric, a = precomputed scene log-gain (uniform across all pixels)
-    return float4(smoothedAPL, smoothedMaxSampledNits, smoothedHighAPLMetric, sceneLogGain);
+    // r = smoothed base closed-loop display-side APL metric used by the live shader,
+    // g = smoothed dynamic-aware display-side APL for yellow OSD only,
+    // b = smoothed High APL % metric,
+    // a = precomputed scene log-gain (uniform across all pixels)
+    return float4(smoothedAPL, smoothedDynamicAwareAPL, smoothedHighAPLMetric, sceneLogGain);
 }
 
 float4 PS_CalcBoostParams(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
@@ -2209,8 +2246,8 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float percentGap = glyphWidth * 0.20;
 
     // Compact five-row numeric OSD on the right.
-    // Row 1 = raw input scene APL (%), Row 2 = smoothed output / display-side APL (%),
-    // Row 3 = smoothed max sampled decoded scene nits, Row 4 = smoothed High APL (%),
+    // Row 1 = raw input scene APL (%), Row 2 = dynamic-aware output / display-side APL (%),
+    // Row 3 = current-frame max sampled decoded scene nits (unsmoothed), Row 4 = smoothed High APL (%),
     // Row 5 = current final scene boost strength.
     float rightMargin = 0.016;
     float2 inputPercentRight = float2(1.0 - rightMargin, 0.040);
@@ -2283,7 +2320,7 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
 
     float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
     float currentAPL = aplData.r;
-    float smoothedMaxSampledNits = aplData.g;
+    float outputAPLForOSD = aplData.g;
     float smoothedHighAPLMetric = aplData.b;
 
     // sceneLogGain is scene-uniform (depends only on APL + uniforms).
@@ -2298,9 +2335,11 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
 
     if (ShowOSD)
     {
-        float rawInputAPL = saturate(tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0)).r);
+        float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
+        float rawInputAPL = saturate(instantData.r);
+        float currentMaxSampledNits = max(instantData.g, 0.0);
         float finalBoostStrength = ComputeSceneFinalBoostStrength(currentAPL, smoothedHighAPLMetric);
-        finalColor = DrawStatsOverlay(texcoord, finalColor, rawInputAPL, currentAPL, smoothedMaxSampledNits, smoothedHighAPLMetric, finalBoostStrength);
+        finalColor = DrawStatsOverlay(texcoord, finalColor, rawInputAPL, outputAPLForOSD, currentMaxSampledNits, smoothedHighAPLMetric, finalBoostStrength);
     }
 
     return float4(finalColor, 1.0);
@@ -2483,8 +2522,10 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
         float idealReferencePeakNits = max(graphMaxMeasuredNits, 0.0);
         if (GraphShowBT2390Reference && idealReferencePeakNits > 0.0)
         {
-            float y0  = ComputeBT2390ReferenceOutputNits(x0, graphAxisMaxNits, idealReferencePeakNits);
-            float y1  = ComputeBT2390ReferenceOutputNits(x1, graphAxisMaxNits, idealReferencePeakNits);
+            float lx0 = ApplyGraphInputSignalLimitNits(x0);
+            float lx1 = ApplyGraphInputSignalLimitNits(x1);
+            float y0  = ComputeBT2390ReferenceOutputNits(lx0, graphAxisMaxNits, idealReferencePeakNits);
+            float y1  = ComputeBT2390ReferenceOutputNits(lx1, graphAxisMaxNits, idealReferencePeakNits);
             float2 a  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0);
             float2 b  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1);
             result = float4(a, b);
