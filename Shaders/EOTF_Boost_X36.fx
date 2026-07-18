@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.16.4 - 1D APL Lookup
+    EOTF Boost v8.18.7.9 - Dense Independent 1D APL Table
     Calibrated for monitor MSI MPG 341CQR QD-OLED X36
     ================================================================
 
@@ -12,22 +12,25 @@
     absolute nits (the pixel-participation / shadow-protection-floor model was
     removed in v8.11; every pixel receives the full scene gain):
 
-        scene_gain = measured_compensation(APL) shaped by LUT weight and strength
+        scene_gain = measured_compensation(APL) ^ effective_strength(APL)
         pixel_gain = scene_gain
 
     where:
         - APL is the scene average picture level metric (0..1, shown as 0..100%)
         - compensation > 1 means the display measured darker than the requested target
 
-    This version collapses the original measured 2D APL x nits LUT into a single
-    representative compensation value per APL row (anchored near 109 nits), because
-    the per-row variation across target nits was small.
+    The live compensation uses an independent replaceable 1D APL table measured
+    at one configurable target brightness (normally 100 nits). The dense table is
+    intentionally decoupled from the legacy 2D debug-graph APL rows, so the Excel-
+    generated COMP_APL_COUNT / COMP_APL_POINTS / COMP_APL_1D block can be pasted
+    directly without changing graph resources or optional per-APL strength controls.
 
     The live boost strength comes from Global APL Boost Strength. Optional per-APL
     controls can be compiled in with PER_APL_BOOST_STRENGTH_ENABLE.
 
-    The lookup table is NOT used as a direct inverse solve.
-    Instead, it is used as a shape / weight map that drives a capped boost model.
+    The lookup table is NOT used as a direct per-pixel inverse solve. It supplies
+    the scene-level log-gain target, while strength, closed-loop APL, highlight
+    roll-off and optional channel-headroom limiting shape the final output.
 
     Optional final HDR calibration LUT layer
     ----------------------------------------
@@ -35,33 +38,24 @@
     layer after the EOTF boost calculation, or directly to the source signal when
     EOTF Boost is disabled. The original boost logic remains intact.
 
-    Optional APL-driven LUT compensation mode
-    -----------------------------------------
-    This experimental mode is compile-time stripped by default. Set
-    PQHDRLUT_ENABLE_APL_DRIVEN to 1 to compile its UI, resources, functions, and
-    three additional post-boost APL passes.
-
-    Disabled: original fixed PQHDRLUT path.
-
-    Enabled with EOTF Boost + PQHDRLUT: after boost parameters are computed, a cheap
-    APL_DECODE_SIZE^2 sampled-grid pass applies the same boost math to those sampled
-    pixels and measures the real post-boost / pre-LUT APL. That value drives the
-    luma-preserving APL-driven LUT lookup only; the boost model does not consume it.
-
-    Enabled with PQHDRLUT only: there is no post-boost intermediate, so the mode
-    falls back to the smoothed raw source APL.
-
     Closed-loop display-side APL
     ----------------------------
-    The compensation lookup is indexed by the display-side (post-boost) APL. The
-    decode pass evaluates the exact boost pipeline (BT.2390 rolloff, never-darken
-    clamp, color-preserving limiting with each sample's own max channel) for every
-    grid sample at three candidate gains; the reductions average them, yielding the
-    scene's aggregate post-boost APL response A(g) at four gain nodes (g = 0 is the
-    raw APL). A(g) is smooth and near-log-linear, so the 1x1 solve runs a damped
-    fixed-point iteration on the log-interpolated response — matching an exact
-    per-sample solve to ~0.03% while leaving only a handful of scalar ALU ops in
-    the single-threaded pass.
+    This revision replaces the sparse live APL grid with a rolling full-frame compute
+    histogram. Every source pixel is decoded once with a 128-segment piecewise-linear
+    PQ EOTF approximation (no per-pixel pow calls), accumulated inside a 32x32 tile,
+    then accumulated into persistent row histograms and reduced globally each frame.
+    Normal mode uses 64 quasi-log luminance bins;
+    color-preserving mode uses 64 luminance x 4 max/luma-headroom bins.
+
+    One interleaved set of tile rows is refreshed per frame by default, while a final
+    256-thread compute pass evaluates one occupied histogram bin per thread
+    at the same three candidate gains and performs a shared-memory reduction. This
+    produces the same four aggregate response nodes consumed by the v8.18.2 bracketed
+    ten-step closed-loop solver, while eliminating sparse-grid spatial aliasing and
+    the former long single-pixel histogram loop. The OSD maximum is tracked exactly
+    for the rolling reconstruction in 0.25-nit units rather than inferred from the
+    upper edge of the highest occupied histogram bin. Shared solved-APL smoothing,
+    boost, fixed PQHDRLUT timing, graph logic and the response-node clamp fix remain unchanged.
 
 */
 
@@ -76,15 +70,6 @@
 // and sampling code from the compiled shader.
 #ifndef PQHDRLUT_ENABLE
     #define PQHDRLUT_ENABLE 0
-#endif
-
-// Experimental APL-driven LUT compensation is available only when PQHDRLUT is
-// compiled in. This keeps its preprocessor option hidden when PQHDRLUT_ENABLE = 0.
-// Set to 1 to compile its UI control, resources, functions, and three extra passes.
-#if PQHDRLUT_ENABLE
-    #ifndef PQHDRLUT_ENABLE_APL_DRIVEN
-        #define PQHDRLUT_ENABLE_APL_DRIVEN 0
-    #endif
 #endif
 
 // Optional per-APL boost-strength controls are stripped by default, including the
@@ -106,38 +91,86 @@
     #define ENABLE_UI_TOOLTIPS 0
 #endif
 
-// APL sample budget: the aspect-matched decode grid uses at most APL_DECODE_SIZE^2
-// samples (see APL_GRID_W/H below). Must be a power of two between 8 and 64.
-// 64 (up to 4096 samples) is the default for stable APL estimation; override at
-// compile time with: #define APL_DECODE_SIZE 32
-#ifndef APL_DECODE_SIZE
-    #define APL_DECODE_SIZE 64
+// --- FULL-FRAME HISTOGRAM PATH ---
+// One 16x16 compute group covers a 32x32 source tile; every thread processes a
+// fixed 2x2 quad. Normal mode uses 64 quasi-log luma bins. Color-preserving mode
+// uses 64 luma x 4 max/luma-ratio bins so the headroom limiter remains represented.
+#define APL_FFH_TILE_SIZE             32
+#define APL_FFH_THREADS_X             16
+#define APL_FFH_THREADS_Y             16
+#define APL_FFH_PIXELS_X               2
+#define APL_FFH_PIXELS_Y               2
+#define APL_FFH_LUMA_BINS              64
+#define APL_FFH_COLOR_LUMA_BINS        64
+#define APL_FFH_COLOR_RATIO_BINS        4
+#define APL_FFH_MAX_BINS              256
+#define APL_FFH_BLOCK_W                16
+#define APL_FFH_BLOCK_H                16
+#define APL_FFH_AUX_X                  APL_FFH_BLOCK_W
+#define APL_FFH_REDUCE_THREADS         64
+
+// Packed tile-local histogram: upper bits hold count, lower 20 bits hold the
+// accumulated 10-bit within-bin luminance positions. A 32x32 tile has at most
+// 1024 pixels, so 1024 * 1023 remains below 2^20 and cannot carry into count.
+#define APL_FFH_PACK_COUNT_SHIFT       20
+#define APL_FFH_PACK_OFFSET_MASK       ((1 << APL_FFH_PACK_COUNT_SHIFT) - 1)
+#define APL_FFH_PACK_OFFSET_SCALE      1023
+#define APL_FFH_PACK_ONE_COUNT         (1 << APL_FFH_PACK_COUNT_SHIFT)
+
+#define APL_FFH_TILE_COUNT_X ((BUFFER_WIDTH  + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
+#define APL_FFH_TILE_COUNT_Y ((BUFFER_HEIGHT + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
+
+// One compact 16x16 histogram block per 32-pixel-high screen row. Tile groups
+// accumulate directly into their row block, replacing separate per-tile
+// histograms with only APL_FFH_TILE_COUNT_Y persistent row histograms.
+// The count texture has one auxiliary column at x = APL_FFH_AUX_X. Its first
+// texel in each row block stores that screen row's exact maximum luminance in Q4
+// units. Offset and color-headroom textures keep the original 16-column width.
+#define APL_FFH_ROW_HIST_TEX_W APL_FFH_BLOCK_W
+#define APL_FFH_ROW_COUNT_TEX_W (APL_FFH_BLOCK_W + 1)
+#define APL_FFH_ROW_TEX_H (APL_FFH_TILE_COUNT_Y * APL_FFH_BLOCK_H)
+
+// Rolling full-frame update mode.
+// 0 = disabled: refresh the complete frame every rendered frame.
+// N > 0 = split the 32-pixel-high tile rows into N interleaved phases and
+// refresh one phase per rendered frame. The global histogram and solved APL are
+// still rebuilt every frame from the latest persistent histogram of every row.
+// Default 6 updates roughly one sixth of the screen rows each frame, so every
+// source pixel is refreshed once per six rendered frames.
+#ifndef APL_FULLFRAME_ROLLING_PHASES
+    #define APL_FULLFRAME_ROLLING_PHASES 6
 #endif
 
-#if (APL_DECODE_SIZE < 8) || (APL_DECODE_SIZE > 64) || (APL_DECODE_SIZE & (APL_DECODE_SIZE - 1))
-    #error "APL_DECODE_SIZE must be a power of two between 8 and 64"
+#if APL_FULLFRAME_ROLLING_PHASES < 0
+    #error "APL_FULLFRAME_ROLLING_PHASES must be >= 0"
 #endif
 
-// Aspect-matched sample grid: APL_DECODE_SIZE^2 is the sample BUDGET; the actual
-// grid is APL_GRID_W x APL_GRID_H with W/H chosen per aspect bucket so sample
-// spacing is near-isotropic in screen pixels (a square 64x64 grid on a 21:9 screen
-// samples ~2.4x denser vertically than horizontally). Row count H ~= budget_side /
-// sqrt(aspect), evaluated with integer math per bucket; W fills the budget, so
-// W * H <= APL_DECODE_SIZE^2 always (never more samples than the square grid).
-// BUFFER_WIDTH/HEIGHT are preprocessor values, so this re-derives automatically
-// whenever ReShade recompiles on a resolution change.
-#if (BUFFER_WIDTH * 10 >= BUFFER_HEIGHT * 31)         // ~32:9 super-ultrawide and wider
-    #define APL_GRID_H ((APL_DECODE_SIZE * 34 + 32) / 64)
-#elif (BUFFER_WIDTH * 10 >= BUFFER_HEIGHT * 21)       // ~21:9 ultrawide
-    #define APL_GRID_H ((APL_DECODE_SIZE * 41 + 32) / 64)
-#elif (BUFFER_WIDTH * 10 >= BUFFER_HEIGHT * 15)       // 16:9 / 16:10
-    #define APL_GRID_H ((APL_DECODE_SIZE * 48 + 32) / 64)
-#elif (BUFFER_WIDTH >= BUFFER_HEIGHT)                 // 3:2 / 4:3 / 5:4 / square
-    #define APL_GRID_H ((APL_DECODE_SIZE * 56 + 32) / 64)
-#else                                                 // portrait orientations
-    #define APL_GRID_H ((APL_DECODE_SIZE * 85 + 32) / 64)
+#if APL_FULLFRAME_ROLLING_PHASES > APL_FFH_TILE_COUNT_Y
+    #error "APL_FULLFRAME_ROLLING_PHASES cannot exceed the number of full-frame tile rows"
 #endif
-#define APL_GRID_W ((APL_DECODE_SIZE * APL_DECODE_SIZE) / APL_GRID_H)
+
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    #define APL_FFH_ROLLING_ROW_SLOTS ((APL_FFH_TILE_COUNT_Y + APL_FULLFRAME_ROLLING_PHASES - 1) / APL_FULLFRAME_ROLLING_PHASES)
+    // Row metadata packs a 12-bit runtime histogram signature above a 20-bit
+    // pixel count. The count validates that a persistent row was fully rebuilt.
+    #define APL_FFH_ROW_META_COUNT_BITS 20
+    #define APL_FFH_ROW_META_COUNT_MASK ((1 << APL_FFH_ROW_META_COUNT_BITS) - 1)
+    #if (BUFFER_WIDTH * APL_FFH_TILE_SIZE) > APL_FFH_ROW_META_COUNT_MASK
+        #error "Rolling full-frame row pixel count exceeds the 20-bit metadata field"
+    #endif
+#else
+    #define APL_FFH_ROLLING_ROW_SLOTS APL_FFH_TILE_COUNT_Y
+#endif
+
+#if (APL_FFH_THREADS_X * APL_FFH_PIXELS_X != APL_FFH_TILE_SIZE) || (APL_FFH_THREADS_Y * APL_FFH_PIXELS_Y != APL_FFH_TILE_SIZE)
+    #error "Full-frame APL histogram tile/thread dimensions are inconsistent"
+#endif
+#if (APL_FFH_BLOCK_W * APL_FFH_BLOCK_H != APL_FFH_MAX_BINS)
+    #error "Full-frame APL histogram block dimensions do not match maximum bin count"
+#endif
+#if (APL_FFH_COLOR_LUMA_BINS * APL_FFH_COLOR_RATIO_BINS != APL_FFH_MAX_BINS)
+    #error "Color-preserving full-frame APL histogram dimensions are inconsistent"
+#endif
 
 
 #if ENABLE_UI_TOOLTIPS
@@ -158,7 +191,7 @@
 
 uniform bool EnableEOTFBoost <
     ui_label = "Enable EOTF Boost";
-    UI_TOOLTIP("Enables the APL-based EOTF boost/ABL compensation layer. Turn this off to bypass boost. Live APL sampling is skipped unless APL-driven LUT compensation is enabled.")
+    UI_TOOLTIP("Enables the APL-based EOTF boost/ABL compensation layer. Turn this off to bypass boost and skip live APL processing.")
 > = true;
 
 uniform int APLInputMode <
@@ -173,34 +206,20 @@ uniform float APLReferenceWhiteNits <
     ui_min = 10.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "APL Reference White (nits)";
     UI_TOOLTIP("Reference white used only for the APL metric normalization. It does not directly clamp output nits or change the graph axes.")
-> = 1350.0;
-
-uniform float APLTrigger <
-    ui_type = "slider";
-    ui_min = 0.0; ui_max = 0.95; ui_step = 0.01;
-    ui_label = "APL Trigger";
-    UI_TOOLTIP("Boost fade-in start threshold based on the smoothed APL metric. Below this level the effect is disabled. With APL Trigger Fade Width = 0, this remains a hard on/off threshold. 10% APL on the graph is exactly the threshold when this is set to 0.10.")
-> = 0.00;
-
-uniform float APLTriggerFadeWidth <
-    ui_type = "slider";
-    ui_min = 0.0; ui_max = 0.50; ui_step = 0.01;
-    ui_label = "APL Trigger Fade Width";
-    UI_TOOLTIP("Width of the APL Trigger fade-in range. 0 = original hard trigger. Example: Trigger 0.10 and Fade Width 0.05 means boost fades from 0 at 10% APL to full strength at 15% APL.")
-> = 0.00;
+> = 1300.0;
 
 uniform float CompensationFreezeAPLPercent <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 50.0; ui_step = 0.1;
+    ui_min = 0.0; ui_max = 95.0; ui_step = 0.1;
     ui_label = "Compensation Freeze APL %";
-    UI_TOOLTIP("Freezes the measured compensation lookup above the selected APL percentage. Example: 10.0 means APL values above 10% keep using the 10% compensation row. 0 = disabled.")
-> = 0.0;
+    UI_TOOLTIP("Freezes the measured compensation lookup above the selected solved display-side APL percentage. Default 50.0 means higher operating points keep using the 50% compensation value. Set 95.0 to use the full measured table; 0 = disabled.")
+> = 50.0;
 
 uniform float MaxAPLBoostStrength <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "Global APL Boost Strength";
-    UI_TOOLTIP("Scales the measured APL compensation in log-gain space before it is applied. 1.0 means full measured compensation at maximum LUT weight. Values below 1.0 under-compensate. Values above 1.0 intentionally over-compensate.")
+    UI_TOOLTIP("Scales measured APL compensation in log-gain space. 1.0 applies the full measured compensation. Values below 1.0 under-compensate; values above 1.0 intentionally over-compensate.")
 > = 0.5;
 
 
@@ -307,13 +326,13 @@ uniform float BoostRollOff <
     ui_min = 0.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "Boost Roll-Off Target (nits)";
     UI_TOOLTIP("Desired output anchor of the PQ highlight rolloff in nits. The shader dynamically places the knee from the current smoothed APL so the boosted curve lands on this endpoint more consistently across APL levels.")
-> = 1350.0;
+> = 1300.0;
 
 uniform float BoostRollOffShape <
     ui_type = "slider";
     ui_min = 0.25; ui_max = 4.0; ui_step = 0.01;
     ui_label = "Boost Roll-Off Shape";
-    UI_TOOLTIP("Adjusts the live roll off character by moving the roll off start together with the shoulder curvature so the transition stays smooth and monotonic. 1.0 = standard BT.2390. Values below 1.0 start later and hold highlights higher longer. Values above 1.0 start earlier and compress highlights harder.")
+    UI_TOOLTIP("Adjusts the live roll-off character by moving the knee together with the shoulder curvature so the transition remains smooth and monotonic. 1.0 = neutral BT.2390-style shoulder. Values below 1.0 start later and retain highlights longer. Values above 1.0 start earlier and compress highlights more strongly.")
 > = 1.25;
 
 
@@ -345,15 +364,6 @@ uniform bool EnablePQHDRLUT <
     UI_TOOLTIP("Applies PQHDRLUT.cube as a final display-calibration layer after the EOTF boost. Default is on.")
 > = true;
 
-#if PQHDRLUT_ENABLE_APL_DRIVEN
-uniform bool EnableAPLDrivenLUTCompensationMode <
-    ui_category = "Optional HDR LUT Calibration";
-    ui_category_closed = true;
-    ui_label = "APL-driven LUT Compensation Mode";
-    UI_TOOLTIP("Experimental. Disabled = original fixed LUT path. Enabled = boost behavior unchanged; sampled real post-boost/pre-LUT APL is used only for luma-preserving APL-driven LUT compensation.")
-> = true;
-#endif
-
 uniform int PQHDRLUTInputColorSpace <
     ui_category = "Optional HDR LUT Calibration";
     ui_category_closed = true;
@@ -366,7 +376,7 @@ uniform int PQHDRLUTInputColorSpace <
 
 uniform bool ShowOSD <
     ui_label = "Show APL Stats";
-    UI_TOOLTIP("Displays raw input APL (green), boost-model APL or sampled post-boost/pre-LUT APL in APL-driven LUT mode (yellow), and sampled max nits for the same source (cyan).")
+    UI_TOOLTIP("Displays raw input APL (green), solved display-side APL used by the boost model (yellow), and the exact maximum input-scene luminance present in the rolling full-frame reconstruction (cyan, 0.25-nit analysis precision). Stats are available while EOTF Boost is active.")
 > = false;
 
 uniform float OSDBrightness <
@@ -377,21 +387,22 @@ uniform float OSDBrightness <
 > = 0.5;
 
 uniform float FrameTime < source = "frametime"; >;
+uniform int FrameCount < source = "framecount"; >;
 
 #if ENABLE_APL_GRAPH
 uniform bool ShowAPLGraph <
     ui_label = "Show APL EOTF Debug Graph";
-    UI_TOOLTIP("Shows the analysis graph. Standard mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the projected measured peak for the selected raw APL input, Light blue = real 2D measured LUT output for that raw input APL, Green = shader remapped target after the closed-loop APL solve, Gray = projected measured output at the solved display-side operating point. Window projection mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF for the raw input, Gray = projected window output after the closed-loop APL solve.")
+    UI_TOOLTIP("Shows the analysis graph. Standard mode: Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the projected measured peak for the selected raw APL input, Light blue = real 2D measured LUT output for that raw input APL, Green = shader remapped target after the closed-loop APL solve, Gray = projected measured output at the solved display-side operating point. Window projection mode uses the same four-node response solve, APL lookup, rolloff, never-darken clamp and optional color-preserving limiter as the live shader. Light blue = measured raw window EOTF, Green = live-equivalent remapped signal, Gray = measured window output predicted from that signal.")
 > = true;
 
 uniform bool GraphShowBT2390Reference <
-    ui_label = "Graph Show BT.2390 Reference";
-    UI_TOOLTIP("Shows or hides the optional BT.2390-style Hermite rolloff reference overlay. It uses the measured peak for the selected APL or selected window size.")
+    ui_label = "Graph Show BT.2390-Style Reference";
+    UI_TOOLTIP("Shows or hides the optional BT.2390-style roll-off reference overlay. It uses the projected measured peak for the selected APL or window size.")
 > = false;
 
 uniform bool GraphUseFullFieldWindowProjection <
     ui_label = "Graph Use Window Projection";
-    UI_TOOLTIP("Switches the debug graph to the built-in window PQ measurement projection overlay. In this mode, Graph APL (%) is ignored. Use the window selector below to choose between the built-in 100%, 50%, 25%, 15%, and 10% window measurements. Blue dashed = identity reference, optional Magenta dashed = BT.2390-style reference tone map using the selected window peak, Light blue = measured window EOTF only, Gray = projected window output only.")
+    UI_TOOLTIP("Switches the debug graph to the built-in window PQ measurement projection overlay. Graph APL (%) is ignored. The selected window is modeled as bright window pixels plus a black background, then processed through the same steady-state four-node closed-loop response solver and boost/rolloff math as the live shader. Blue dashed = identity, optional Magenta dashed = BT.2390 reference, Light blue = measured raw window EOTF, Green = remapped signal sent to the display, Gray = predicted measured window output.")
 > = true;
 
 uniform int GraphProjectionWindowSize <
@@ -405,7 +416,7 @@ uniform float GraphAPLIndex <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 50.0; ui_step = 0.01;
     ui_label = "Graph APL (%)";
-    UI_TOOLTIP("Continuous raw / pre-boost input APL value used by the standard APL-slice graph mode. Light blue = measured curve for that raw input APL. Green = shader remapped target projected from that raw input through the closed-loop APL solve. Gray = projected measured output at the solved display-side operating point. Ignored when Graph Use Window Projection is enabled.")
+    UI_TOOLTIP("Continuous raw / pre-boost input APL value used by the standard fixed-APL slice graph. The live-equivalent closed-loop operating point is solved from a uniform representative scene at this APL and then held fixed across the plotted EOTF curve. Light blue = measured curve for the selected raw APL, Green = remapped signal, Gray = predicted measured output. Ignored when Graph Use Window Projection is enabled.")
 > = 50.0;
 
 uniform float GraphInputSignalLimitNits <
@@ -420,7 +431,7 @@ uniform float GraphAxisMaxNits <
     ui_min = 100.0; ui_max = 10000.0; ui_step = 1.0;
     ui_label = "Graph Axis Max (nits)";
     UI_TOOLTIP("Maximum nits shown on both graph axes. Raising it lets you inspect curve behavior beyond 1000-nit input without changing the live shader.")
-> = 1350.0;
+> = 1300.0;
 
 uniform float GraphOpacity <
     ui_type = "slider";
@@ -446,6 +457,24 @@ texture TexAPL
 sampler SamplerAPL
 {
     Texture = TexAPL;
+};
+
+// Uniform candidate boost/roll-off parameters used by the histogram response solve.
+// Width 3 stores the exact parameter sets for gMax/3, 2*gMax/3 and gMax.
+// A tiny three-pixel setup pass computes these once per frame; every APL sample
+// then reuses them instead of repeating uniform PQ/log/exp setup for every occupied bin.
+texture TexCandidateBoostParams
+{
+    Width = 3;
+    Height = 1;
+    Format = RGBA32F;
+};
+sampler SamplerCandidateBoostParams
+{
+    Texture = TexCandidateBoostParams;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
 };
 
 // Scene-uniform boost/rolloff parameters precomputed after APL smoothing.
@@ -499,6 +528,10 @@ sampler SamplerAPLInstant
 {
     Texture = TexAPLInstant;
 };
+storage2D<float4> StorageAPLInstant
+{
+    Texture = TexAPLInstant;
+};
 
 texture TexAPLPrev
 {
@@ -511,82 +544,167 @@ sampler SamplerAPLPrev
     Texture = TexAPLPrev;
 };
 
-// Parallel APL decode target.
-// Each of the APL_GRID_W x APL_GRID_H texels is written by PS_DecodeAPL,
-// which runs on that many GPU threads simultaneously (grid aspect matches the
-// screen, so sample spacing is near-isotropic in pixels). In PQ mode each
-// thread decodes the sampled RGB triplet once and derives both luma and optional
-// max-channel nits from that same decoded value, instead of serialising all
-// decodes inside a single 1x1 pixel shader loop.
-// RGBA32F layout: .r = raw pre-boost APL metric, .gba = post-boost metric of
-// this sample at the three candidate gains of the response-curve solve
-// (gMax/3, 2*gMax/3, gMax). Per-sample luma nits for the OSD max readout are
-// stored separately in TexAPLDecodedNits.
-texture TexAPLDecoded
-{
-    Width  = APL_GRID_W;
-    Height = APL_GRID_H;
-    Format = RGBA32F;
-};
-sampler SamplerAPLDecoded
-{
-    Texture   = TexAPLDecoded;
-    MinFilter = POINT;
-    MagFilter = POINT;
-    MipFilter = POINT;
-};
 
-// Companion target of the decode MRT pass: per-sample luma nits, only consumed by
-// the OSD max-nits readout via the column reduction.
-texture TexAPLDecodedNits
+// Tiny runtime-generated PQ decode LUT. A 129-pixel setup pass evaluates exact
+// ST.2084 once per node; hardware linear filtering supplies the 128-segment
+// approximation to the full-frame compute pass. This avoids dynamically indexing
+// a 129-element const array, which D3D11 FXC tried to force-unroll (X3511).
+texture TexAPLFastPQNits
 {
-    Width  = APL_GRID_W;
-    Height = APL_GRID_H;
-    Format = R32F;
-};
-sampler SamplerAPLDecodedNits
-{
-    Texture   = TexAPLDecodedNits;
-    MinFilter = POINT;
-    MagFilter = POINT;
-    MipFilter = POINT;
-};
-
-// Stage-1 reduction target: one texel per column of TexAPLDecoded.
-// PS_ReduceAPLColumns runs on APL_GRID_W parallel threads, each summing one
-// column (APL_GRID_H fetches). PS_CalcAPL then only sums these APL_GRID_W
-// column results, replacing the previous single-thread whole-grid serial
-// fetch loop (a latency-bound pattern) with two short, parallel stages.
-// RGBA32F: column sums of (raw metric, candidate metric g1, g2, g3) — must be
-// full-width or the upper candidate channels are silently dropped on write.
-texture TexAPLReduced
-{
-    Width  = APL_GRID_W;
-    Height = 1;
-    Format = RGBA32F;
-};
-sampler SamplerAPLReduced
-{
-    Texture   = TexAPLReduced;
-    MinFilter = POINT;
-    MagFilter = POINT;
-    MipFilter = POINT;
-};
-
-// Column max of the per-sample luma nits (OSD readout only).
-texture TexAPLReducedNits
-{
-    Width  = APL_GRID_W;
+    Width = 129;
     Height = 1;
     Format = R32F;
 };
-sampler SamplerAPLReducedNits
+sampler SamplerAPLFastPQNits
 {
-    Texture   = TexAPLReducedNits;
+    Texture = TexAPLFastPQNits;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = POINT;
+};
+
+// Compact row-aggregated and global histogram resources. The hot tile pass uses
+// one packed group-shared count+luminance atomic per pixel in normal mode, merges
+// equal bins inside each thread's 2x2 quad, then performs only one storage atomic
+// per occupied tile/bin into the corresponding 32-pixel-high screen-row histogram.
+// The count textures reserve one auxiliary column for the exact rolling maximum.
+texture TexAPLRowHistCount
+{
+    Width = APL_FFH_ROW_COUNT_TEX_W;
+    Height = APL_FFH_ROW_TEX_H;
+    Format = R32I;
+};
+sampler2D<int> SamplerAPLRowHistCount
+{
+    Texture = TexAPLRowHistCount;
     MinFilter = POINT;
     MagFilter = POINT;
     MipFilter = POINT;
 };
+storage2D<int> StorageAPLRowHistCount
+{
+    Texture = TexAPLRowHistCount;
+};
+
+texture TexAPLRowHistOffset10
+{
+    Width = APL_FFH_ROW_HIST_TEX_W;
+    Height = APL_FFH_ROW_TEX_H;
+    Format = R32I;
+};
+sampler2D<int> SamplerAPLRowHistOffset10
+{
+    Texture = TexAPLRowHistOffset10;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<int> StorageAPLRowHistOffset10
+{
+    Texture = TexAPLRowHistOffset10;
+};
+
+// Color-preserving mode only: two-nit-unit max-channel sums. A single 32-pixel
+// row contains at most BUFFER_WIDTH*32 pixels, so this stays safely in signed R32I.
+texture TexAPLRowHistMaxNits
+{
+    Width = APL_FFH_ROW_HIST_TEX_W;
+    Height = APL_FFH_ROW_TEX_H;
+    Format = R32I;
+};
+sampler2D<int> SamplerAPLRowHistMaxNits
+{
+    Texture = TexAPLRowHistMaxNits;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<int> StorageAPLRowHistMaxNits
+{
+    Texture = TexAPLRowHistMaxNits;
+};
+
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+// Persistent rolling-row validity metadata. High bits store the current histogram
+// interpretation signature; low 20 bits store the number of pixels accumulated
+// into that row. A row participates in the global reduction only when both match.
+texture TexAPLRowMeta
+{
+    Width = 1;
+    Height = APL_FFH_TILE_COUNT_Y;
+    Format = R32I;
+};
+sampler2D<int> SamplerAPLRowMeta
+{
+    Texture = TexAPLRowMeta;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<int> StorageAPLRowMeta
+{
+    Texture = TexAPLRowMeta;
+};
+#endif
+
+texture TexAPLGlobalHistCount
+{
+    Width = APL_FFH_BLOCK_W + 1;
+    Height = APL_FFH_BLOCK_H;
+    Format = R32I;
+};
+sampler2D<int> SamplerAPLGlobalHistCount
+{
+    Texture = TexAPLGlobalHistCount;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<int> StorageAPLGlobalHistCount
+{
+    Texture = TexAPLGlobalHistCount;
+};
+
+// Full-frame offset/max sums can exceed signed 32-bit, so the short row reduction
+// converts them to float only after all storage atomics are complete.
+texture TexAPLGlobalHistOffset10
+{
+    Width = APL_FFH_BLOCK_W;
+    Height = APL_FFH_BLOCK_H;
+    Format = R32F;
+};
+sampler2D<float> SamplerAPLGlobalHistOffset10
+{
+    Texture = TexAPLGlobalHistOffset10;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<float> StorageAPLGlobalHistOffset10
+{
+    Texture = TexAPLGlobalHistOffset10;
+};
+
+texture TexAPLGlobalHistMaxNits
+{
+    Width = APL_FFH_BLOCK_W;
+    Height = APL_FFH_BLOCK_H;
+    Format = R32F;
+};
+sampler2D<float> SamplerAPLGlobalHistMaxNits
+{
+    Texture = TexAPLGlobalHistMaxNits;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<float> StorageAPLGlobalHistMaxNits
+{
+    Texture = TexAPLGlobalHistMaxNits;
+};
+
 
 // Aggregate post-boost APL response of the scene at the three candidate gains.
 // .rgb = A(gMax/3), A(2*gMax/3), A(gMax); .a = valid. A(0) is the raw APL itself.
@@ -600,52 +718,11 @@ sampler SamplerAPLResponse
 {
     Texture = TexAPLResponse;
 };
-
-
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-// Optional real post-boost / pre-LUT APL path for APL-driven LUT compensation.
-// This does not render a full extra boosted image. It re-runs the exact boost math only
-// on the APL sampling grid, then averages those boosted samples in a 1x1 pass.
-texture TexPostBoostAPLDecoded
+storage2D<float4> StorageAPLResponse
 {
-    Width  = APL_GRID_W;
-    Height = APL_GRID_H;
-    Format = RG32F;
-};
-sampler SamplerPostBoostAPLDecoded
-{
-    Texture   = TexPostBoostAPLDecoded;
-    MinFilter = POINT;
-    MagFilter = POINT;
-    MipFilter = POINT;
+    Texture = TexAPLResponse;
 };
 
-// Stage-1 reduction target for the post-boost APL path (same scheme as TexAPLReduced).
-texture TexPostBoostAPLReduced
-{
-    Width  = APL_GRID_W;
-    Height = 1;
-    Format = RG32F;
-};
-sampler SamplerPostBoostAPLReduced
-{
-    Texture   = TexPostBoostAPLReduced;
-    MinFilter = POINT;
-    MagFilter = POINT;
-    MipFilter = POINT;
-};
-
-texture TexPostBoostAPL
-{
-    Width = 1;
-    Height = 1;
-    Format = RGBA32F;
-};
-sampler SamplerPostBoostAPL
-{
-    Texture = TexPostBoostAPL;
-};
-#endif
 
 #if ENABLE_APL_GRAPH
 // Curve-precompute constants — must match DrawAPLGraphOverlay.
@@ -658,7 +735,7 @@ sampler SamplerPostBoostAPL
 // (texcoord with p.x *= aspect).  The precompute pass converts from nits
 // to screen space so the per-pixel draw loop needs zero NitsToPQ / pow calls.
 // Texels with x < 0 are sentinels: the segment should be skipped.
-#define GCURVE_REMAPPED  0   // green re-mapped curve (APL mode only)
+#define GCURVE_REMAPPED  0   // green live-equivalent remapped signal curve
 #define GCURVE_CORRECTED 1   // gray projected-output / corrected curve
 #define GCURVE_MEASURED  2   // light-blue measured raw curve
 #define GCURVE_BT2390REF 3   // magenta BT.2390 reference (optional)
@@ -672,6 +749,29 @@ texture TexGraphParams
 sampler SamplerGraphParams
 {
     Texture = TexGraphParams;
+};
+
+// Live-equivalent steady-state projection for each graph x-axis sample.
+// Standard APL mode reuses one fixed bracketed operating point; window mode builds
+// and solves its four-node response per x sample. Both apply the same gain lookup,
+// roll-off, never-darken clamp and optional color limiter as the live shader.
+// RGBA layout:
+//   .r = remapped signal nits sent to the display
+//   .g = predicted measured output from that remapped signal
+//   .b = solved display-side APL
+//   .a = valid
+texture TexGraphProjection
+{
+    Width  = GRAPH_CURVE_SAMPLES;
+    Height = 1;
+    Format = RGBA32F;
+};
+sampler SamplerGraphProjection
+{
+    Texture   = TexGraphProjection;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
 };
 
 // Precomputed per-segment screen-space endpoints for all four curve rows.
@@ -799,23 +899,8 @@ float NitsToPQ(float nits)
 
 bool NeedsAPLProcessing()
 {
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-    return EnableEOTFBoost || (EnablePQHDRLUT && EnableAPLDrivenLUTCompensationMode);
-#else
     return EnableEOTFBoost;
-#endif
 }
-
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-bool NeedsRealPostBoostAPLProcessing()
-{
-    // Only needed when boost is active and the APL-driven LUT path is active.
-    // LUT-only mode has no boosted intermediate; its effective APL is the raw source APL.
-    // The boost model itself no longer consumes this measurement: the closed-loop APL
-    // is solved in-frame from the decoded grid's aggregate response curve.
-    return EnableEOTFBoost && EnablePQHDRLUT && EnableAPLDrivenLUTCompensationMode;
-}
-#endif
 
 #if PQHDRLUT_ENABLE
 // --- Optional final PQ HDR calibration LUT layer ---
@@ -949,17 +1034,15 @@ float3 PQHDRLUT_Apply(float3 color)
 // Replaces two NitsToPQ(0.0) calls per ComputeBT2390ReferenceOutputNits invocation.
 static const float PQ_BLACK = 7.309559025783966e-07;
 
-// BT.2390 highlight rolloff in PQ space.
-// This follows the Report ITU-R BT.2390 EETF construction when shapeControl = 1.0.
-// For other values we keep the same normalized source/target endpoints, then move the
-// knee and rebuild the shoulder with a monotonic power form that preserves a slope of 1
-// where the rolloff begins and a slope of 0 at the peak. This avoids the S-shaped bend
-// that appears when only the Hermite parameterization is warped.
+// BT.2390-style highlight roll-off in PQ space. The neutral setting uses the
+// standard normalized knee placement, then constructs a monotonic power shoulder
+// with slope 1 at the knee and slope 0 at the peak. Shape control moves the knee and
+// shoulder together while preserving those endpoint constraints.
 float ComputeBT2390ShapedKneeStart(float maxLum, float shapeControl)
 {
     float standardKneeStart = saturate(1.5 * maxLum - 0.5);
 
-    // Standard BT.2390 fast path: avoid log2() and extra shaping math when the control
+    // Neutral-knee fast path: avoid log2() and extra shaping math when the control
     // is effectively at its neutral value.
     if (abs(shapeControl - 1.0) <= 1e-4)
         return standardKneeStart;
@@ -1038,19 +1121,6 @@ float ApplyBT2390EETFToNits(float inputNits, float sourcePeakNits, float targetP
 }
 #endif
 
-float GetSceneNitsFromColor(float3 color)
-{
-    if (APLInputMode == 1)
-    {
-        float3 linearPQ = PQToLinearBT2100(color);
-        return GetLuma2020(linearPQ) * 10000.0;
-    }
-
-    // scRGB may use negative Rec.709 components to represent wide-gamut colours.
-    // Preserve those signed components in the luma dot product, then clamp only
-    // the resulting physical luminance to zero.
-    return max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
-}
 
 float GetDigit(int digit, float2 uv)
 {
@@ -1097,10 +1167,12 @@ float SegmentLerp(float x, float x0, float y0, float x1, float y1)
     return lerp(y0, y1, Remap01(x, x0, x1));
 }
 
-static const int APL_COUNT = 10;
+static const int GRAPH_APL_COUNT = 10;
 static const int NIT_COUNT = 24;
 
-static const float APL_POINTS[APL_COUNT] =
+// Legacy APL rows retained only for the optional 2D debug graph and advanced
+// per-APL strength controls. They are independent of the live dense 1D table.
+static const float GRAPH_APL_POINTS[GRAPH_APL_COUNT] =
 {
     3.000000, 5.000000, 7.000000, 10.000000, 14.000000, 18.000000, 22.000000, 25.000000, 35.000000, 50.000000
 };
@@ -1110,35 +1182,83 @@ static const float NIT_POINTS[NIT_COUNT] =
     3.575635, 5.171928, 7.225205, 10.050671, 13.609937, 18.423039, 24.669117, 32.378420, 42.624646, 55.159547, 71.694443, 92.698470, 118.169439, 151.523348, 191.827692, 244.458256, 307.922168, 390.672851, 494.833309, 620.319592, 783.927695, 981.175502, 1238.660348, 1350.000000
 };
 
-// Original 2D table collapsed to one representative compensation value per APL row.
-// These anchors are taken near 100 nits, which tracks the row average very closely
-// while preserving the stronger APL dependence that matters most.
-static const float COMP_APL_1D[APL_COUNT] =
+// ==========================================================================
+// BEGIN DENSE 1D APL TABLE
+// Replace the three declarations below with the block generated in Excel at
+// Shader Table!A74. Piecewise-linear interpolation is retained by the shader.
+// ==========================================================================
+// ReShade FX/HLSL has no portable static-array length query. Keep this explicit
+// compile-time count synchronized with both arrays and the generated Excel block.
+static const int COMP_APL_COUNT = 20;
+
+static const float COMP_APL_POINTS[COMP_APL_COUNT] =
 {
-    1.000000, // APL 3
-    1.438764, // APL 5
-    1.864640, // APL 7
-    2.594132, // APL 10
-    2.833818, // APL 14
-    3.005215, // APL 18
-    3.164954, // APL 22
-    3.255290, // APL 25
-    3.513427, // APL 35
-    3.805490  // APL 50
+    2.000000,
+    3.000000,
+    4.000000,
+    5.000000,
+    6.000000,
+    7.000000,
+    8.000000,
+    9.000000,
+    10.000000,
+    11.000000,
+    15.000000,
+    20.000000,
+    25.000000,
+    30.000000,
+    35.000000,
+    40.000000,
+    50.000000,
+    60.000000,
+    70.000000,
+    95.000000
 };
 
-static const float COMP_MIN = 1.0;
-static const float COMP_MAX = 3.805490;
-
-int FindAPLIndex(float aplPct)
+static const float COMP_APL_1D[COMP_APL_COUNT] =
 {
-    // Branchless: all APL_COUNT-1 comparisons are independent and emit in parallel.
-    // [loop]+branch forces a serial dependency chain; [unroll]+step() removes it.
+    1.000000, // APL 2.%
+    1.000000, // APL 3.%
+    1.222800, // APL 4.%
+    1.429226, // APL 5.%
+    1.654645, // APL 6.%
+    1.896584, // APL 7.%
+    2.111334, // APL 8.%
+    2.346582, // APL 9.%
+    2.598814, // APL 10.%
+    2.710108, // APL 11.%
+    2.911658, // APL 15.%
+    3.127065, // APL 20.%
+    3.286341, // APL 25.%
+    3.429106, // APL 30.%
+    3.558611, // APL 35.%
+    3.665642, // APL 40.%
+    3.855918, // APL 50.%
+    4.029733, // APL 60.%
+    4.184151, // APL 70.%
+    4.530331  // APL 95.%
+};
+// ==========================================================================
+// END DENSE 1D APL TABLE
+// ==========================================================================
+
+int FindCompAPLIndex(float aplPct)
+{
+    // Branchless: all COMP_APL_COUNT-1 comparisons are independent.
     int idx = 0;
     [unroll]
-    for (int i = 0; i < APL_COUNT - 1; ++i)
-        idx += int(step(APL_POINTS[i + 1], aplPct));
-    return min(idx, APL_COUNT - 2);
+    for (int i = 0; i < COMP_APL_COUNT - 1; ++i)
+        idx += int(step(COMP_APL_POINTS[i + 1], aplPct));
+    return min(idx, COMP_APL_COUNT - 2);
+}
+
+int FindGraphAPLIndex(float aplPct)
+{
+    int idx = 0;
+    [unroll]
+    for (int i = 0; i < GRAPH_APL_COUNT - 1; ++i)
+        idx += int(step(GRAPH_APL_POINTS[i + 1], aplPct));
+    return min(idx, GRAPH_APL_COUNT - 2);
 }
 
 float ApplyCompensationFreezeAPL(float aplPct)
@@ -1153,14 +1273,14 @@ float ApplyCompensationFreezeAPL(float aplPct)
 float LookupMeasuredComp1D(float aplPct)
 {
     float lookupAPL = ApplyCompensationFreezeAPL(aplPct);
-    float clampedAPL = clamp(lookupAPL, APL_POINTS[0], APL_POINTS[APL_COUNT - 1]);
-    int a0 = FindAPLIndex(clampedAPL);
-    int a1 = min(a0 + 1, APL_COUNT - 1);
+    float clampedAPL = clamp(lookupAPL, COMP_APL_POINTS[0], COMP_APL_POINTS[COMP_APL_COUNT - 1]);
+    int a0 = FindCompAPLIndex(clampedAPL);
+    int a1 = min(a0 + 1, COMP_APL_COUNT - 1);
 
     return SegmentLerp(
         clampedAPL,
-        APL_POINTS[a0], COMP_APL_1D[a0],
-        APL_POINTS[a1], COMP_APL_1D[a1]
+        COMP_APL_POINTS[a0], COMP_APL_1D[a0],
+        COMP_APL_POINTS[a1], COMP_APL_1D[a1]
     );
 }
 
@@ -1184,30 +1304,17 @@ float LookupPerAPLBoostStrength(float aplPct)
     if (!EnablePerAPLBoostStrength)
         return MaxAPLBoostStrength;
 
-    float clampedAPL = clamp(aplPct, APL_POINTS[0], APL_POINTS[APL_COUNT - 1]);
-    int a0 = FindAPLIndex(clampedAPL);
-    int a1 = min(a0 + 1, APL_COUNT - 1);
+    float clampedAPL = clamp(aplPct, GRAPH_APL_POINTS[0], GRAPH_APL_POINTS[GRAPH_APL_COUNT - 1]);
+    int a0 = FindGraphAPLIndex(clampedAPL);
+    int a1 = min(a0 + 1, GRAPH_APL_COUNT - 1);
 
     return SegmentLerp(
         clampedAPL,
-        APL_POINTS[a0], GetPerAPLBoostStrengthAtIndex(a0),
-        APL_POINTS[a1], GetPerAPLBoostStrengthAtIndex(a1)
+        GRAPH_APL_POINTS[a0], GetPerAPLBoostStrengthAtIndex(a0),
+        GRAPH_APL_POINTS[a1], GetPerAPLBoostStrengthAtIndex(a1)
     );
 }
 #endif
-
-// LUT shapes the scene-compensation weight only. Final response is a nits-domain gain.
-float ComputeAPLBoostFader(float currentAPL)
-{
-    float triggerStart = saturate(APLTrigger);
-    float fadeWidth = max(APLTriggerFadeWidth, 0.0);
-
-    if (fadeWidth <= 1e-6)
-        return step(triggerStart, currentAPL);
-
-    float triggerEnd = min(triggerStart + fadeWidth, 1.0);
-    return Remap01(currentAPL, triggerStart, max(triggerEnd, triggerStart + 1e-6));
-}
 
 float ComputeTemporalBlendFactor(float smoothingSeconds)
 {
@@ -1221,14 +1328,13 @@ float ComputeTemporalBlendFactor(float smoothingSeconds)
 
 float ComputeSceneBoostStrength(float currentAPL)
 {
-    float fader = ComputeAPLBoostFader(currentAPL);
 #if PER_APL_BOOST_STRENGTH_ENABLE
     float aplPct = saturate(currentAPL) * 100.0;
     float boostStrength = LookupPerAPLBoostStrength(aplPct);
 #else
     float boostStrength = MaxAPLBoostStrength;
 #endif
-    return max(boostStrength * fader, 0.0);
+    return max(boostStrength, 0.0);
 }
 
 
@@ -1248,12 +1354,12 @@ float ComputeSceneLogGainFromAPL(float currentAPL)
 // Conservative upper bound of the achievable scene log-gain under the current
 // settings. The compensation table is monotonic, so the maximum measured
 // compensation is the last APL anchor after applying the optional freeze clamp.
-// Strength is bounded independently; the trigger fader is <= 1. This keeps the
-// response-curve candidate gains wide enough to cover the live gain without
-// over-spacing them unnecessarily when Compensation Freeze APL % is active.
+// Strength is bounded independently. This keeps the response-curve candidate
+// gains wide enough to cover the live gain without over-spacing them unnecessarily
+// when Compensation Freeze APL % is active.
 float ComputeCandidateMaxLogGain()
 {
-    float maxComp = max(LookupMeasuredComp1D(APL_POINTS[APL_COUNT - 1]), 1.0);
+    float maxComp = max(LookupMeasuredComp1D(COMP_APL_POINTS[COMP_APL_COUNT - 1]), 1.0);
     float maxStrength = MaxAPLBoostStrength;
 
 #if PER_APL_BOOST_STRENGTH_ENABLE
@@ -1261,7 +1367,7 @@ float ComputeCandidateMaxLogGain()
     {
         maxStrength = 0.0;
         [unroll]
-        for (int j = 0; j < APL_COUNT; ++j)
+        for (int j = 0; j < GRAPH_APL_COUNT; ++j)
             maxStrength = max(maxStrength, GetPerAPLBoostStrengthAtIndex(j));
     }
 #endif
@@ -1269,95 +1375,6 @@ float ComputeCandidateMaxLogGain()
     return max(log2(maxComp) * max(maxStrength, 0.0), 0.0);
 }
 
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-float3 PQHDRLUT_Apply_APLDriven(float3 color, float currentAPL)
-{
-    int inputMode = PQHDRLUT_Resolve_Input_Mode();
-    float3 sourcePQ = PQHDRLUT_Buffer_To_PQ2020(color, inputMode);
-    float3 sourceNits = PQHDRLUT_PQ_To_Nits(sourcePQ);
-    float sourceLumaNits = max(GetLuma2020(sourceNits), 0.0);
-
-    // Always compute the original fixed-LUT result first. In APL-driven mode this
-    // result supplies the final luminance, so disabling this mode is still exactly
-    // the original path and enabling it changes only the colour-direction behaviour.
-    float3 fixedCalibratedPQ = PQHDRLUT_Sample(sourcePQ);
-    float3 fixedCalibratedNits = PQHDRLUT_PQ_To_Nits(fixedCalibratedPQ);
-    float fixedCalibratedLumaNits = max(GetLuma2020(fixedCalibratedNits), 0.0);
-
-    // At black / near-black, fall back to the fixed LUT. Chroma-only extraction is
-    // unstable when luma is tiny and would magnify harmless LUT black-offset noise.
-    if (sourceLumaNits <= 1e-4 || fixedCalibratedLumaNits <= 1e-4)
-        return PQHDRLUT_PQ2020_To_Buffer(fixedCalibratedPQ, inputMode);
-
-    float aplPct = saturate(currentAPL) * 100.0;
-    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
-
-    if (measuredComp <= 1.0001)
-        return PQHDRLUT_PQ2020_To_Buffer(fixedCalibratedPQ, inputMode);
-
-    // measuredComp > 1 means the monitor is physically darker than requested.
-    // effectiveScale estimates the real post-ABL brightness relative to the signal.
-    // Example: measuredComp = 2 => a nominal 1000-nit pixel behaves like ~500 nits.
-    float effectiveScale = 1.0 / max(measuredComp, 1.0);
-
-    // Sample the LUT at the estimated real post-ABL brightness, using the same
-    // RGB/chromaticity direction. This lower-brightness LUT slice is used only
-    // to obtain the corrected colour direction: hue, saturation and channel balance.
-    float3 effectiveNits = sourceNits * effectiveScale;
-    float3 effectivePQ = PQHDRLUT_Nits_To_PQ(effectiveNits);
-    float3 aplColourPQ = PQHDRLUT_Sample(effectivePQ);
-    float3 aplColourNits = PQHDRLUT_PQ_To_Nits(aplColourPQ);
-    float aplColourLumaNits = max(GetLuma2020(aplColourNits), 0.0);
-
-    if (aplColourLumaNits <= 1e-4)
-        return PQHDRLUT_PQ2020_To_Buffer(fixedCalibratedPQ, inputMode);
-
-    // Luma-preserving reconstruction:
-    //   direction = lower-brightness APL-driven LUT colour
-    //   luminance = original fixed-LUT luminance
-    // This prevents the lower slice from adding a second luminance correction while
-    // still allowing its hue/saturation/channel-balance behaviour to be used.
-    float3 lumaPreservedNits = max(aplColourNits * (fixedCalibratedLumaNits / aplColourLumaNits), 0.0);
-
-    return PQHDRLUT_PQ2020_To_Buffer(PQHDRLUT_Nits_To_PQ(lumaPreservedNits), inputMode);
-}
-#endif
-
-// SolveClosedLoopDisplayAPLFromRaw is defined further below, after the precomputed
-// boost/rolloff parameter functions it now uses for its forward model.
-
-#if ENABLE_APL_GRAPH
-float ComputeSceneGainNoRolloff(float currentAPL)
-{
-    float aplPct = saturate(currentAPL) * 100.0;
-    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
-    float sceneLogGain = ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL);
-    return exp2(sceneLogGain);
-}
-
-float SignalLumaToNits(float signalLuma)
-{
-    if (APLInputMode == 1)
-        return max(PQToLinearScalar(signalLuma) * 10000.0, 0.0);
-
-    return max(signalLuma, 0.0) * SIGNAL_REFERENCE_NITS;
-}
-
-float NitsToSignalLuma(float nits)
-{
-    if (APLInputMode == 1)
-        return NitsToPQ(max(nits, 0.0));
-
-    return max(nits, 0.0) / SIGNAL_REFERENCE_NITS;
-}
-
-float ComputeBoostedTargetNitsFromBoostTNoRolloff(float currentAPL, float inputNits)
-{
-    // Gain is scene-uniform (the participation model was removed in v8.11).
-    return max(inputNits, 0.0) * max(ComputeSceneGainNoRolloff(currentAPL), 1.0);
-}
-
-#endif
 
 float ComputeRollOffAnchorBoostedNitsFromSceneLogGain(float sceneLogGain)
 {
@@ -1370,19 +1387,14 @@ float ComputeRollOffAnchorBoostedNitsFromSceneLogGain(float sceneLogGain)
     return referenceInputNits * exp2(sceneLogGain);
 }
 
-#if ENABLE_APL_GRAPH
-float ComputeRollOffAnchorBoostedNits(float currentAPL)
-{
-    float sceneLogGain = ComputeSceneLogGainFromAPL(currentAPL);
-    return ComputeRollOffAnchorBoostedNitsFromSceneLogGain(sceneLogGain);
-}
-#endif
-
-// Precompute all scene-uniform BT.2390 rolloff setup in a 1x1 pass.
-// The fullscreen pass still computes the pixel-dependent NitsToPQ/PQToNits work,
-// but no longer recomputes source/target white, knee placement, or anchor per pixel.
+// Build scene-uniform BT.2390-style roll-off parameters for one log gain.
+// The final live parameters are computed in a 1x1 pass, while the three response-
+// curve candidates are computed once in a three-pixel setup pass.
 float4 ComputeBoostRolloffParamsFromSceneLogGain(float sceneLogGain)
 {
+    if (sceneLogGain <= 1e-6)
+        return float4(1.0, 0.0, 1.0, 0.0);
+
     float sceneGain = exp2(sceneLogGain);
     float rollOffEndNits = max(BoostRollOff, 0.0);
     float anchorBoostedNits = ComputeRollOffAnchorBoostedNitsFromSceneLogGain(sceneLogGain);
@@ -1406,64 +1418,51 @@ float4 ComputeBoostRolloffParamsFromSceneLogGain(float sceneLogGain)
     return float4(sceneGain, pqRange, kneeStart, compressionSpan);
 }
 
-float ApplyBT2390EETFToPQWithPrecomputedParams(float inputPQ, float4 boostParams)
+float4 LoadCandidateBoostParams(int candidateIndex)
 {
-    float pqRange = boostParams.g;
+    int idx = clamp(candidateIndex, 1, 3);
+    float u = (float(idx) - 0.5) / 3.0;
+    return tex2Dlod(SamplerCandidateBoostParams, float4(u, 0.5, 0.0, 0.0));
+}
 
-    if (pqRange <= 0.0)
-        return saturate(inputPQ);
+// Three-pixel uniform setup pass: x = 0,1,2 correspond to gMax/3, 2*gMax/3,
+// and gMax. This replaces identical transcendental setup in every APL sample.
+float4 PS_CalcCandidateBoostParams(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    if (!EnableEOTFBoost)
+        return float4(1.0, 0.0, 1.0, 0.0);
 
-    float kneeStart = saturate(boostParams.b);
-    float compressionSpan = max(boostParams.a, 1e-6);
-
-    float e1 = saturate((saturate(inputPQ) - PQ_BLACK) / pqRange);
-    float e2 = e1;
-
-    if (e1 >= kneeStart)
-    {
-        float shoulderSpan = max(1.0 - kneeStart, 1e-6);
-        float u = saturate((e1 - kneeStart) / shoulderSpan);
-        float shoulderPower = max(shoulderSpan / compressionSpan, 1.0);
-
-        e2 = kneeStart + compressionSpan * (1.0 - pow(1.0 - u, shoulderPower));
-    }
-
-    return saturate(e2 * pqRange + PQ_BLACK);
+    int candidateIndex = min(int(vpos.x) + 1, 3);
+    float gMax = ComputeCandidateMaxLogGain();
+    return ComputeBoostRolloffParamsFromSceneLogGain(gMax * (float(candidateIndex) / 3.0));
 }
 
 float ApplyBT2390EETFToNitsWithPrecomputedParams(float inputNits, float4 boostParams)
 {
     float safeInputNits = max(inputNits, 0.0);
+    float pqRange = boostParams.g;
 
-    if (boostParams.g <= 0.0)
+    if (pqRange <= 0.0)
         return safeInputNits;
 
-    float outputPQ = ApplyBT2390EETFToPQWithPrecomputedParams(NitsToPQ(safeInputNits), boostParams);
+    float inputPQ = NitsToPQ(safeInputNits);
+    float kneeStart = saturate(boostParams.b);
+    float e1 = saturate((inputPQ - PQ_BLACK) / pqRange);
+
+    // Below the knee the roll-off is exactly identity. Return the original nits
+    // directly and avoid an unnecessary inverse-PQ pow round trip.
+    if (e1 < kneeStart)
+        return safeInputNits;
+
+    float shoulderSpan = max(1.0 - kneeStart, 1e-6);
+    float compressionSpan = max(boostParams.a, 1e-6);
+    float u = saturate((e1 - kneeStart) / shoulderSpan);
+    float shoulderPower = max(shoulderSpan / compressionSpan, 1.0);
+    float e2 = kneeStart + compressionSpan * (1.0 - pow(1.0 - u, shoulderPower));
+    float outputPQ = saturate(e2 * pqRange + PQ_BLACK);
+
     return max(PQToLinearScalar(outputPQ) * 10000.0, 0.0);
 }
-
-#if ENABLE_APL_GRAPH
-float ApplyBoostWithBT2390Rolloff(float signalLuma, float currentAPL, float anchorBoostedNits)
-{
-    float originalNits = SignalLumaToNits(signalLuma);
-    float fullyBoostedNits = ComputeBoostedTargetNitsFromBoostTNoRolloff(currentAPL, originalNits);
-    float rollOffEndNits = max(BoostRollOff, 0.0);
-
-    if (rollOffEndNits <= 0.0)
-        return NitsToSignalLuma(fullyBoostedNits);
-
-    float sourcePeakNits = max(anchorBoostedNits, rollOffEndNits + 1e-4);
-    float rolledNits = max(ApplyBT2390EETFToNitsWithShape(fullyBoostedNits, sourcePeakNits, rollOffEndNits, BoostRollOffShape), originalNits);
-
-    return NitsToSignalLuma(rolledNits);
-}
-
-float ApplyBoostWithSelectedRolloff(float signalLuma, float currentAPL, float anchorBoostedNits)
-{
-    return ApplyBoostWithBT2390Rolloff(signalLuma, currentAPL, anchorBoostedNits);
-}
-
-#endif
 
 float ComputeBoostedLumaNitsFromPrecomputedParams(float inputLumaNits, float4 boostParams)
 {
@@ -1476,51 +1475,6 @@ float ComputeBoostedLumaNitsFromPrecomputedParams(float inputLumaNits, float4 bo
 
     return max(ApplyBT2390EETFToNitsWithPrecomputedParams(fullyBoostedNits, boostParams), safeInputLumaNits);
 }
-
-// Mean-pixel closed-loop projection solve. The forward model runs the mean scene
-// nits through the exact per-pixel luma pipeline (BT.2390 rolloff, never-darken
-// clamp; the boost gain itself is scene-uniform).
-//
-// Used by graph projections (hypothetical APL slices have no live pixel data)
-// and as a first-frame fallback. The live boost path uses
-// SolveClosedLoopDisplayAPLFromResponse, which solves on the scene's aggregate
-// post-boost response sampled exactly per grid sample by the decode pass.
-float SolveClosedLoopDisplayAPLFromRaw(float rawAPL)
-{
-    float safeRawAPL = saturate(rawAPL);
-
-    if (safeRawAPL <= 1e-6)
-        return 0.0;
-
-    float referenceWhite = max(APLReferenceWhiteNits, 1.0);
-    float meanInputNits = safeRawAPL * referenceWhite;
-    float displayAPL = safeRawAPL;
-
-    [unroll]
-    for (int i = 0; i < 3; ++i)
-    {
-        float sceneLogGain = ComputeSceneLogGainFromAPL(displayAPL);
-        float4 rolloffParams = ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain);
-        float boostedMeanNits = ComputeBoostedLumaNitsFromPrecomputedParams(meanInputNits, rolloffParams);
-        float estimatedDisplayAPL = saturate(boostedMeanNits / referenceWhite);
-
-        // Mild damping keeps the closed-loop estimate stable with very short smoothing times.
-        displayAPL = lerp(displayAPL, estimatedDisplayAPL, 0.85);
-    }
-
-    return displayAPL;
-}
-
-#if ENABLE_APL_GRAPH
-float ComputeGraphClosedLoopAPLFromRawPercent(float rawAPLPercent)
-{
-    float rawAPL = saturate(rawAPLPercent * 0.01);
-
-    // Graph projections are hypothetical APL slices / window patterns, not the live
-    // scene, so the mean-pixel projection model applies here.
-    return SolveClosedLoopDisplayAPLFromRaw(rawAPL);
-}
-#endif
 
 float Max3(float3 v)
 {
@@ -1560,6 +1514,9 @@ float SoftLimitBoostScale(float desiredScale, float maxScale, float kneeFraction
 
 float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostParams)
 {
+    if (boostParams.r <= 1.000001 && boostParams.g <= 0.0)
+        return color;
+
     if (APLInputMode == 1)
     {
         float3 linearColorNits = PQToLinearBT2100(saturate(color)) * 10000.0;
@@ -1608,10 +1565,12 @@ float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostPa
     return linearColor * colorScale;
 }
 
-// Exact per-sample post-boost APL metric for one candidate gain. Mirrors the luma
-// path of ApplyBoostPreserveColorFromPrecomputedParams, including the
-// color-preserving limiter evaluated with this sample's own max channel.
-float ComputePostBoostMetricForSample(float lumaNits, float maxChannelNits, float4 boostParams)
+// Exact per-sample post-boost luminance for one gain candidate. Mirrors the luma
+// path of ApplyBoostPreserveColorFromPrecomputedParams, including BT.2390 rolloff,
+// the never-darken clamp and the optional max-channel color-preserving limiter.
+// Keeping this as the shared scalar path lets the live response decode and the
+// graph simulators use exactly the same scalar luma math.
+float ComputePostBoostNitsForSample(float lumaNits, float maxChannelNits, float4 boostParams)
 {
     if (lumaNits <= 1e-6)
         return 0.0;
@@ -1627,18 +1586,127 @@ float ComputePostBoostMetricForSample(float lumaNits, float maxChannelNits, floa
         boostedLumaNits = lumaNits * colorScale;
     }
 
-    return saturate(boostedLumaNits / max(APLReferenceWhiteNits, 1.0));
+    return boostedLumaNits;
 }
 
-// Response-curve closed-loop display-side APL solve.
+// Exact per-sample post-boost APL metric for one candidate gain.
+float ComputePostBoostMetricForSample(float lumaNits, float maxChannelNits, float4 boostParams)
+{
+    return saturate(
+        ComputePostBoostNitsForSample(lumaNits, maxChannelNits, boostParams) /
+        max(APLReferenceWhiteNits, 1.0)
+    );
+}
+
+// Evaluate aggregate post-boost APL response A(g) from precomputed log-domain
+// nodes at g = 0, gMax/3, 2*gMax/3 and gMax.
+float EvaluateDisplayAPLResponseFromLogNodes(float4 logA, float logGain, float gainToNodeScale)
+{
+    float t = clamp(logGain * gainToNodeScale, 0.0, 3.0);
+    float logEst;
+
+    if (t <= 1.0)
+        logEst = lerp(logA.x, logA.y, t);
+    else if (t <= 2.0)
+        logEst = lerp(logA.y, logA.z, t - 1.0);
+    else
+        logEst = lerp(logA.z, logA.w, t - 2.0);
+
+    return saturate(exp2(logEst));
+}
+
+// Shared bracketed closed-loop display-side APL solve. The live shader and both
+// graph simulators call this exact function. It solves
 //
-// The solve only needs the scene's aggregate post-boost response A(g), not the
-// per-sample distribution: the decode pass evaluates the exact boost per sample at
-// three candidate gains (in parallel, with per-sample max-channel limiting), the
-// reductions average them, and this 1x1 function runs the damped fixed point on
-// the log-interpolated four-node curve (A(0) = raw APL). A(g) is near-log-linear,
-// so this matches an exact per-sample solve to ~0.03% (validated), while the
-// single-threaded work here is one fetch and a handful of ALU ops.
+//     g = ComputeSceneLogGainFromAPL(A(g))
+//
+// directly in log-gain space. ComputeCandidateMaxLogGain guarantees that the
+// requested gain lies within [0, gMax], so the endpoint signs form a valid bracket.
+float SolveClosedLoopDisplayAPLFromResponseNodes(float rawAPL, float3 responseNodes, float gMax)
+{
+    float safeRawAPL = saturate(rawAPL);
+
+    if (safeRawAPL <= 1e-6)
+        return 0.0;
+
+    if (gMax <= 1e-6)
+        return safeRawAPL;
+
+    // Log nodes and reciprocal gain scaling are invariant across all bisection
+    // iterations; compute them once instead of repeating four log2 operations.
+    float4 logA = log2(max(float4(safeRawAPL, responseNodes), 1e-6));
+    float gainToNodeScale = 3.0 / gMax;
+
+    float lo = 0.0;
+    float hi = gMax;
+
+    float aplLo = safeRawAPL;           // A(0)
+    float fLo = clamp(ComputeSceneLogGainFromAPL(aplLo), 0.0, gMax);
+
+    // Prefer the stable zero-gain solution when the configured strength requests
+    // no boost at the unboosted operating point.
+    if (fLo <= 1e-6)
+        return aplLo;
+
+    float aplHi = saturate(responseNodes.z); // A(gMax)
+    float fHi = clamp(ComputeSceneLogGainFromAPL(aplHi), 0.0, gMax) - gMax;
+
+    if (fHi >= -1e-6)
+        return aplHi;
+
+    // Ten bisection steps leave less than 1/1024 of the original log-gain interval.
+    // Keep this as a runtime loop to avoid expanding graph-enabled compile time.
+    [loop]
+    for (int i = 0; i < 10; ++i)
+    {
+        float mid = 0.5 * (lo + hi);
+        float aplMid = EvaluateDisplayAPLResponseFromLogNodes(logA, mid, gainToNodeScale);
+        float fMid = clamp(ComputeSceneLogGainFromAPL(aplMid), 0.0, gMax) - mid;
+
+        if (fMid > 0.0)
+            lo = mid;
+        else
+            hi = mid;
+    }
+
+    float solvedGain = 0.5 * (lo + hi);
+    return EvaluateDisplayAPLResponseFromLogNodes(logA, solvedGain, gainToNodeScale);
+}
+
+// Bracketed fallback for a uniform representative scene. This is used only if the
+// aggregate response texture is not yet valid and by the standard fixed-APL graph.
+// It uses the same precomputed candidate parameters and the same solver as live data.
+float SolveUniformSceneDisplayAPL(float rawAPL)
+{
+    float safeRawAPL = saturate(rawAPL);
+
+    if (safeRawAPL <= 1e-6 || !EnableEOTFBoost)
+        return safeRawAPL;
+
+    float gMax = ComputeCandidateMaxLogGain();
+
+    if (gMax <= 1e-6)
+        return safeRawAPL;
+
+    float representativeNits = safeRawAPL * max(APLReferenceWhiteNits, 1.0);
+    float3 responseNodes;
+
+    [unroll]
+    for (int k = 1; k <= 3; ++k)
+    {
+        responseNodes[k - 1] = ComputePostBoostMetricForSample(
+            representativeNits,
+            representativeNits,
+            LoadCandidateBoostParams(k)
+        );
+    }
+
+    return SolveClosedLoopDisplayAPLFromResponseNodes(safeRawAPL, responseNodes, gMax);
+}
+
+// Live response-curve solve. The decode pass evaluates the exact boost per sample
+// at three candidate gains, reductions average those samples, and this 1x1 path
+// solves on the resulting aggregate response curve.
 float SolveClosedLoopDisplayAPLFromResponse(float rawAPL)
 {
     float safeRawAPL = saturate(rawAPL);
@@ -1648,57 +1716,20 @@ float SolveClosedLoopDisplayAPLFromResponse(float rawAPL)
 
     float gMax = ComputeCandidateMaxLogGain();
 
-    // All strengths zero: gain is identically 1.0, display APL equals raw APL.
     if (gMax <= 1e-6)
         return safeRawAPL;
 
     float4 responseData = tex2Dlod(SamplerAPLResponse, float4(0.5, 0.5, 0.0, 0.0));
 
-    // Response not populated yet (e.g. first frame after a reload): fall back to
-    // the mean-pixel projection model rather than reporting zero.
     if (responseData.a <= 0.0)
-        return SolveClosedLoopDisplayAPLFromRaw(safeRawAPL);
+        return SolveUniformSceneDisplayAPL(safeRawAPL);
 
-    // Log-domain response nodes at g = 0, gMax/3, 2*gMax/3, gMax.
-    float4 logA = log2(max(float4(safeRawAPL, responseData.rgb), 1e-6));
-
-    float displayAPL = safeRawAPL;
-
-    [unroll]
-    for (int i = 0; i < 4; ++i)
-    {
-        float g = clamp(ComputeSceneLogGainFromAPL(displayAPL), 0.0, gMax);
-        float t = (g / gMax) * 3.0; // node-space position in [0, 3]
-
-        float logEst;
-        if (t <= 1.0)
-            logEst = lerp(logA.x, logA.y, t);
-        else if (t <= 2.0)
-            logEst = lerp(logA.y, logA.z, t - 1.0);
-        else
-            logEst = lerp(logA.z, logA.w, t - 2.0);
-
-        float estimatedDisplayAPL = saturate(exp2(logEst));
-
-        // Mild damping keeps the closed-loop estimate stable with very short smoothing times.
-        displayAPL = lerp(displayAPL, estimatedDisplayAPL, 0.85);
-    }
-
-    return displayAPL;
+    return SolveClosedLoopDisplayAPLFromResponseNodes(safeRawAPL, responseData.rgb, gMax);
 }
 #if ENABLE_APL_GRAPH
-float ComputeBoostedTargetNitsFromBoostT(float currentAPL, float inputNits, float anchorBoostedNits)
-{
-    float safeInputNits = max(inputNits, 0.0);
-    float signalLuma = NitsToSignalLuma(safeInputNits);
-
-    return SignalLumaToNits(ApplyBoostWithSelectedRolloff(signalLuma, currentAPL, anchorBoostedNits));
-}
-
-
-// Restored graph-only 2D measurement table from the original shader.
-// Live boost logic stays on the simplified 1D LUT path.
-static const float GRAPH_COMP_TABLE_2D[APL_COUNT * NIT_COUNT] =
+// Graph-only 2D measurement table used to project physical display output.
+// Live boost logic intentionally remains on the simplified 1D compensation path.
+static const float GRAPH_COMP_TABLE_2D[GRAPH_APL_COUNT * NIT_COUNT] =
 {
     // APL 3
     1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
@@ -1818,7 +1849,6 @@ static const float FULLFIELD_10_MEASURED_NITS[FULLFIELD_10_COUNT] =
 };
 
 
-static const int GRAPH_WINDOW_MODE_100 = 0;
 static const int GRAPH_WINDOW_MODE_50  = 1;
 static const int GRAPH_WINDOW_MODE_25  = 2;
 static const int GRAPH_WINDOW_MODE_15  = 3;
@@ -1902,15 +1932,63 @@ float GetFullFieldMeasuredMaxOutputNitsByMode(int mode)
     return maxMeasuredNits;
 }
 
-float ComputeFullFieldRemappedTargetNitsByMode(int mode, float inputNits)
+// Live-equivalent steady-state projection of a grayscale test window on black.
+// The window and background are treated as two sample populations, so raw APL and
+// all three response nodes follow the same per-pixel saturation and averaging as
+// the live histogram path. The shared four-node solver then produces
+// the same display-side APL that the live shader would use for this static pattern.
+// Returns: .r remapped signal nits, .g predicted measured output nits,
+//          .b solved display-side APL, .a valid.
+float4 ComputeFullFieldLiveProjectionByMode(int mode, float inputNits)
 {
     float safeInputNits = max(inputNits, 0.0);
-    float currentAPL = SolveClosedLoopDisplayAPLFromRaw(
-        saturate(safeInputNits * GetFullFieldWindowScaleByMode(mode) / max(APLReferenceWhiteNits, 1e-4))
-    );
-    float anchorBoostedNits = ComputeRollOffAnchorBoostedNits(currentAPL);
+    float windowFraction = saturate(GetFullFieldWindowScaleByMode(mode));
+    float referenceWhite = max(APLReferenceWhiteNits, 1.0);
 
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, safeInputNits, anchorBoostedNits);
+    // Exact aggregate raw metric for a uniform grayscale window on black:
+    // each bright pixel is normalized and saturated first, then averaged with
+    // the zero-valued background pixels, matching the live decode/reduction path.
+    float rawWindowMetric = saturate(safeInputNits / referenceWhite);
+    float rawAPL = saturate(windowFraction * rawWindowMetric);
+    float displayAPL = rawAPL;
+    float remappedSignalNits = safeInputNits;
+
+    if (EnableEOTFBoost && rawAPL > 1e-6)
+    {
+        float gMax = ComputeCandidateMaxLogGain();
+
+        if (gMax > 1e-6)
+        {
+            float3 responseNodes = rawAPL.xxx;
+
+            [unroll]
+            for (int k = 1; k <= 3; ++k)
+            {
+                float4 candidateParams = LoadCandidateBoostParams(k);
+                float brightPixelMetric = ComputePostBoostMetricForSample(
+                    safeInputNits,
+                    safeInputNits, // grayscale max channel equals luma
+                    candidateParams
+                );
+
+                // Black-background pixels contribute zero at every gain node.
+                responseNodes[k - 1] = saturate(windowFraction * brightPixelMetric);
+            }
+
+            displayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
+        }
+
+        float sceneLogGain = ComputeSceneLogGainFromAPL(displayAPL);
+        float4 liveBoostParams = ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain);
+        remappedSignalNits = ComputePostBoostNitsForSample(
+            safeInputNits,
+            safeInputNits, // exact grayscale max-channel limiter input
+            liveBoostParams
+        );
+    }
+
+    float predictedMeasuredOutputNits = SampleMeasuredOutputNitsFullFieldByMode(mode, remappedSignalNits);
+    return float4(remappedSignalNits, predictedMeasuredOutputNits, displayAPL, 1.0);
 }
 
 float GraphTableComp2D(int aplIdx, int nitIdx)
@@ -1950,14 +2028,14 @@ float LookupGraphCompForAPLRow2D(int aplIdx, float inputNits)
 
 float LookupMeasuredComp2DGraph(float aplPct, float inputNits)
 {
-    float clampedAPL = clamp(aplPct, APL_POINTS[0], APL_POINTS[APL_COUNT - 1]);
-    int a0 = FindAPLIndex(clampedAPL);
-    int a1 = min(a0 + 1, APL_COUNT - 1);
+    float clampedAPL = clamp(aplPct, GRAPH_APL_POINTS[0], GRAPH_APL_POINTS[GRAPH_APL_COUNT - 1]);
+    int a0 = FindGraphAPLIndex(clampedAPL);
+    int a1 = min(a0 + 1, GRAPH_APL_COUNT - 1);
 
     return SegmentLerp(
         clampedAPL,
-        APL_POINTS[a0], LookupGraphCompForAPLRow2D(a0, inputNits),
-        APL_POINTS[a1], LookupGraphCompForAPLRow2D(a1, inputNits)
+        GRAPH_APL_POINTS[a0], LookupGraphCompForAPLRow2D(a0, inputNits),
+        GRAPH_APL_POINTS[a1], LookupGraphCompForAPLRow2D(a1, inputNits)
     );
 }
 
@@ -1965,14 +2043,6 @@ float SampleRealMeasuredOutputNitsForAPL(float aplPct, float targetNits)
 {
     float comp = max(LookupMeasuredComp2DGraph(aplPct, targetNits), 1e-6);
     return targetNits / comp;
-}
-
-float ComputeGraphBoostedTargetNits(float aplPct, float inputNits, float anchorBoostedNits)
-{
-    float currentAPL = saturate(aplPct / 100.0);
-    float safeInputNits = max(inputNits, 0.0);
-
-    return ComputeBoostedTargetNitsFromBoostT(currentAPL, safeInputNits, anchorBoostedNits);
 }
 
 float GetAPLMaxMeasuredNits(float aplPct)
@@ -2005,24 +2075,6 @@ float ApplyGraphInputSignalLimitNits(float inputNits)
         return min(safeInputNits, GraphInputSignalLimitNits);
 
     return safeInputNits;
-}
-
-float ComputeGraphCurveRemappedTargetNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphClosedLoopAPLPercent, float graphAnchorBoostedNits, float inputNits)
-{
-    float limitedInputNits = ApplyGraphInputSignalLimitNits(inputNits);
-
-    if (useFullFieldWindowProjection)
-        return ComputeFullFieldRemappedTargetNitsByMode(fullFieldWindowMode, limitedInputNits);
-
-    return ComputeGraphBoostedTargetNits(graphClosedLoopAPLPercent, limitedInputNits, graphAnchorBoostedNits);
-}
-
-float ComputeGraphCurveCorrectedOutputNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphClosedLoopAPLPercent, float graphMaxMeasuredNits, float remappedTargetNits)
-{
-    if (useFullFieldWindowProjection)
-        return SampleMeasuredOutputNitsFullFieldByMode(fullFieldWindowMode, remappedTargetNits);
-
-    return SampleCorrectedOutputNitsForAPL(graphClosedLoopAPLPercent, remappedTargetNits, graphMaxMeasuredNits);
 }
 
 float ComputeGraphCurveMeasuredRawOutputNits(bool useFullFieldWindowProjection, int fullFieldWindowMode, float graphRawAPLPercent, float inputNits)
@@ -2328,51 +2380,42 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
     if (inGraphCore)
     {
-        // -------------------------------------------------------------------
-        // Curve drawing — all segment endpoints precomputed in PS_CalcGraphCurves.
-        // Each texel = float4(ax, ay, bx, by) in p-space (texcoord with x*=aspect).
-        // Sentinels (x < 0) mark segments to skip (invalid range or disabled curve).
-        // Per-pixel cost: GRAPH_CURVE_SAMPLES tex fetches + DrawGraphLine bbox tests.
-        // All expensive LUT math + NitsToPQ/pow moved to the 64x4 precompute pass.
-        // -------------------------------------------------------------------
-        [loop]
-        for (int s = 0; s < GRAPH_CURVE_SAMPLES - 1; ++s)
+        // All curves share the same uniformly spaced x endpoints in graph space.
+        // A pixel can only be touched by its local segment or nearby neighbors.
+        // Inspect five segments for line-thickness margin instead of scanning all 63.
+        float curveX = saturate((p.x - graphMin.x) / max(graphSize.x, 1e-6));
+        int centerSegment = clamp(
+            int(floor(curveX * float(GRAPH_CURVE_SAMPLES - 1))),
+            0,
+            GRAPH_CURVE_SAMPLES - 2
+        );
+
+        [unroll]
+        for (int neighbor = 0; neighbor < 5; ++neighbor)
         {
+            int s = clamp(centerSegment + neighbor - 2, 0, GRAPH_CURVE_SAMPLES - 2);
             float u = (float(s) + 0.5) / float(GRAPH_CURVE_SAMPLES);
 
-            // Remapped (green) curve — APL mode only; precompute stores sentinel in window mode
-            if (!useFullFieldWindowProjection)
-            {
-                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.125, 0.0, 0.0));
-                if (seg.x >= 0.0)
-                    remappedMask = max(remappedMask, DrawGraphLine(p, seg.xy, seg.zw, curveThickness * 0.95));
-            }
+            float4 remappedSeg = tex2Dlod(SamplerGraphCurves, float4(u, 0.125, 0.0, 0.0));
+            if (remappedSeg.x >= 0.0)
+                remappedMask = max(remappedMask, DrawGraphLine(p, remappedSeg.xy, remappedSeg.zw, curveThickness * 0.95));
 
-            // Corrected / gray projected-output curve
-            {
-                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.375, 0.0, 0.0));
-                if (seg.x >= 0.0)
-                    correctedMask = max(correctedMask, DrawGraphLine(p, seg.xy, seg.zw, curveThickness));
-            }
+            float4 correctedSeg = tex2Dlod(SamplerGraphCurves, float4(u, 0.375, 0.0, 0.0));
+            if (correctedSeg.x >= 0.0)
+                correctedMask = max(correctedMask, DrawGraphLine(p, correctedSeg.xy, correctedSeg.zw, curveThickness));
 
-            // Measured raw / light-blue curve
-            {
-                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.625, 0.0, 0.0));
-                if (seg.x >= 0.0)
-                    measuredMask = max(measuredMask, DrawGraphLine(p, seg.xy, seg.zw, curveThickness));
-            }
-        }
+            float4 measuredSeg = tex2Dlod(SamplerGraphCurves, float4(u, 0.625, 0.0, 0.0));
+            if (measuredSeg.x >= 0.0)
+                measuredMask = max(measuredMask, DrawGraphLine(p, measuredSeg.xy, measuredSeg.zw, curveThickness));
 
-        // BT.2390 reference (magenta dashed) — row 3; precompute stores sentinels when disabled
-        if (GraphShowBT2390Reference && max(graphMaxMeasuredNits, 0.0) > 0.0)
-        {
-            [loop]
-            for (int s = 0; s < GRAPH_CURVE_SAMPLES - 1; ++s)
+            if (GraphShowBT2390Reference && graphMaxMeasuredNits > 0.0)
             {
-                float u = (float(s) + 0.5) / float(GRAPH_CURVE_SAMPLES);
-                float4 seg = tex2Dlod(SamplerGraphCurves, float4(u, 0.875, 0.0, 0.0));
-                if (seg.x >= 0.0)
-                    idealPQRefMask = max(idealPQRefMask, DrawGraphDashedLine(p, seg.xy, seg.zw, refThickness * 0.95, 18.0));
+                float4 referenceSeg = tex2Dlod(SamplerGraphCurves, float4(u, 0.875, 0.0, 0.0));
+                if (referenceSeg.x >= 0.0)
+                    idealPQRefMask = max(
+                        idealPQRefMask,
+                        DrawGraphDashedLine(p, referenceSeg.xy, referenceSeg.zw, refThickness * 0.95, 18.0)
+                    );
             }
         }
     }
@@ -2401,230 +2444,559 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
 #endif
 
-// --- SHADERS ---
 
-// PASS 0: Parallel APL decode — runs on APL_GRID_W x APL_GRID_H threads.
-// Each thread samples the backbuffer at its own UV and performs the full PQ decode
-// (or scRGB luma) exactly once, writing the result to TexAPLDecoded.
-// This spreads the grid's transcendental calls across that many parallel GPU
-// threads instead of serialising them all inside a single 1x1 pixel shader loop.
-// PS_CalcAPL then only needs to read and sum precomputed scalars — zero transcendentals.
-void PS_DecodeAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord,
-                  out float4 outMetrics : SV_Target0, out float4 outNits : SV_Target1)
+// --- FULL-FRAME HISTOGRAM HELPERS ---
+
+// Runtime-generated 128-segment piecewise-linear ST.2084 EOTF approximation.
+float PS_BuildAPLFastPQLUT(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
-    outMetrics = 0.0.xxxx;
-    outNits    = 0.0.xxxx;
+    int node = min(int(vpos.x), 128);
+    float pqCode = float(node) * (1.0 / 128.0);
+    return PQToLinearScalar(pqCode) * 10000.0;
+}
 
-    // Runtime pass skipping is not available here, so make the pass a cheap no-op
-    // unless EOTF boost or APL-driven LUT mode needs live APL data.
-    if (!NeedsAPLProcessing())
-        return;
+float APL_FastPQCodeToNits(float pqCode)
+{
+    // Node i is centered at (i + 0.5) / 129. Hardware bilinear filtering
+    // interpolates between the two adjacent exact-PQ nodes.
+    float u = (saturate(pqCode) * 128.0 + 0.5) * (1.0 / 129.0);
+    return tex2Dlod(SamplerAPLFastPQNits, float4(u, 0.5, 0.0, 0.0)).r;
+}
 
-    float3 color = tex2Dlod(ReShade::BackBuffer, float4(texcoord, 0.0, 0.0)).rgb;
+float3 APL_FastPQToNits(float3 pq)
+{
+    return float3(
+        APL_FastPQCodeToNits(pq.r),
+        APL_FastPQCodeToNits(pq.g),
+        APL_FastPQCodeToNits(pq.b));
+}
 
-    float sceneNits   = 0.0;
-    float maxChanNits = 0.0;
+int APL_QuantizeNitsQ4(float nits)
+{
+    return clamp((int)floor(max(nits, 0.0) * 4.0 + 0.5), 0, 40000);
+}
 
-    // Decode the APL sample only once. In PQ mode the previous path called the
-    // ST.2084 EOTF separately for luma and max-channel nits; both values now come
-    // from the same decoded RGB triplet. Max-channel nits are only needed when the
-    // color-preserving limiter participates in the candidate response solve.
-    if (APLInputMode == 1)
+int APL_QuantizeMaxNits2(float nits)
+{
+    // Two-nit units keep per-row integer sums safely below signed R32 limits even
+    // at very wide resolutions; the resulting mean max-channel error is negligible.
+    return clamp((int)floor(max(nits, 0.0) * 0.5 + 0.5), 0, 5000);
+}
+
+int APL_ActiveHistogramBins()
+{
+    return (EnableEOTFBoost && EnableColorPreservingBoostMode) ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
+}
+
+int APL_HistogramLumaBin64(int lumaQ4)
+{
+    if (lumaQ4 <= 0) return 0;
+    int exponent = firstbithigh(lumaQ4);
+    int subBin = (exponent >= 2) ? ((lumaQ4 >> (exponent - 2)) & 3) : 0;
+    return min(exponent * 4 + subBin, APL_FFH_LUMA_BINS - 1);
+}
+
+int APL_HistogramColorRatioBin(int lumaQ4, int maxQ4)
+{
+    int safeLumaQ4 = max(lumaQ4, 1);
+    int ratioBin = 0;
+    ratioBin += (maxQ4 >= safeLumaQ4 * 2) ? 1 : 0;
+    ratioBin += (maxQ4 >= safeLumaQ4 * 4) ? 1 : 0;
+    ratioBin += (maxQ4 >= safeLumaQ4 * 8) ? 1 : 0;
+    return min(ratioBin, APL_FFH_COLOR_RATIO_BINS - 1);
+}
+
+void APL_HistogramLumaBinBoundsQ4(int lumaBin, out int lowerQ4, out int upperQ4)
+{
+    lowerQ4 = 0;
+    upperQ4 = 0;
+
+    int exponent = lumaBin >> 2;
+    int subBin = lumaBin & 3;
+
+    if (exponent < 2)
     {
-        float3 linearNits = PQToLinearBT2100(color) * 10000.0;
-        sceneNits = GetLuma2020(linearNits);
-
-        if (EnableEOTFBoost && EnableColorPreservingBoostMode)
-            maxChanNits = max(max(linearNits.r, linearNits.g), linearNits.b);
+        lowerQ4 = (exponent == 0) ? 0 : (1 << exponent);
+        upperQ4 = (1 << (exponent + 1)) - 1;
     }
     else
     {
-        // Signed scRGB components must participate in the Rec.709 luma dot product;
-        // clamp only the resulting luminance. The channel-headroom limiter still
-        // uses positive channel magnitudes because negative channels do not clip.
-        sceneNits = max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
+        int stepQ4 = 1 << (exponent - 2);
+        lowerQ4 = (1 << exponent) + subBin * stepQ4;
+        upperQ4 = lowerQ4 + stepQ4 - 1;
+    }
 
-        if (EnableEOTFBoost && EnableColorPreservingBoostMode)
+    upperQ4 = min(upperQ4, 40000);
+    lowerQ4 = min(lowerQ4, upperQ4);
+}
+
+int APL_EncodeWithinBinOffset10(int lumaQ4, int lumaBin)
+{
+    int lowerQ4 = 0;
+    int upperQ4 = 0;
+    APL_HistogramLumaBinBoundsQ4(lumaBin, lowerQ4, upperQ4);
+    int rangeQ4 = upperQ4 - lowerQ4;
+
+    if (rangeQ4 <= 0)
+        return 0;
+
+    int numerator = (clamp(lumaQ4, lowerQ4, upperQ4) - lowerQ4) * APL_FFH_PACK_OFFSET_SCALE;
+    return clamp((numerator + rangeQ4 / 2) / rangeQ4, 0, APL_FFH_PACK_OFFSET_SCALE);
+}
+
+float APL_ReconstructMeanLumaQ4(int binIndex, bool colorHistogram, float pixelCount, float offsetSum10)
+{
+    int lumaBin = colorHistogram ? (binIndex / APL_FFH_COLOR_RATIO_BINS) : binIndex;
+    int lowerQ4 = 0;
+    int upperQ4 = 0;
+    APL_HistogramLumaBinBoundsQ4(lumaBin, lowerQ4, upperQ4);
+    float rangeQ4 = float(upperQ4 - lowerQ4);
+
+    if (pixelCount <= 0.0 || rangeQ4 <= 0.0)
+        return float(lowerQ4);
+
+    float meanOffset10 = offsetSum10 / pixelCount;
+    return float(lowerQ4) + rangeQ4 * (meanOffset10 / float(APL_FFH_PACK_OFFSET_SCALE));
+}
+
+int2 APL_HistogramBlockCoord(int binIndex)
+{
+    return int2(binIndex & 15, binIndex >> 4);
+}
+
+int2 APL_RowHistogramCoord(int rowIndex, int binIndex)
+{
+    int2 binCoord = APL_HistogramBlockCoord(binIndex);
+    return int2(binCoord.x, rowIndex * APL_FFH_BLOCK_H + binCoord.y);
+}
+
+int2 APL_RowExactMaxLumaCoord(int rowIndex)
+{
+    return int2(APL_FFH_AUX_X, rowIndex * APL_FFH_BLOCK_H);
+}
+
+int2 APL_GlobalExactMaxLumaCoord()
+{
+    return int2(APL_FFH_AUX_X, 0);
+}
+
+int APL_GetRollingPhase()
+{
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    int safeFrame = max(FrameCount, 0);
+    return safeFrame % APL_FULLFRAME_ROLLING_PHASES;
+#else
+    return 0;
+#endif
+}
+
+int APL_GetPhysicalRowFromDispatchSlot(int dispatchRowSlot)
+{
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    return APL_GetRollingPhase() + dispatchRowSlot * APL_FULLFRAME_ROLLING_PHASES;
+#else
+    return dispatchRowSlot;
+#endif
+}
+
+int APL_GetExpectedRowPixelCount(int rowIndex)
+{
+    int rowStartY = rowIndex * APL_FFH_TILE_SIZE;
+    int rowHeight = clamp(BUFFER_HEIGHT - rowStartY, 0, APL_FFH_TILE_SIZE);
+    return BUFFER_WIDTH * rowHeight;
+}
+
+int APL_GetExpectedTilePixelCount(int tileX, int rowIndex)
+{
+    int tileStartX = tileX * APL_FFH_TILE_SIZE;
+    int tileStartY = rowIndex * APL_FFH_TILE_SIZE;
+    int tileWidth = clamp(BUFFER_WIDTH - tileStartX, 0, APL_FFH_TILE_SIZE);
+    int tileHeight = clamp(BUFFER_HEIGHT - tileStartY, 0, APL_FFH_TILE_SIZE);
+    return tileWidth * tileHeight;
+}
+
+int APL_GetRollingHistogramSignature(bool colorHistogram)
+{
+    // SIGNAL_REFERENCE_NITS has integer UI steps and affects scRGB histogram data.
+    // Including it prevents rows produced under different runtime interpretations
+    // from being mixed after a mode change. Maximum signature remains below 2^12.
+    int signalRef = clamp(int(SIGNAL_REFERENCE_NITS + 0.5), 1, 200);
+    return clamp(APLInputMode, 0, 1) + (colorHistogram ? 2 : 0) + signalRef * 4;
+}
+
+void APL_DecodePackedFullFrameSample(
+    int2 pixel,
+    bool needsMaxHistogram,
+    out int binIndex,
+    out int packedContribution,
+    out int maxNits2,
+    out int lumaQ4,
+    out int valid)
+{
+    binIndex = 0;
+    packedContribution = 0;
+    maxNits2 = 0;
+    lumaQ4 = 0;
+    valid = 0;
+
+    if (pixel.x < 0 || pixel.y < 0 || pixel.x >= BUFFER_WIDTH || pixel.y >= BUFFER_HEIGHT)
+        return;
+
+    float3 color = tex2Dfetch(ReShade::BackBuffer, pixel).rgb;
+    float sceneNits = 0.0;
+    float maxChannelNits = 0.0;
+
+    if (APLInputMode == 1)
+    {
+        float3 channelNits = APL_FastPQToNits(color);
+        sceneNits = max(GetLuma2020(channelNits), 0.0);
+        if (needsMaxHistogram)
+            maxChannelNits = max(max(channelNits.r, channelNits.g), channelNits.b);
+    }
+    else
+    {
+        sceneNits = max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
+        if (needsMaxHistogram)
         {
             float3 positiveColor = max(color, 0.0.xxx);
-            maxChanNits = max(max(positiveColor.r, positiveColor.g), positiveColor.b) * SIGNAL_REFERENCE_NITS;
+            maxChannelNits = max(max(positiveColor.r, positiveColor.g), positiveColor.b) * SIGNAL_REFERENCE_NITS;
         }
     }
 
-    float rawMetric = saturate(sceneNits / max(APLReferenceWhiteNits, 1.0));
+    lumaQ4 = APL_QuantizeNitsQ4(sceneNits);
+    int maxQ4 = needsMaxHistogram ? APL_QuantizeNitsQ4(maxChannelNits) : 0;
+    int lumaBin = APL_HistogramLumaBin64(lumaQ4);
+    binIndex = needsMaxHistogram
+        ? lumaBin * APL_FFH_COLOR_RATIO_BINS + APL_HistogramColorRatioBin(lumaQ4, maxQ4)
+        : lumaBin;
 
-    // Response-curve candidates: this sample's exact post-boost metric at three
-    // candidate gains covering the achievable range. Rolloff params are a function
-    // of gain only; recomputing them per thread is trivially parallel work.
-    float3 candidateMetrics = rawMetric.xxx;
+    int offset10 = APL_EncodeWithinBinOffset10(lumaQ4, lumaBin);
+    packedContribution = APL_FFH_PACK_ONE_COUNT + offset10;
+    maxNits2 = needsMaxHistogram ? APL_QuantizeMaxNits2(maxChannelNits) : 0;
+    valid = 1;
+}
 
-    if (EnableEOTFBoost)
+groupshared int APL_TilePackedCountLuma[APL_FFH_MAX_BINS];
+groupshared int APL_TileMaxNits[APL_FFH_MAX_BINS];
+groupshared int APL_TileExactMaxLumaQ4;
+
+void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int maxNits2, int valid, bool needsMaxHistogram)
+{
+    if (valid == 0)
+        return;
+
+    atomicAdd(APL_TilePackedCountLuma[binIndex], packedContribution);
+    if (needsMaxHistogram)
+        atomicAdd(APL_TileMaxNits[binIndex], maxNits2);
+}
+
+// One 256-thread group clears the row/bin entries selected for this frame.
+[shader("compute")]
+void CS_ClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID)
+{
+    bool aplActive = NeedsAPLProcessing();
+    int localIndex = int(threadID.x);
+    int activeBins = APL_ActiveHistogramBins();
+    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    int rowSlots = APL_FFH_ROLLING_ROW_SLOTS;
+    int totalEntries = rowSlots * activeBins;
+    int signature = APL_GetRollingHistogramSignature(needsMaxHistogram);
+#else
+    int rowSlots = APL_FFH_TILE_COUNT_Y;
+    int totalEntries = rowSlots * activeBins;
+#endif
+
+    if (aplActive)
     {
-        float gMax = ComputeCandidateMaxLogGain();
-
-        if (gMax > 1e-6)
+        [loop]
+        for (int entry = localIndex; entry < totalEntries; entry += 256)
         {
-            [unroll]
-            for (int k = 1; k <= 3; ++k)
+            int rowSlot = entry / activeBins;
+            int binIndex = entry - rowSlot * activeBins;
+            int rowIndex = APL_GetPhysicalRowFromDispatchSlot(rowSlot);
+            if (rowIndex < APL_FFH_TILE_COUNT_Y)
             {
-                float4 candidateParams = ComputeBoostRolloffParamsFromSceneLogGain(gMax * (float(k) / 3.0));
-                candidateMetrics[k - 1] = ComputePostBoostMetricForSample(sceneNits, maxChanNits, candidateParams);
+                int2 coord = APL_RowHistogramCoord(rowIndex, binIndex);
+                tex2Dstore(StorageAPLRowHistCount, coord, 0);
+                tex2Dstore(StorageAPLRowHistOffset10, coord, 0);
+                if (needsMaxHistogram)
+                    tex2Dstore(StorageAPLRowHistMaxNits, coord, 0);
+                if (binIndex == 0)
+                {
+                    tex2Dstore(StorageAPLRowHistCount, APL_RowExactMaxLumaCoord(rowIndex), 0);
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+                    tex2Dstore(StorageAPLRowMeta, int2(0, rowIndex), signature << APL_FFH_ROW_META_COUNT_BITS);
+#endif
+                }
+            }
+        }
+    }
+}
+
+[shader("compute")]
+void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    // All threads follow the same barrier structure.
+    bool aplActive = NeedsAPLProcessing();
+    uint localIndex = threadID.y * APL_FFH_THREADS_X + threadID.x;
+    int activeBins = APL_ActiveHistogramBins();
+    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    int physicalRow = APL_GetPhysicalRowFromDispatchSlot(int(groupID.y));
+    bool validPhysicalRow = physicalRow < APL_FFH_TILE_COUNT_Y;
+    bool decodeThisGroup = aplActive && validPhysicalRow;
+
+    if (localIndex < activeBins)
+    {
+        APL_TilePackedCountLuma[localIndex] = 0;
+        APL_TileMaxNits[localIndex] = 0;
+    }
+    if (localIndex == 0)
+        APL_TileExactMaxLumaQ4 = 0;
+    barrier();
+
+    if (decodeThisGroup)
+    {
+        int2 pixelBase = int2(int(groupID.x) * APL_FFH_TILE_SIZE, physicalRow * APL_FFH_TILE_SIZE) + int2(threadID.xy) * 2;
+
+        int b0, p0, m0, l0, v0;
+        int b1, p1, m1, l1, v1;
+        int b2, p2, m2, l2, v2;
+        int b3, p3, m3, l3, v3;
+        APL_DecodePackedFullFrameSample(pixelBase + int2(0, 0), needsMaxHistogram, b0, p0, m0, l0, v0);
+        APL_DecodePackedFullFrameSample(pixelBase + int2(1, 0), needsMaxHistogram, b1, p1, m1, l1, v1);
+        APL_DecodePackedFullFrameSample(pixelBase + int2(0, 1), needsMaxHistogram, b2, p2, m2, l2, v2);
+        APL_DecodePackedFullFrameSample(pixelBase + int2(1, 1), needsMaxHistogram, b3, p3, m3, l3, v3);
+
+        atomicMax(APL_TileExactMaxLumaQ4, max(max(l0, l1), max(l2, l3)));
+
+        // Merge equal bins locally before touching group-shared atomics. This is
+        // exact because both packed count/offset and max-channel sums are additive.
+        if (v1 != 0 && v0 != 0 && b1 == b0) { p0 += p1; m0 += m1; v1 = 0; }
+        if (v2 != 0 && v0 != 0 && b2 == b0) { p0 += p2; m0 += m2; v2 = 0; }
+        if (v2 != 0 && v1 != 0 && b2 == b1) { p1 += p2; m1 += m2; v2 = 0; }
+        if (v3 != 0 && v0 != 0 && b3 == b0) { p0 += p3; m0 += m3; v3 = 0; }
+        if (v3 != 0 && v1 != 0 && b3 == b1) { p1 += p3; m1 += m3; v3 = 0; }
+        if (v3 != 0 && v2 != 0 && b3 == b2) { p2 += p3; m2 += m3; v3 = 0; }
+
+        APL_AtomicAddMergedTileSample(b0, p0, m0, v0, needsMaxHistogram);
+        APL_AtomicAddMergedTileSample(b1, p1, m1, v1, needsMaxHistogram);
+        APL_AtomicAddMergedTileSample(b2, p2, m2, v2, needsMaxHistogram);
+        APL_AtomicAddMergedTileSample(b3, p3, m3, v3, needsMaxHistogram);
+    }
+    barrier();
+
+    if (decodeThisGroup && localIndex == 0)
+        atomicMax(StorageAPLRowHistCount, APL_RowExactMaxLumaCoord(physicalRow), APL_TileExactMaxLumaQ4);
+
+    if (decodeThisGroup && localIndex < activeBins)
+    {
+        int packedValue = APL_TilePackedCountLuma[localIndex];
+        int count = packedValue >> APL_FFH_PACK_COUNT_SHIFT;
+        if (count > 0)
+        {
+            int offsetSum10 = packedValue & APL_FFH_PACK_OFFSET_MASK;
+            int2 rowCoord = APL_RowHistogramCoord(physicalRow, int(localIndex));
+            atomicAdd(StorageAPLRowHistCount, rowCoord, count);
+            atomicAdd(StorageAPLRowHistOffset10, rowCoord, offsetSum10);
+            if (needsMaxHistogram)
+                atomicAdd(StorageAPLRowHistMaxNits, rowCoord, APL_TileMaxNits[localIndex]);
+        }
+    }
+
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    // One metadata atomic per source tile validates that the selected persistent
+    // row received all of its pixels before it is included in the global result.
+    if (decodeThisGroup && localIndex == 0)
+    {
+        int tilePixelCount = APL_GetExpectedTilePixelCount(int(groupID.x), physicalRow);
+        if (tilePixelCount > 0)
+            atomicAdd(StorageAPLRowMeta, int2(0, physicalRow), tilePixelCount);
+    }
+#endif
+}
+
+groupshared int APL_ReduceCount[APL_FFH_REDUCE_THREADS];
+groupshared float APL_ReduceOffset10[APL_FFH_REDUCE_THREADS];
+groupshared float APL_ReduceMaxNits[APL_FFH_REDUCE_THREADS];
+
+#define APL_REDUCE_ROW_STAGE(S) \
+    if (localIndex < S) { \
+        APL_ReduceCount[localIndex] += APL_ReduceCount[localIndex + S]; \
+        APL_ReduceOffset10[localIndex] += APL_ReduceOffset10[localIndex + S]; \
+        if (needsMaxHistogram) APL_ReduceMaxNits[localIndex] += APL_ReduceMaxNits[localIndex + S]; \
+    } \
+    barrier();
+
+[shader("compute")]
+void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    bool aplActive = NeedsAPLProcessing();
+    int localIndex = int(threadID.x);
+    int2 localBinCoord = int2(groupID.xy);
+    int binIndex = localBinCoord.y * APL_FFH_BLOCK_W + localBinCoord.x;
+    int activeBins = APL_ActiveHistogramBins();
+    bool validBin = binIndex < activeBins;
+    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+
+    int countSum = 0;
+    float offsetSum10 = 0.0;
+    float maxSumNits = 0.0;
+    if (aplActive && validBin)
+    {
+        [loop]
+        for (int rowIndex = localIndex; rowIndex < APL_FFH_TILE_COUNT_Y; rowIndex += APL_FFH_REDUCE_THREADS)
+        {
+            bool includeRow = true;
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+            int rowMeta = tex2Dfetch(SamplerAPLRowMeta, int2(0, rowIndex));
+            int rowCount = rowMeta & APL_FFH_ROW_META_COUNT_MASK;
+            int rowSignature = rowMeta >> APL_FFH_ROW_META_COUNT_BITS;
+            int expectedSignature = APL_GetRollingHistogramSignature(needsMaxHistogram);
+            includeRow = (rowCount == APL_GetExpectedRowPixelCount(rowIndex)) && (rowSignature == expectedSignature);
+#endif
+            if (includeRow)
+            {
+                int2 sourceCoord = APL_RowHistogramCoord(rowIndex, binIndex);
+                countSum += tex2Dfetch(SamplerAPLRowHistCount, sourceCoord);
+                offsetSum10 += float(tex2Dfetch(SamplerAPLRowHistOffset10, sourceCoord));
+                if (needsMaxHistogram)
+                    maxSumNits += float(tex2Dfetch(SamplerAPLRowHistMaxNits, sourceCoord));
             }
         }
     }
 
-    // RT0: .r = raw pre-boost metric, .gba = post-boost metric at the candidate gains
-    outMetrics = float4(rawMetric, candidateMetrics);
-    // RT1: .r = luma nits (OSD max readout)
-    outNits = float4(sceneNits, 0.0, 0.0, 1.0);
-}
+    APL_ReduceCount[localIndex] = countSum;
+    APL_ReduceOffset10[localIndex] = offsetSum10;
+    APL_ReduceMaxNits[localIndex] = maxSumNits;
+    barrier();
 
+    APL_REDUCE_ROW_STAGE(32)
+    APL_REDUCE_ROW_STAGE(16)
+    APL_REDUCE_ROW_STAGE(8)
+    APL_REDUCE_ROW_STAGE(4)
+    APL_REDUCE_ROW_STAGE(2)
+    APL_REDUCE_ROW_STAGE(1)
 
-// PASS 1a: Column reduction — runs on APL_GRID_W parallel threads.
-// Each thread sums one column of TexAPLDecoded (APL_GRID_H fetches) and tracks
-// the column max nits. Every texel is read exactly once at full fp32 precision, so
-// the result is the exact sum/max — no sample is skipped or approximated.
-void PS_ReduceAPLColumns(float4 vpos : SV_Position, float2 texcoord : TexCoord,
-                         out float4 outSums : SV_Target0, out float4 outMax : SV_Target1)
-{
-    outSums = 0.0.xxxx;
-    outMax  = 0.0.xxxx;
-
-    if (!NeedsAPLProcessing())
-        return;
-
-    static const float invW = 1.0 / float(APL_GRID_W);
-    static const float invH = 1.0 / float(APL_GRID_H);
-
-    // SV_Position is pixel-center based (x + 0.5), so this hits column texel centers exactly.
-    float u = vpos.x * invW;
-
-    float4 columnSums   = 0.0.xxxx;
-    float columnMaxNits = 0.0;
-
-    [loop]
-    for (int y = 0; y < APL_GRID_H; ++y)
+    if (aplActive && validBin && localIndex == 0)
     {
-        float v = (float(y) + 0.5) * invH;
-        columnSums    += tex2Dlod(SamplerAPLDecoded, float4(u, v, 0.0, 0.0));
-        columnMaxNits  = max(columnMaxNits, tex2Dlod(SamplerAPLDecodedNits, float4(u, v, 0.0, 0.0)).r);
-    }
+        tex2Dstore(StorageAPLGlobalHistCount, localBinCoord, APL_ReduceCount[0]);
+        tex2Dstore(StorageAPLGlobalHistOffset10, localBinCoord, APL_ReduceOffset10[0]);
+        if (needsMaxHistogram)
+            tex2Dstore(StorageAPLGlobalHistMaxNits, localBinCoord, APL_ReduceMaxNits[0]);
 
-    // RT0: column sums of (raw metric, candidate metrics); RT1: column max nits
-    outSums = columnSums;
-    outMax  = float4(columnMaxNits, 0.0, 0.0, 1.0);
-}
-
-// PASS 1b: Final accumulation — runs on a single 1x1 pixel.
-// Only APL_GRID_W column results remain to sum, instead of the previous
-// whole-grid serial fetches in one thread (a latency-bound pattern).
-// The total is mathematically identical; only fp summation order changes.
-
-void PS_CalcAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord,
-                out float4 outInstant : SV_Target0, out float4 outResponse : SV_Target1)
-{
-    outInstant  = 0.0.xxxx;
-    outResponse = 0.0.xxxx;
-
-    // No APL accumulation unless EOTF boost or APL-driven LUT mode needs it.
-    if (!NeedsAPLProcessing())
-        return;
-
-    float4 totals             = 0.0.xxxx;
-    float maxSampledSceneNits = 0.0;
-    static const float invW            = 1.0 / float(APL_GRID_W);
-    static const float invTotalSamples = 1.0 / float(APL_GRID_W * APL_GRID_H);
-
-    [loop]
-    for (int x = 0; x < APL_GRID_W; ++x)
-    {
-        float u = (float(x) + 0.5) * invW;
-        totals              += tex2Dlod(SamplerAPLReduced, float4(u, 0.5, 0.0, 0.0));
-        maxSampledSceneNits  = max(maxSampledSceneNits, tex2Dlod(SamplerAPLReducedNits, float4(u, 0.5, 0.0, 0.0)).r);
-    }
-
-    float4 averages = totals * invTotalSamples; // .r = raw APL, .gba = A(g1), A(g2), A(g3)
-
-    // RT0 (TexAPLInstant, layout unchanged):
-    // r = raw current-frame APL metric, g = max sampled decoded scene nits, b = unused, a = valid
-    outInstant = float4(averages.r, maxSampledSceneNits, 0.0, 1.0);
-    // RT1 (TexAPLResponse): aggregate post-boost response at the candidate gains
-    outResponse = float4(averages.gba, 1.0);
-}
-
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-// Optional real post-boost / pre-LUT APL decode. Evaluated after PS_SmoothAPL
-// and PS_CalcBoostParams, so it can reuse the already-computed boost parameters.
-// This pass does not feed back into boost setup; the closed-loop APL is solved
-// in-frame from the sampled response curve. It only measures the sampled post-boost APL used
-// by the final APL-driven LUT path.
-float4 PS_DecodePostBoostAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
-{
-    if (!NeedsRealPostBoostAPLProcessing())
-        return float4(0.0, 0.0, 0.0, 0.0);
-
-    float3 color = tex2Dlod(ReShade::BackBuffer, float4(texcoord, 0.0, 0.0)).rgb;
-    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-
-    float3 boostedColor = ApplyBoostPreserveColorFromPrecomputedParams(color, boostParams);
-    float sceneNits = GetSceneNitsFromColor(boostedColor);
-    float metric = saturate(sceneNits / max(APLReferenceWhiteNits, 1.0));
-
-    // .r = real post-boost/pre-LUT normalised APL metric
-    // .g = real post-boost/pre-LUT sampled nits, for OSD max-nits when this path is active
-    return float4(metric, sceneNits, 0.0, 1.0);
-}
-
-// Post-boost column reduction — same two-stage scheme as PS_ReduceAPLColumns.
-float4 PS_ReducePostBoostAPLColumns(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
-{
-    if (!NeedsRealPostBoostAPLProcessing())
-        return float4(0.0, 0.0, 0.0, 0.0);
-
-    static const float invW = 1.0 / float(APL_GRID_W);
-    static const float invH = 1.0 / float(APL_GRID_H);
-
-    float u = vpos.x * invW;
-
-    float columnMetricSum = 0.0;
-    float columnMaxNits   = 0.0;
-
-    [loop]
-    for (int y = 0; y < APL_GRID_H; ++y)
-    {
-        float2 data = tex2Dlod(SamplerPostBoostAPLDecoded, float4(u, (float(y) + 0.5) * invH, 0.0, 0.0)).rg;
-        columnMetricSum += data.r;
-        columnMaxNits    = max(columnMaxNits, data.g);
-    }
-
-    return float4(columnMetricSum, columnMaxNits, 0.0, 1.0);
-}
-
-float4 PS_CalcPostBoostAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
-{
-    if (!NeedsRealPostBoostAPLProcessing())
-        return float4(0.0, 0.0, 0.0, 0.0);
-
-    float totalMetric = 0.0;
-    float maxSampledSceneNits = 0.0;
-    static const float invW            = 1.0 / float(APL_GRID_W);
-    static const float invTotalSamples = 1.0 / float(APL_GRID_W * APL_GRID_H);
-
-    [loop]
-    for (int x = 0; x < APL_GRID_W; ++x)
-    {
-        float2 data = tex2Dlod(SamplerPostBoostAPLReduced, float4((float(x) + 0.5) * invW, 0.5, 0.0, 0.0)).rg;
-
-        totalMetric += data.r;
-        maxSampledSceneNits = max(maxSampledSceneNits, data.g);
-    }
-
-    float apl = totalMetric * invTotalSamples;
-
-    // r = real raw post-boost/pre-LUT APL, g = post-boost max sampled nits, a = valid
-    return float4(apl, maxSampledSceneNits, 0.0, 1.0);
-}
+        // The first bin group also reduces the exact maximum across all valid
+        // persistent rows. This is only a few dozen point reads and adds no pass.
+        if (binIndex == 0)
+        {
+            int exactMaxLumaQ4 = 0;
+            [loop]
+            for (int rowIndex = 0; rowIndex < APL_FFH_TILE_COUNT_Y; ++rowIndex)
+            {
+                bool includeRow = true;
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+                int rowMeta = tex2Dfetch(SamplerAPLRowMeta, int2(0, rowIndex));
+                int rowCount = rowMeta & APL_FFH_ROW_META_COUNT_MASK;
+                int rowSignature = rowMeta >> APL_FFH_ROW_META_COUNT_BITS;
+                int expectedSignature = APL_GetRollingHistogramSignature(needsMaxHistogram);
+                includeRow = (rowCount == APL_GetExpectedRowPixelCount(rowIndex)) && (rowSignature == expectedSignature);
 #endif
+                if (includeRow)
+                    exactMaxLumaQ4 = max(exactMaxLumaQ4, tex2Dfetch(SamplerAPLRowHistCount, APL_RowExactMaxLumaCoord(rowIndex)));
+            }
+            tex2Dstore(StorageAPLGlobalHistCount, APL_GlobalExactMaxLumaCoord(), exactMaxLumaQ4);
+        }
+    }
+}
+
+#undef APL_REDUCE_ROW_STAGE
+
+groupshared float4 APL_EvalWeightedMetrics[APL_FFH_MAX_BINS];
+groupshared float APL_EvalPixelCount[APL_FFH_MAX_BINS];
+
+#define APL_REDUCE_EVAL_STAGE(S) \
+    if (localIndex < S) { \
+        APL_EvalWeightedMetrics[localIndex] += APL_EvalWeightedMetrics[localIndex + S]; \
+        APL_EvalPixelCount[localIndex] += APL_EvalPixelCount[localIndex + S]; \
+    } \
+    barrier();
+
+[shader("compute")]
+void CS_EvaluateAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
+{
+    bool aplActive = NeedsAPLProcessing();
+    int localIndex = int(threadID.x);
+    bool colorHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    int activeBins = colorHistogram ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
+
+    float4 weighted = 0.0.xxxx;
+    float pixelCount = 0.0;
+
+    if (aplActive && localIndex < activeBins)
+    {
+        int2 binCoord = APL_HistogramBlockCoord(localIndex);
+        int pixelCountI = tex2Dfetch(SamplerAPLGlobalHistCount, binCoord);
+        if (pixelCountI > 0)
+        {
+            pixelCount = float(pixelCountI);
+            float offsetSum10 = tex2Dfetch(SamplerAPLGlobalHistOffset10, binCoord);
+            float meanLumaQ4 = APL_ReconstructMeanLumaQ4(localIndex, colorHistogram, pixelCount, offsetSum10);
+            float sceneNits = max(meanLumaQ4 * 0.25, 0.0);
+            float rawMetric = saturate(sceneNits / max(APLReferenceWhiteNits, 1.0));
+            float3 candidateMetrics = rawMetric.xxx;
+
+            if (EnableEOTFBoost)
+            {
+                float maxChannelNits = 0.0;
+                if (colorHistogram)
+                {
+                    float maxSumNits = tex2Dfetch(SamplerAPLGlobalHistMaxNits, binCoord);
+                    maxChannelNits = max((maxSumNits / pixelCount) * 2.0, sceneNits);
+                }
+                candidateMetrics.x = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(1));
+                candidateMetrics.y = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(2));
+                candidateMetrics.z = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(3));
+            }
+
+            weighted = float4(rawMetric, candidateMetrics) * pixelCount;
+        }
+    }
+
+    APL_EvalWeightedMetrics[localIndex] = weighted;
+    APL_EvalPixelCount[localIndex] = pixelCount;
+    barrier();
+
+    APL_REDUCE_EVAL_STAGE(128)
+    APL_REDUCE_EVAL_STAGE(64)
+    APL_REDUCE_EVAL_STAGE(32)
+    APL_REDUCE_EVAL_STAGE(16)
+    APL_REDUCE_EVAL_STAGE(8)
+    APL_REDUCE_EVAL_STAGE(4)
+    APL_REDUCE_EVAL_STAGE(2)
+    APL_REDUCE_EVAL_STAGE(1)
+
+    if (aplActive && localIndex == 0)
+    {
+        float totalPixelCount = APL_EvalPixelCount[0];
+        if (totalPixelCount <= 0.0)
+        {
+            tex2Dstore(StorageAPLInstant, int2(0, 0), 0.0.xxxx);
+            tex2Dstore(StorageAPLResponse, int2(0, 0), 0.0.xxxx);
+        }
+        else
+        {
+            float4 averages = APL_EvalWeightedMetrics[0] / totalPixelCount;
+            float exactRollingMaxNits = float(tex2Dfetch(SamplerAPLGlobalHistCount, APL_GlobalExactMaxLumaCoord())) * 0.25;
+            tex2Dstore(StorageAPLInstant, int2(0, 0), float4(averages.r, exactRollingMaxNits, 0.0, 1.0));
+            tex2Dstore(StorageAPLResponse, int2(0, 0), float4(averages.gba, 1.0));
+        }
+    }
+}
+
+#undef APL_REDUCE_EVAL_STAGE
+
+// --- SHADERS ---
 
 float4 PS_CopyAPLState(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
@@ -2653,26 +3025,20 @@ float4 PS_SmoothAPL(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_
     // would snap the smoothing on fade-in.
     float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
 
-    // Boost path: closed-loop display-side APL solved in-frame on the scene's
-    // aggregate post-boost response curve. Rolloff, the never-darken clamp and
-    // color-preserving limiting were evaluated exactly per sample by the decode
-    // pass, so every parameter shapes the estimate directly.
-    // When EOTF Boost is disabled but APL-driven LUT mode is enabled, keep a
-    // smoothed raw APL only so the LUT-only path still has an APL value.
-    float currentAPLForModel = EnableEOTFBoost ? SolveClosedLoopDisplayAPLFromResponse(rawAPL) : rawAPL;
-    float smoothedAPL = lerp(currentAPLForModel, lerp(prevSmoothedAPL, currentAPLForModel, alpha), hasPrev);
+    // Closed-loop display-side APL is solved in-frame from the scene's aggregate
+    // post-boost response curve reconstructed from the full-frame histogram.
+    // Rolloff and the never-darken clamp are evaluated per occupied bin;
+    // color-preserving limiting uses each bin's average max-channel headroom.
+    float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponse(rawAPL);
+    float smoothedAPL = lerp(currentDisplayAPL, lerp(prevSmoothedAPL, currentDisplayAPL, alpha), hasPrev);
 
-    // Precompute scene-uniform sceneLogGain here (1x1 pass) so PS_MainPass reads it from the
-    // texture instead of recomputing the LUT lookup + log2 chain for every pixel.
-    float sceneLogGain = EnableEOTFBoost ? ComputeSceneLogGainFromAPL(smoothedAPL) : 0.0;
+    // Precompute the scene-uniform log-gain once in this 1x1 pass so PS_MainPass
+    // does not repeat the APL lookup and log2 chain for every pixel.
+    float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
 
-    // r = smoothed APL used by the boost model and LUT-only fallback
-    //     EOTF Boost ON: closed-loop display-side APL from the response-curve solve
-    //     EOTF Boost OFF: smoothed raw APL for APL-driven LUT-only mode
-    // g = OSD output-APL fallback; overwritten by sampled post-boost APL in Main_Boost
-    //     when APL-driven LUT mode is active and the post-boost pass is valid
-    // b = history-valid flag
-    // a = precomputed scene log-gain (uniform across all pixels)
+    // r/g = smoothed display-side APL used by the boost model and OSD
+    // b   = history-valid flag
+    // a   = precomputed scene log-gain (uniform across all pixels)
     return float4(smoothedAPL, smoothedAPL, 1.0, sceneLogGain);
 }
 
@@ -2846,16 +3212,16 @@ float DrawOSDLabel8(float2 texcoord, float2 topLeft, float scale, float stepX, f
 }
 
 
-float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSampledNits)
+float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSceneNits)
 {
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float invAspect = 1.0 / max(aspect, 1e-6);
 
     // Smaller compact OSD than previous versions.
     // Row labels:
-    //   RAW APL  = current raw input scene APL
+    //   RAW APL  = raw input APL from the rolling full-frame reconstruction
     //   OUT APL  = smoothed output/display-side APL used by the boost logic
-    //   MAX NITS = current-frame max sampled decoded scene luminance in nits
+    //   RAW NITS = exact input-scene maximum in the rolling full-frame reconstruction
     float scale = 0.022;
     float glyphWidth = scale * invAspect;
     float stepX = glyphWidth * 1.06;
@@ -2892,13 +3258,13 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     if (texcoord.x < left - padX || texcoord.x > right + padX || texcoord.y < top - padY || texcoord.y > bottom + padY)
         return sceneColor;
 
-    int nitDisplay = clamp(int(floor(max(maxSampledNits, 0.0) + 0.5)), 0, 99999);
+    int nitDisplay = clamp(int(floor(max(maxSceneNits, 0.0) + 0.5)), 0, 99999);
 
     float bgMask = (texcoord.x >= left - padX && texcoord.x <= right + padX && texcoord.y >= top - padY && texcoord.y <= bottom + padY) ? 1.0 : 0.0;
 
     float rawLabelMask = DrawOSDLabel8(texcoord, inputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
     float outputLabelMask = DrawOSDLabel8(texcoord, outputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_O, OSD_CHAR_U, OSD_CHAR_T, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
-    float nitsLabelMask = DrawOSDLabel8(texcoord, nitsLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_M, OSD_CHAR_A, OSD_CHAR_X, OSD_CHAR_SPACE, OSD_CHAR_N, OSD_CHAR_I, OSD_CHAR_T, OSD_CHAR_S);
+    float nitsLabelMask = DrawOSDLabel8(texcoord, nitsLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_N, OSD_CHAR_I, OSD_CHAR_T, OSD_CHAR_S);
 
     float inputMask = 0.0;
     inputMask += DrawOSDAPLPercent2(texcoord, inputRowRight, scale, stepX, aspect, rawInputAPL);
@@ -2927,37 +3293,23 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     return result;
 }
 
-// PASS 2b: Main Rendering (1D APL-only measured scene gain, scene-uniform)
+// MAIN FULLSCREEN PASS: scene-uniform gain from the measured 1D APL model.
 
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
-
     bool boostEnabled = EnableEOTFBoost;
 
 #if PQHDRLUT_ENABLE
     bool lutEnabled = EnablePQHDRLUT;
 #endif
 
-    // EOTF Boost OFF = clean passthrough or LUT-only path.
-    // APL texture reads happen here only when APL-driven LUT mode is enabled.
+    // EOTF Boost OFF = clean passthrough or the original fixed LUT-only path.
     if (!boostEnabled)
     {
 #if PQHDRLUT_ENABLE
         if (lutEnabled)
-        {
-#if PQHDRLUT_ENABLE_APL_DRIVEN
-            if (EnableAPLDrivenLUTCompensationMode)
-            {
-                float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
-                color = PQHDRLUT_Apply_APLDriven(color, aplData.r);
-            }
-            else
-#endif
-            {
-                color = PQHDRLUT_Apply(color);
-            }
-        }
+            color = PQHDRLUT_Apply(color);
 #endif
 #if ENABLE_APL_GRAPH
         if (ShowAPLGraph)
@@ -2967,22 +3319,6 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
     }
 
     float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
-    float outputAPLForOSD = aplData.g;
-
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-    bool useRealPostBoostAPLForLUT = lutEnabled && EnableAPLDrivenLUTCompensationMode;
-    float4 postBoostAPLData = float4(0.0, 0.0, 0.0, 0.0);
-    if (useRealPostBoostAPLForLUT)
-    {
-        postBoostAPLData = tex2Dlod(SamplerPostBoostAPL, float4(0.5, 0.5, 0.0, 0.0));
-        if (postBoostAPLData.a > 0.0)
-            outputAPLForOSD = postBoostAPLData.r;
-    }
-#endif
-
-    // sceneLogGain is scene-uniform (depends only on APL + uniforms).
-    // It is precomputed once in PS_SmoothAPL and stored in aplData.a,
-    // eliminating the LUT lookup + log2 + conditional pow chain per pixel.
     float sceneLogGain = aplData.a;
 
 #if PQHDRLUT_ENABLE
@@ -3007,46 +3343,36 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
 
     float3 finalColor = color;
 
-    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-    finalColor = ApplyBoostPreserveColorFromPrecomputedParams(color, boostParams);
+    // Avoid a full-screen PQ/scRGB decode-and-reencode round trip when the solved
+    // gain is identity but LUT, OSD or graph processing still keeps this pass active.
+    if (sceneLogGain > 1e-6)
+    {
+        float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
+        finalColor = ApplyBoostPreserveColorFromPrecomputedParams(color, boostParams);
+    }
 
 #if PQHDRLUT_ENABLE
-    // Optional calibration layer is applied after the boost layer when boost is enabled,
-    // or directly to the original HDR signal when boost is disabled. APL-driven LUT
-    // mode changes only the LUT-compensation lookup; boost math above is unchanged.
+    // The optional fixed calibration LUT is applied after boost.
     if (lutEnabled)
-    {
-#if PQHDRLUT_ENABLE_APL_DRIVEN
-        if (EnableAPLDrivenLUTCompensationMode)
-        {
-            float aplForLUT = aplData.r;
-            if (postBoostAPLData.a > 0.0)
-                aplForLUT = postBoostAPLData.r;
-
-            finalColor = PQHDRLUT_Apply_APLDriven(finalColor, aplForLUT);
-        }
-        else
-#endif
-        {
-            finalColor = PQHDRLUT_Apply(finalColor);
-        }
-    }
+        finalColor = PQHDRLUT_Apply(finalColor);
 #endif
 
     if (ShowOSD)
     {
         float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
         float rawInputAPL = saturate(instantData.r);
-        float currentMaxSampledNits = max(instantData.g, 0.0);
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-        if (postBoostAPLData.a > 0.0)
-            currentMaxSampledNits = max(postBoostAPLData.g, 0.0);
-#endif
-        finalColor = DrawStatsOverlay(texcoord, finalColor, rawInputAPL, outputAPLForOSD, currentMaxSampledNits);
+        float currentMaxSceneNits = max(instantData.g, 0.0);
+        finalColor = DrawStatsOverlay(
+            texcoord,
+            finalColor,
+            rawInputAPL,
+            saturate(aplData.g),
+            currentMaxSceneNits
+        );
     }
 
 #if ENABLE_APL_GRAPH
-    // Graph overlay is drawn directly in the main pass (uniform branch — free when hidden).
+    // Graph overlay is drawn directly in the main pass; the uniform branch skips it when hidden.
     // This removes the full-resolution TexBoosted intermediate and the extra fullscreen
     // Debug_Overlay pass that previously cost ~120 MB/frame of bandwidth even with the
     // graph toggled off. Drawn after the OSD to preserve the original overlay order.
@@ -3058,8 +3384,21 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
 }
 
 #if ENABLE_APL_GRAPH
+// Live-equivalent fixed-APL operating point for the standard APL graph.
+// Graph APL (%) is treated as a uniform representative scene and solved with the
+// same candidate parameters and bracketed gain solver used by the live fallback.
+// The plotted probe is intentionally excluded from this scene-level operating point,
+// so sweeping the x-axis cannot redistribute APL or create graph-only feedback.
+float ComputeAPLGraphLiveOperatingPoint(float rawAPLPercent)
+{
+    return SolveUniformSceneDisplayAPL(saturate(rawAPLPercent * 0.01));
+}
+
 float4 PS_CalcGraphParams(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
+    if (!ShowAPLGraph)
+        return 0.0.xxxx;
+
     float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
     float graphAxisMaxPQ = GraphUsePQSpace ? max(NitsToPQ(graphAxisMaxNits), 1e-6) : 0.0;
 
@@ -3069,20 +3408,77 @@ float4 PS_CalcGraphParams(float4 vpos : SV_Position, float2 texcoord : TexCoord)
     }
 
     float graphRawAPLPercent = clamp(GraphAPLIndex, 0.0, 100.0);
-    float graphClosedLoopAPL = ComputeGraphClosedLoopAPLFromRawPercent(graphRawAPLPercent);
+    float graphClosedLoopAPL = ComputeAPLGraphLiveOperatingPoint(graphRawAPLPercent);
     float graphClosedLoopAPLPercent = graphClosedLoopAPL * 100.0;
     float maxMeasuredNits = GetAPLMaxMeasuredNits(graphClosedLoopAPLPercent);
-    float graphAnchorBoostedNits = ComputeRollOffAnchorBoostedNits(graphClosedLoopAPL);
 
-    // r = solved closed-loop APL %, g = max measured nits, b = axis max PQ, a = rolloff anchor.
-    // The old r value was graphRollOffStartNits but PS_CalcGraphCurves never used it.
-    return float4(graphClosedLoopAPLPercent, maxMeasuredNits, graphAxisMaxPQ, graphAnchorBoostedNits);
+    // r = solved closed-loop APL %, g = max measured nits, b = axis max PQ, a = unused.
+    return float4(graphClosedLoopAPLPercent, maxMeasuredNits, graphAxisMaxPQ, 0.0);
 }
 
-// GRAPH PASS 1b: Precompute grid/tick/ref line screen-space endpoints (32 pixels — free).
+// Apply the exact live per-pixel boost path at an already solved fixed-APL operating
+// point, then project that remapped signal through the measured 2D APL x nits model.
+// Returns: .r remapped signal nits, .g predicted measured output nits,
+//          .b solved display-side APL, .a valid.
+float4 ComputeAPLGraphLiveProjection(float displayAPL, float maxMeasuredNits, float inputNits)
+{
+    float safeInputNits = max(inputNits, 0.0);
+    float remappedSignalNits = safeInputNits;
+
+    if (EnableEOTFBoost && displayAPL > 1e-6)
+    {
+        float sceneLogGain = ComputeSceneLogGainFromAPL(displayAPL);
+        float4 liveBoostParams = ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain);
+        remappedSignalNits = ComputePostBoostNitsForSample(
+            safeInputNits,
+            safeInputNits,
+            liveBoostParams
+        );
+    }
+
+    float displayAPLPercent = displayAPL * 100.0;
+    float predictedMeasuredOutputNits = SampleCorrectedOutputNitsForAPL(
+        displayAPLPercent,
+        remappedSignalNits,
+        maxMeasuredNits
+    );
+
+    return float4(remappedSignalNits, predictedMeasuredOutputNits, displayAPL, 1.0);
+}
+
+// GRAPH PASS 1a: Live-equivalent projection, one thread per graph x sample.
+// Heavy graph-only per-point math is isolated here instead of being duplicated for
+// both ends of every segment in PS_CalcGraphCurves. The standard APL mode reuses the
+// single fixed operating point solved by Graph_Params; window mode solves per x sample.
+float4 PS_CalcGraphProjection(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    if (!ShowAPLGraph)
+        return 0.0.xxxx;
+
+    int sampleIndex = min(int(vpos.x), GRAPH_CURVE_SAMPLES - 1);
+    float t = float(sampleIndex) / float(GRAPH_CURVE_SAMPLES - 1);
+
+    float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
+    float4 graphParams = tex2Dlod(SamplerGraphParams, float4(0.5, 0.5, 0.0, 0.0));
+    float graphAxisMaxPQ = GraphUsePQSpace ? max(graphParams.b, 1e-6) : 0.0;
+    float inputNits = GraphSampleNitsFromFraction(t, graphAxisMaxNits, graphAxisMaxPQ);
+    float limitedInputNits = ApplyGraphInputSignalLimitNits(inputNits);
+
+    if (GraphUseFullFieldWindowProjection)
+        return ComputeFullFieldLiveProjectionByMode(GraphProjectionWindowSize, limitedInputNits);
+
+    float graphClosedLoopAPL = saturate(graphParams.r * 0.01);
+    float graphMaxMeasuredNits = max(graphParams.g, 0.0);
+    return ComputeAPLGraphLiveProjection(graphClosedLoopAPL, graphMaxMeasuredNits, limitedInputNits);
+}
+
+// GRAPH PASS 1b: Precompute grid/tick/reference endpoints in a tiny 32-pixel pass.
 // Eliminates ~200 NitsToPQ/pow calls per inGraphCore pixel in the fullscreen draw pass.
 float4 PS_CalcGraphLines(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
+    if (!ShowAPLGraph)
+        return float4(-1.0, -1.0, -1.0, -1.0);
+
     int idx = int(vpos.x);
 
     float aspect       = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
@@ -3139,7 +3535,7 @@ float4 PS_CalcGraphLines(float4 vpos : SV_Position, float2 texcoord : TexCoord) 
     return float4(a, b);
 }
 
-// GRAPH PASS 2: Precompute all curve segment endpoints (64 x 4 = 256 pixels — free).
+// GRAPH PASS 2: Precompute curve segment endpoints in a 64 x 4 graph-only pass.
 //
 // Each texel (s, row) stores float4(ax, ay, bx, by) in p-space screen coords
 // (texcoord with p.x *= aspect) for curve segment s, row = GCURVE_* index.
@@ -3150,6 +3546,9 @@ float4 PS_CalcGraphLines(float4 vpos : SV_Position, float2 texcoord : TexCoord) 
 float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     static const float4 SENTINEL = float4(-1.0, -1.0, -1.0, -1.0);
+
+    if (!ShowAPLGraph)
+        return SENTINEL;
 
     int s   = int(vpos.x);   // 0 .. GRAPH_CURVE_SAMPLES-1
     int row = int(vpos.y);   // 0 .. 3
@@ -3167,8 +3566,6 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
     float4 graphParams               = tex2Dlod(SamplerGraphParams, float4(0.5, 0.5, 0.0, 0.0));
     float  graphAxisMaxPQ            = GraphUsePQSpace ? max(graphParams.b, 1e-6) : 0.0;
     float  graphRawAPLPercent        = clamp(GraphAPLIndex, 0.0, 100.0);
-    float  graphClosedLoopAPLPercent = graphParams.r;
-    float  graphAnchorBoostedNits    = graphParams.a;
 
     bool useFF = GraphUseFullFieldWindowProjection;
     int fullFieldWindowMode = GraphProjectionWindowSize;
@@ -3185,13 +3582,33 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
 
     float4 result = SENTINEL;
 
+    // Projection values are computed once per x sample in the dedicated 64x1 pass.
+    // Adjacent segments share those samples instead of running the full response
+    // solve twice per endpoint here.
+    static const float invGraphSamples = 1.0 / float(GRAPH_CURVE_SAMPLES);
+    float4 graphProjection0 = 0.0.xxxx;
+    float4 graphProjection1 = 0.0.xxxx;
+
+    if (row <= GCURVE_CORRECTED)
+    {
+        graphProjection0 = tex2Dlod(
+            SamplerGraphProjection,
+            float4((float(s) + 0.5) * invGraphSamples, 0.5, 0.0, 0.0)
+        );
+        graphProjection1 = tex2Dlod(
+            SamplerGraphProjection,
+            float4((float(s + 1) + 0.5) * invGraphSamples, 0.5, 0.0, 0.0)
+        );
+    }
+
     if (row == GCURVE_REMAPPED)
     {
-        // Green re-mapped curve: standard APL mode only, using the closed-loop display-side APL solved from the selected raw input APL.
-        if (!useFF)
+        // Green curve: exact signal produced by the selected graph model.
+        float y0 = graphProjection0.r;
+        float y1 = graphProjection1.r;
+
+        if (graphProjection0.a > 0.0 && graphProjection1.a > 0.0)
         {
-            float y0 = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x0);
-            float y1 = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x1);
             float2 a = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0);
             float2 b = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1);
             result = float4(a, b);
@@ -3199,14 +3616,19 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
     }
     else if (row == GCURVE_CORRECTED)
     {
-        // Gray projected / corrected output curve (both modes).
-        float y0r = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x0);
-        float y1r = ComputeGraphCurveRemappedTargetNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphAnchorBoostedNits, x1);
-        float y0  = ComputeGraphCurveCorrectedOutputNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphMaxMeasuredNits, y0r);
-        float y1  = ComputeGraphCurveCorrectedOutputNits(useFF, fullFieldWindowMode, graphClosedLoopAPLPercent, graphMaxMeasuredNits, y1r);
-        float2 a  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0);
-        float2 b  = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1);
-        result = float4(a, b);
+        // Gray curve: predicted measured output from the live-equivalent projection pass.
+        float y0;
+        float y1;
+
+        y0 = graphProjection0.g;
+        y1 = graphProjection1.g;
+
+        if (graphProjection0.a > 0.0 && graphProjection1.a > 0.0)
+        {
+            float2 a = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x0, y0);
+            float2 b = ToGraphPointWithPQMax(graphPos, graphSize, graphAxisMaxNits, graphAxisMaxPQ, x1, y1);
+            result = float4(a, b);
+        }
     }
     else if (row == GCURVE_MEASURED)
     {
@@ -3250,30 +3672,63 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
 
 technique EOTF_Boost_1D_APL_LUT 
 {
-    // Parallel decode: APL_GRID_W x APL_GRID_H threads each decode one APL sample.
-    pass APL_Decode
+    // Three-pixel uniform setup for the response-curve candidate parameter sets.
+    pass Candidate_Boost_Params
     {
         VertexShader = PostProcessVS;
-        PixelShader  = PS_DecodeAPL;
-        RenderTarget0 = TexAPLDecoded;
-        RenderTarget1 = TexAPLDecodedNits;
+        PixelShader = PS_CalcCandidateBoostParams;
+        RenderTarget = TexCandidateBoostParams;
     }
 
-    // Stage-1 reduction: APL_GRID_W threads each sum one decoded column.
-    pass APL_Reduce
+    // 129 exact PQ nodes; hardware filtering turns them into the fast full-frame
+    // decoder without dynamic-array indexing or FXC unroll failures.
+    pass APL_Fast_PQ_LUT
     {
         VertexShader = PostProcessVS;
-        PixelShader  = PS_ReduceAPLColumns;
-        RenderTarget0 = TexAPLReduced;
-        RenderTarget1 = TexAPLReducedNits;
+        PixelShader = PS_BuildAPLFastPQLUT;
+        RenderTarget = TexAPLFastPQNits;
     }
 
-    pass APL_Calculation
+    // Clear all row histograms or only the current rolling phase before rebuilding.
+    pass APL_FullFrame_RowHistogramClear
     {
-        VertexShader = PostProcessVS;
-        PixelShader = PS_CalcAPL;
-        RenderTarget0 = TexAPLInstant;
-        RenderTarget1 = TexAPLResponse;
+        ComputeShader = CS_ClearAPLFullFrameRowHistograms<256, 1, 1>;
+        DispatchSizeX = 1;
+        DispatchSizeY = 1;
+        DispatchSizeZ = 1;
+        GenerateMipMaps = false;
+    }
+
+    // Packed row-histogram build. Rolling mode maps the compact Y dispatch onto
+    // one interleaved 32-pixel-high row phase.
+    pass APL_FullFrame_RowHistogramBuild
+    {
+        ComputeShader = CS_BuildAPLFullFrameRowHistogram<16, 16, 1>;
+        DispatchSizeX = APL_FFH_TILE_COUNT_X;
+        DispatchSizeY = APL_FFH_ROLLING_ROW_SLOTS;
+        DispatchSizeZ = 1;
+        GenerateMipMaps = false;
+    }
+
+    // Rebuild the global histogram every rendered frame from the latest valid
+    // persistent row histograms, including newly refreshed rolling rows.
+    pass APL_FullFrame_RowHistogramReduce
+    {
+        ComputeShader = CS_ReduceAPLFullFrameRowHistogram<64, 1, 1>;
+        DispatchSizeX = APL_FFH_BLOCK_W;
+        DispatchSizeY = APL_FFH_BLOCK_H;
+        DispatchSizeZ = 1;
+        GenerateMipMaps = false;
+    }
+
+    // One 256-thread group evaluates and reduces all bins into the existing 1x1 APL state.
+    pass APL_FullFrame_ResponseEvaluate
+    {
+        ComputeShader = CS_EvaluateAPLFullFrameHistogram<256, 1, 1>;
+        DispatchSizeX = 1;
+        DispatchSizeY = 1;
+        DispatchSizeZ = 1;
+        GenerateMipMaps = false;
     }
 
     pass APL_CopyState
@@ -3297,39 +3752,22 @@ technique EOTF_Boost_1D_APL_LUT
         RenderTarget = TexBoostParams;
     }
 
-#if PQHDRLUT_ENABLE && PQHDRLUT_ENABLE_APL_DRIVEN
-    pass PostBoost_APL_Decode
-    {
-        VertexShader = PostProcessVS;
-        PixelShader = PS_DecodePostBoostAPL;
-        RenderTarget = TexPostBoostAPLDecoded;
-    }
-
-    pass PostBoost_APL_Reduce
-    {
-        VertexShader = PostProcessVS;
-        PixelShader = PS_ReducePostBoostAPLColumns;
-        RenderTarget = TexPostBoostAPLReduced;
-    }
-
-    pass PostBoost_APL_Calculation
-    {
-        VertexShader = PostProcessVS;
-        PixelShader = PS_CalcPostBoostAPL;
-        RenderTarget = TexPostBoostAPL;
-    }
-#endif
-
 #if ENABLE_APL_GRAPH
-    // Graph precompute passes read only uniforms and TexGraphParams — no dependency on
-    // the boosted image — so they run before Main_Boost, which then draws the overlay
-    // itself. This eliminates the full-resolution TexBoosted intermediate and the extra
-    // fullscreen Debug_Overlay pass entirely.
+    // Graph-only precompute passes use uniforms, candidate parameters and their own
+    // small intermediate textures. They have no dependency on a full-resolution
+    // boosted image, so Main_Boost can draw the overlay directly.
     pass Graph_Params
     {
         VertexShader = PostProcessVS;
         PixelShader = PS_CalcGraphParams;
         RenderTarget = TexGraphParams;
+    }
+
+    pass Graph_Projection
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = PS_CalcGraphProjection;
+        RenderTarget = TexGraphProjection;
     }
 
     pass Graph_Lines
