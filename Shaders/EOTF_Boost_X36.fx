@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.18.7.12
+    EOTF Boost v8.18.7.13
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
@@ -2368,13 +2368,15 @@ int APL_EncodeWithinBinOffset10(int lumaQ4, int lumaBin)
     int lowerQ4 = 0;
     int upperQ4 = 0;
     APL_HistogramLumaBinBoundsQ4(lumaBin, lowerQ4, upperQ4);
-    int rangeQ4 = upperQ4 - lowerQ4;
 
-    if (rangeQ4 <= 0)
+    uint rangeQ4 = uint(upperQ4 - lowerQ4);
+    if (rangeQ4 == 0u)
         return 0;
 
-    int numerator = (clamp(lumaQ4, lowerQ4, upperQ4) - lowerQ4) * APL_FFH_PACK_OFFSET_SCALE;
-    return clamp((numerator + rangeQ4 / 2) / rangeQ4, 0, APL_FFH_PACK_OFFSET_SCALE);
+    uint positionQ4 = uint(clamp(lumaQ4, lowerQ4, upperQ4) - lowerQ4);
+    uint numerator = positionQ4 * uint(APL_FFH_PACK_OFFSET_SCALE);
+    uint offset10 = (numerator + (rangeQ4 >> 1)) / rangeQ4;
+    return int(min(offset10, uint(APL_FFH_PACK_OFFSET_SCALE)));
 }
 
 float APL_ReconstructMeanLumaQ4(int binIndex, bool colorHistogram, float pixelCount, float offsetSum10)
