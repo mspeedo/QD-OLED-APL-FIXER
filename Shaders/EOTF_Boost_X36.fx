@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.18.7.13
+    EOTF Boost v8.18.7.14
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
@@ -19,6 +19,7 @@
       5. Fullscreen boost and optional calibration LUT
 
     Max Raw Nits is tracked only while the OSD is visible.
+    Rolling phases advance per shader execution, independent of presented-frame count.
 */
 
 #include "ReShade.fxh"
@@ -333,7 +334,6 @@ uniform float OSDBrightness <
 > = 0.5;
 
 uniform float FrameTime < source = "frametime"; >;
-uniform int FrameCount < source = "framecount"; >;
 
 #if ENABLE_APL_GRAPH
 uniform bool ShowAPLGraph <
@@ -2415,20 +2415,29 @@ int2 APL_GlobalExactMaxLumaCoord()
     return int2(APL_FFH_AUX_X, 0);
 }
 
-int APL_GetRollingPhase()
+int APL_DecodeStoredRollingPhase(float storedPhase)
 {
 #if APL_FULLFRAME_ROLLING_PHASES > 0
-    int safeFrame = max(FrameCount, 0);
-    return safeFrame % APL_FULLFRAME_ROLLING_PHASES;
+    return clamp(int(floor(storedPhase + 0.5)), 0, APL_FULLFRAME_ROLLING_PHASES - 1);
 #else
     return 0;
 #endif
 }
 
-int APL_GetPhysicalRowFromDispatchSlot(int dispatchRowSlot)
+int APL_GetNextRollingPhase(int currentPhase)
 {
 #if APL_FULLFRAME_ROLLING_PHASES > 0
-    return APL_GetRollingPhase() + dispatchRowSlot * APL_FULLFRAME_ROLLING_PHASES;
+    int nextPhase = currentPhase + 1;
+    return (nextPhase < APL_FULLFRAME_ROLLING_PHASES) ? nextPhase : 0;
+#else
+    return 0;
+#endif
+}
+
+int APL_GetPhysicalRowFromDispatchSlot(int dispatchRowSlot, int rollingPhase)
+{
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    return rollingPhase + dispatchRowSlot * APL_FULLFRAME_ROLLING_PHASES;
 #else
     return dispatchRowSlot;
 #endif
@@ -2511,9 +2520,11 @@ void APL_DecodePackedFullFrameSample(
     valid = 1;
 }
 
+groupshared int APL_SetupRollingPhase;
 groupshared int APL_TilePackedCountLuma[APL_FFH_MAX_BINS];
 groupshared int APL_TileMaxNits[APL_FFH_MAX_BINS];
 groupshared int APL_TileExactMaxLumaQ4;
+groupshared int APL_BuildRollingPhase;
 
 void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int maxNits2, int valid, bool needsMaxHistogram)
 {
@@ -2562,8 +2573,16 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
         float4 previousAPL = aplActive
             ? tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0))
             : 0.0.xxxx;
+        float storedPhase = aplActive
+            ? tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0)).b
+            : 0.0;
+        APL_SetupRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
+
+        // TexAPLPrev.g is unused by the solver and carries this execution's phase.
+        previousAPL.g = float(APL_SetupRollingPhase);
         tex2Dstore(StorageAPLPrev, int2(0, 0), previousAPL);
     }
+    barrier();
 
 #if APL_FULLFRAME_ROLLING_PHASES > 0
     int rowSlots = APL_FFH_ROLLING_ROW_SLOTS;
@@ -2589,7 +2608,7 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
         {
             int rowSlot = entry / activeBins;
             int binIndex = entry - rowSlot * activeBins;
-            int rowIndex = APL_GetPhysicalRowFromDispatchSlot(rowSlot);
+            int rowIndex = APL_GetPhysicalRowFromDispatchSlot(rowSlot, APL_SetupRollingPhase);
             if (rowIndex < APL_FFH_TILE_COUNT_Y)
             {
                 int2 coord = APL_RowHistogramCoord(rowIndex, binIndex);
@@ -2620,9 +2639,12 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
     int activeBins = APL_ActiveHistogramBins();
     bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
-    int physicalRow = APL_GetPhysicalRowFromDispatchSlot(int(groupID.y));
-    bool validPhysicalRow = physicalRow < APL_FFH_TILE_COUNT_Y;
-    bool decodeThisGroup = aplActive && validPhysicalRow;
+
+    if (localIndex == 0)
+    {
+        float storedPhase = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0)).g;
+        APL_BuildRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
+    }
 
     if (localIndex < activeBins)
     {
@@ -2632,6 +2654,10 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
     if (trackExactMax && localIndex == 0)
         APL_TileExactMaxLumaQ4 = 0;
     barrier();
+
+    int physicalRow = APL_GetPhysicalRowFromDispatchSlot(int(groupID.y), APL_BuildRollingPhase);
+    bool validPhysicalRow = physicalRow < APL_FFH_TILE_COUNT_Y;
+    bool decodeThisGroup = aplActive && validPhysicalRow;
 
     if (decodeThisGroup)
     {
@@ -2889,6 +2915,8 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         float prevSmoothedAPL = saturate(prevData.r);
         float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
         float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
+        int currentRollingPhase = APL_DecodeStoredRollingPhase(prevData.g);
+        int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
 
 
         float gMax = ComputeCandidateMaxLogGain();
@@ -2905,7 +2933,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         tex2Dstore(
             StorageAPLInstant,
             int2(0, 0),
-            float4(rawAPL, exactRollingMaxNits, 0.0, (totalPixelCount > 0.0) ? 1.0 : 0.0)
+            float4(rawAPL, exactRollingMaxNits, float(nextRollingPhase), (totalPixelCount > 0.0) ? 1.0 : 0.0)
         );
         tex2Dstore(StorageAPL, int2(0, 0), float4(smoothedAPL, smoothedAPL, 1.0, sceneLogGain));
         tex2Dstore(StorageBoostParams, int2(0, 0), ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain));
