@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v9.0
+    EOTF Boost v9.1
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
@@ -2848,14 +2848,17 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
     int2 localBinCoord = int2(groupID.xy);
     int binIndex = localBinCoord.y * APL_FFH_BLOCK_W + localBinCoord.x;
     int activeBins = APL_ActiveHistogramBins();
-    bool validBin = binIndex < activeBins;
+    // One group reduces one bin, so all lanes take this exit together.
+    if (binIndex >= activeBins)
+        return;
+
     bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
     int countSum = 0;
     float offsetSum10 = 0.0;
     float maxSumNits = 0.0;
-    if (aplActive && validBin)
+    if (aplActive)
     {
         [loop]
         for (int rowIndex = localIndex; rowIndex < APL_FFH_TILE_COUNT_Y; rowIndex += APL_FFH_REDUCE_THREADS)
@@ -2891,7 +2894,7 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
     APL_REDUCE_ROW_STAGE(2)
     APL_REDUCE_ROW_STAGE(1)
 
-    if (aplActive && validBin && localIndex == 0)
+    if (aplActive && localIndex == 0)
     {
         tex2Dstore(StorageAPLGlobalHistCount, localBinCoord, APL_ReduceCount[0]);
         tex2Dstore(StorageAPLGlobalHistOffset10, localBinCoord, APL_ReduceOffset10[0]);

@@ -1,6 +1,8 @@
-# EOTF Boost v9.0 for the MSI MPG 341CQR QD-OLED X36
+# EOTF Boost v9.1 for the MSI MPG 341CQR QD-OLED X36
 
 This ReShade shader compensates for the X36’s APL-dependent HDR dimming. It estimates average picture level (APL) with a rolling full-frame histogram and uses the monitor’s measured brightness response to set the boost. Highlight roll-off fades the added gain to zero at the target luminance (1300 nits by default).
+
+In v9.1, the default 64-bin histogram skips reduction work for the 192 unused bins. Enabling **Preserve Color by Reducing Boost** uses all 256 bins.
 
 Enable `EOTF_Boost_1D_APL_LUT` in ReShade. Under **APL Input Mode**, select **PQ Decoded Normalized** for HDR10 (default) or **scRGB Normalized** for scRGB. [Download the X36 shader](Shaders/EOTF_Boost_X36.fx).
 
@@ -19,7 +21,7 @@ Enable `EOTF_Boost_1D_APL_LUT` in ReShade. Under **APL Input Mode**, select **PQ
 | Preserve Color by Reducing Boost | Off | Reduces brightness gain near a channel limit so saturated highlights can retain their RGB ratios. |
 | HDR Saturation (%) | 100% | Adjusts color after boost and before the LUT while preserving signal luminance. 0% gives grayscale, 100% bypasses the adjustment, and increases up to 150% taper near channel limits. |
 | scRGB Signal Reference (nits) | 80 | Sets the luminance represented by a linear scRGB value of 1.0 for APL, boost and saturation. The optional calibration LUT uses the standard 80-nit scRGB conversion. |
-| Show APL Stats | Off | With boost enabled, displays raw input APL, estimated output APL and Max Raw Nits. The last value tracks the brightest input channel. |
+| Show APL Stats | Off | With boost enabled, displays raw input APL, estimated output APL and Max Raw Nits. Max Raw Nits is the highest input pixel luminance before boost across the rows in the rolling histogram. |
 | OSD Brightness | 0.5 | Adjusts the brightness of the stats overlay and debug graph. |
 
 ## Optional calibration LUT
