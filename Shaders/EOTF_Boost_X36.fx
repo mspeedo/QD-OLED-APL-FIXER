@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v8.18.7.14
+    EOTF Boost v9.0
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
@@ -16,7 +16,7 @@
       2. Full-frame row histogram build
       3. Global histogram reduction
       4. Response solve, smoothing, and boost parameters
-      5. Fullscreen boost and optional calibration LUT
+      5. Fullscreen boost, HDR saturation, and optional calibration LUT
 
     Max Raw Nits is tracked only while the OSD is visible.
     Rolling phases advance per shader execution, independent of presented-frame count.
@@ -294,6 +294,13 @@ uniform bool EnableColorPreservingBoostMode <
     ui_label = "Preserve Color by Reducing Boost";
     UI_TOOLTIP("Reduces added boost near channel limits to preserve RGB ratios.")
 > = false;
+
+uniform int HDRSaturationPercent <
+    ui_type = "slider";
+    ui_label = "HDR Saturation (%)";
+    ui_min = 0; ui_max = 150; ui_step = 1;
+    UI_TOOLTIP("Preserves signal luminance. 100% keeps the original color. Increases taper near channel limits.")
+> = 100;
 
 static const float COLOR_PRESERVING_BOOST_KNEE = 0.85;
 
@@ -1401,10 +1408,106 @@ float SoftLimitBoostScale(float desiredScale, float maxScale, float kneeFraction
     return min(kneeStart + span * (x / (1.0 + x)), safeMax);
 }
 
-float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostParams)
+// C(t) = neutral + t * (RGB - neutral). D is X + 15Y + 3Z, normalized
+// to one on unit white. Along this line the u'v' radius multiplier is
+// s = t*r / (1 + t*(r-1)), where r = D(pixel) / D(neutral).
+float HDRSaturationRayScale(float3 rec2020, float neutral, float channelLimit)
+{
+    if (neutral <= 0.0)
+        return 1.0;
+
+    float requested = float(HDRSaturationPercent) * 0.01;
+    if (requested == 0.0)
+        return 0.0;
+
+    const float3 dWeights = float3(0.23819074, 0.54110764, 0.22070162);
+    float ratio = dot(rec2020, dWeights) / neutral;
+    if (ratio <= 0.0)
+        return 1.0;
+
+    if (requested > 1.0)
+    {
+        float low = min(rec2020.r, min(rec2020.g, rec2020.b));
+        float high = Max3(rec2020);
+        if (low <= 0.0 || high >= channelLimit || neutral >= channelLimit)
+            return 1.0;
+
+        // Inverse distance to the first intersection with the RGB cube.
+        // This stays bounded even when the color is nearly gray.
+        float invBoundary = max((neutral - low) / neutral,
+                                (high - neutral) / (channelLimit - neutral));
+        float roomNumerator = 1.0 - invBoundary;
+        float roomDenominator = invBoundary + (ratio - 1.0);
+        float extra = requested - 1.0;
+
+        // u'v' headroom is roomNumerator / roomDenominator. Compare before
+        // dividing so near-neutral pixels never require a huge boundary scale.
+        if (extra * roomDenominator > 0.75 * roomNumerator)
+        {
+            float room = roomNumerator / roomDenominator;
+            float knee = 0.75 * room;
+            float tail = 0.25 * room;
+            float beyond = extra - knee;
+            requested = 1.0 + knee + tail * (beyond / (tail + beyond));
+        }
+    }
+
+    return requested / (requested + (1.0 - requested) * ratio);
+}
+
+float HDRSaturationLimitNits()
+{
+    return (BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0;
+}
+
+float3 HDRSaturationRec709ToRec2020(float3 color)
+{
+    // D65 Rec.709 -> D65 Rec.2020. Centering on green maps equal RGB exactly
+    // and keeps signed scRGB values until after the primaries conversion.
+    return color.ggg + (color.r - color.g) * float3(0.62740390, 0.06909729, 0.01639144)
+                     + (color.b - color.g) * float3(0.04331307, 0.01136232, 0.89559525);
+}
+
+float3 HDRSaturationLinearRGB(float3 color, bool isPQLinear)
+{
+    if (color.r == color.g && color.g == color.b)
+        return color;
+
+    float3 rec2020 = isPQLinear ? color : HDRSaturationRec709ToRec2020(color);
+    float neutral = isPQLinear ? GetLuma2020(color) : GetLuma709(color);
+    float limit = HDRSaturationLimitNits();
+    if (!isPQLinear)
+        limit /= SIGNAL_REFERENCE_NITS;
+
+    float rayScale = HDRSaturationRayScale(rec2020, neutral, limit);
+    if (rayScale == 1.0)
+        return color;
+
+    // A D65-neutral ray has the same affine parameter in both linear RGB
+    // spaces, so the signed scRGB path needs no inverse matrix.
+    return neutral.xxx + rayScale * (color - neutral.xxx);
+}
+
+float3 HDRSaturationBuffer(float3 color)
+{
+    if (HDRSaturationPercent == 100)
+        return color;
+
+    if (APLInputMode != 1)
+        return HDRSaturationLinearRGB(color, false);
+
+    float3 nits = PQToLinearBT2100(color) * 10000.0;
+    float3 adjusted = HDRSaturationLinearRGB(nits, true);
+    if (all(adjusted == nits))
+        return color;
+
+    return LinearToPQBT2100(adjusted / 10000.0);
+}
+
+float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams)
 {
     if (boostParams.r <= 1.000001 && boostParams.g <= 0.0)
-        return color;
+        return HDRSaturationBuffer(color);
 
     if (APLInputMode == 1)
     {
@@ -1412,7 +1515,7 @@ float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostPa
         float originalLumaNits = max(GetLuma2020(linearColorNits), 0.0);
 
         if (originalLumaNits <= 1e-6)
-            return color;
+            return HDRSaturationBuffer(color);
 
         float boostedLumaNits = ComputeBoostedLumaNitsFromPrecomputedParams(originalLumaNits, boostParams);
         float colorScale = boostedLumaNits / originalLumaNits;
@@ -1428,6 +1531,10 @@ float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostPa
 
         float3 boostedColorNits = linearColorNits * colorScale;
 
+        // Match the original PQ boost output boundary before adjusting chroma.
+        if (HDRSaturationPercent != 100)
+            boostedColorNits = HDRSaturationLinearRGB(clamp(boostedColorNits, 0.0, 10000.0), true);
+
         return LinearToPQBT2100(saturate(max(boostedColorNits, 0.0) / 10000.0));
     }
 
@@ -1437,7 +1544,7 @@ float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostPa
     float originalLumaNits = max(GetLuma709(linearColor) * SIGNAL_REFERENCE_NITS, 0.0);
 
     if (originalLumaNits <= 1e-6)
-        return color;
+        return HDRSaturationBuffer(color);
 
     float boostedLumaNits = ComputeBoostedLumaNitsFromPrecomputedParams(originalLumaNits, boostParams);
     float colorScale = boostedLumaNits / originalLumaNits;
@@ -1451,7 +1558,7 @@ float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostPa
         colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
     }
 
-    return linearColor * colorScale;
+    return HDRSaturationBuffer(linearColor * colorScale);
 }
 
 
@@ -3180,71 +3287,31 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
 }
 
 
-// Pass 5: apply scene-uniform boost, optional LUT, OSD, and graph.
+// Pass 5: apply boost and saturation, calibrate, then draw the OSD and graph.
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
-    bool boostEnabled = EnableEOTFBoost;
+    float4 aplData = 0.0.xxxx;
+    if (EnableEOTFBoost)
+        aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
 
-#if PQHDRLUT_ENABLE
-    bool lutEnabled = EnablePQHDRLUT;
-#endif
-
-
-    if (!boostEnabled)
-    {
-        // LUT-only or passthrough path.
-#if PQHDRLUT_ENABLE
-        if (lutEnabled)
-            color = PQHDRLUT_Apply(color);
-#endif
-#if ENABLE_APL_GRAPH
-        if (ShowAPLGraph)
-            color = DrawAPLGraphOverlay(texcoord, color);
-#endif
-        return float4(color, 1.0);
-    }
-
-    float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
-    float sceneLogGain = aplData.a;
-
-#if PQHDRLUT_ENABLE
-    if ((sceneLogGain <= 0.0) && (lutEnabled == false) && (ShowOSD == false))
-    {
-#if ENABLE_APL_GRAPH
-        if (ShowAPLGraph)
-            color = DrawAPLGraphOverlay(texcoord, color);
-#endif
-        return float4(color, 1.0);
-    }
-#else
-    if ((sceneLogGain <= 0.0) && (ShowOSD == false))
-    {
-#if ENABLE_APL_GRAPH
-        if (ShowAPLGraph)
-            color = DrawAPLGraphOverlay(texcoord, color);
-#endif
-        return float4(color, 1.0);
-    }
-#endif
-
-    float3 finalColor = color;
-
-
-    if (sceneLogGain > 1e-6)
+    float3 finalColor;
+    if (aplData.a > 1e-6)
     {
         float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-        finalColor = ApplyBoostPreserveColorFromPrecomputedParams(color, boostParams);
+        finalColor = ApplyBoostAndHDRSaturation(color, boostParams);
+    }
+    else
+    {
+        finalColor = HDRSaturationBuffer(color);
     }
 
 #if PQHDRLUT_ENABLE
-
-    // The calibration LUT operates on the final boosted signal.
-    if (lutEnabled)
+    if (EnablePQHDRLUT)
         finalColor = PQHDRLUT_Apply(finalColor);
 #endif
 
-    if (ShowOSD)
+    if (EnableEOTFBoost && ShowOSD)
     {
         float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
         float rawInputAPL = saturate(instantData.r);
