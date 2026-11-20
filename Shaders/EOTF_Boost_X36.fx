@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v9.1
+    EOTF Boost v9.2
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
@@ -19,7 +19,7 @@
       5. Fullscreen boost, HDR saturation, and optional calibration LUT
 
     Max Raw Nits is tracked only while the OSD is visible.
-    Rolling phases advance per shader execution, independent of presented-frame count.
+    Each scheduled measurement advances one rolling phase. Rendering continues every execution.
 */
 
 #include "ReShade.fxh"
@@ -283,6 +283,13 @@ uniform float BoostRollOffShape <
 > = 1.25;
 
 
+uniform int APLMeasurementRate <
+    ui_type = "slider";
+    ui_min = 0; ui_max = 240; ui_step = 1;
+    ui_label = "APL Measurement Rate (Hz)";
+    UI_TOOLTIP("Targets this many histogram phase updates per second. 0 updates every execution. Six updates refresh the full histogram by default.")
+> = 60;
+
 uniform float TransitionSpeed <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
@@ -341,6 +348,7 @@ uniform float OSDBrightness <
 > = 0.5;
 
 uniform float FrameTime < source = "frametime"; >;
+uniform uint MeasurementClockMs < source = "timer"; >;
 
 #if ENABLE_APL_GRAPH
 uniform bool ShowAPLGraph <
@@ -490,6 +498,19 @@ sampler SamplerAPLInstant
 storage2D<float4> StorageAPLInstant
 {
     Texture = TexAPLInstant;
+};
+
+// Only lane zero of the setup pass accesses this clock. Single-channel R32I
+// supports typed UAV reads on D3D11. Slots hold last sample time, credit and rate.
+texture TexAPLMeasurementClock
+{
+    Width = 3;
+    Height = 1;
+    Format = R32I;
+};
+storage2D<int> StorageAPLMeasurementClock
+{
+    Texture = TexAPLMeasurementClock;
 };
 
 texture TexAPLPrev
@@ -1227,12 +1248,12 @@ float LookupPerAPLBoostStrength(float aplPct)
 }
 #endif
 
-float ComputeTemporalBlendFactor(float smoothingSeconds)
+float ComputeTemporalBlendFactor(float smoothingSeconds, float elapsedMs)
 {
     if (smoothingSeconds <= 1e-6)
         return 1.0;
 
-    float dtSeconds = max(FrameTime, 0.0) * 0.001;
+    float dtSeconds = max(elapsedMs, 0.0) * 0.001;
     return saturate(1.0 - exp(-dtSeconds / max(smoothingSeconds, 1e-6)));
 }
 
@@ -2631,7 +2652,7 @@ groupshared int APL_SetupRollingPhase;
 groupshared int APL_TilePackedCountLuma[APL_FFH_MAX_BINS];
 groupshared int APL_TileMaxNits[APL_FFH_MAX_BINS];
 groupshared int APL_TileExactMaxLumaQ4;
-groupshared int APL_BuildRollingPhase;
+
 
 void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int maxNits2, int valid, bool needsMaxHistogram)
 {
@@ -2644,6 +2665,34 @@ void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int max
 }
 
 
+// Integer credit keeps fractional intervals at rates such as 60 Hz on a
+// 200 FPS stream. Allow 1 ms of clock quantization and carry that error forward.
+bool APL_MeasurementDue(bool hasPrevious, inout float elapsedMs)
+{
+    int rate = clamp(APLMeasurementRate, 0, 240);
+    uint lastMs = uint(tex2Dfetch(StorageAPLMeasurementClock, int2(0, 0)));
+    int lastRate = tex2Dfetch(StorageAPLMeasurementClock, int2(2, 0));
+    uint deltaMs = MeasurementClockMs - lastMs;
+    int credit = 0;
+    if (hasPrevious && rate > 0)
+    {
+        elapsedMs = float(deltaMs);
+        if (rate == lastRate)
+        {
+            // One second or more always crosses a deadline. Drop missed ticks.
+            int total = int(min(deltaMs, 1000u)) * rate
+                      + tex2Dfetch(StorageAPLMeasurementClock, int2(1, 0));
+            if (deltaMs == 0u || total < 1000 - rate)
+                return false;
+            credit = (total < 2000) ? total - 1000 : 0;
+        }
+    }
+    tex2Dstore(StorageAPLMeasurementClock, int2(0, 0), int(MeasurementClockMs));
+    tex2Dstore(StorageAPLMeasurementClock, int2(1, 0), credit);
+    tex2Dstore(StorageAPLMeasurementClock, int2(2, 0), rate);
+    return true;
+}
+
 [shader("compute")]
 // Pass 1: build frame constants, copy APL history, and clear updated rows.
 void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID)
@@ -2654,6 +2703,31 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
     bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
+
+    if (localIndex == 0)
+    {
+        float4 previousAPL = aplActive
+            ? tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0))
+            : 0.0.xxxx;
+        float storedPhase = aplActive
+            ? tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0)).b
+            : 0.0;
+        APL_SetupRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
+
+        // A negative phase tells subsequent passes to reuse the completed measurement.
+        float elapsedMs = FrameTime;
+        if (aplActive)
+        {
+            if (!APL_MeasurementDue(previousAPL.b > 0.0, elapsedMs))
+                APL_SetupRollingPhase = -1;
+        }
+        previousAPL.a = elapsedMs;
+        previousAPL.g = float(APL_SetupRollingPhase);
+        tex2Dstore(StorageAPLPrev, int2(0, 0), previousAPL);
+    }
+    barrier();
+    if (APL_SetupRollingPhase < 0)
+        return;
 
     if (localIndex < 3)
     {
@@ -2673,23 +2747,6 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
         float pqCode = float(localIndex) * (1.0 / 128.0);
         tex2Dstore(StorageAPLFastPQNits, int2(localIndex, 0), PQToLinearScalar(pqCode) * 10000.0);
     }
-
-
-    if (localIndex == 0)
-    {
-        float4 previousAPL = aplActive
-            ? tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0))
-            : 0.0.xxxx;
-        float storedPhase = aplActive
-            ? tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0)).b
-            : 0.0;
-        APL_SetupRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
-
-        // TexAPLPrev.g is unused by the solver and carries this execution's phase.
-        previousAPL.g = float(APL_SetupRollingPhase);
-        tex2Dstore(StorageAPLPrev, int2(0, 0), previousAPL);
-    }
-    barrier();
 
 #if APL_FULLFRAME_ROLLING_PHASES > 0
     int rowSlots = APL_FFH_ROLLING_ROW_SLOTS;
@@ -2747,11 +2804,9 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
     bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
-    if (localIndex == 0)
-    {
-        float storedPhase = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0)).g;
-        APL_BuildRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
-    }
+    int rollingPhase = int(tex2Dfetch(SamplerAPLPrev, int2(0, 0)).g);
+    if (rollingPhase < 0)
+        return;
 
     if (localIndex < activeBins)
     {
@@ -2762,7 +2817,7 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
         APL_TileExactMaxLumaQ4 = 0;
     barrier();
 
-    int physicalRow = APL_GetPhysicalRowFromDispatchSlot(int(groupID.y), APL_BuildRollingPhase);
+    int physicalRow = APL_GetPhysicalRowFromDispatchSlot(int(groupID.y), rollingPhase);
     bool validPhysicalRow = physicalRow < APL_FFH_TILE_COUNT_Y;
     bool decodeThisGroup = aplActive && validPhysicalRow;
 
@@ -2850,6 +2905,8 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
     int activeBins = APL_ActiveHistogramBins();
     // One group reduces one bin, so all lanes take this exit together.
     if (binIndex >= activeBins)
+        return;
+    if (tex2Dfetch(SamplerAPLPrev, int2(0, 0)).g < 0.0)
         return;
 
     bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
@@ -2948,6 +3005,10 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     bool colorHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
     int activeBins = colorHistogram ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
 
+    float4 prevData = tex2Dfetch(SamplerAPLPrev, int2(0, 0));
+    if (prevData.g < 0.0)
+        return;
+
     float4 weighted = 0.0.xxxx;
     float pixelCount = 0.0;
 
@@ -3021,10 +3082,9 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
                 : 0.0;
         }
 
-        float4 prevData = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0));
         float prevSmoothedAPL = saturate(prevData.r);
         float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
-        float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
+        float alpha = ComputeTemporalBlendFactor(TransitionSpeed, prevData.a);
         int currentRollingPhase = APL_DecodeStoredRollingPhase(prevData.g);
         int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
 
