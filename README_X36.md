@@ -2,7 +2,7 @@
 
 This ReShade shader compensates for the X36’s APL-dependent HDR dimming. It estimates average picture level (APL) with a rolling full-frame histogram and uses the monitor’s measured brightness response to set the boost. Highlight roll-off fades the added gain to zero at the target luminance (1300 nits by default).
 
-The shader measures APL at up to 60 updates per second by default. Every rendered frame still receives boost, saturation and calibration using the latest available gain.
+By default the shader measures one histogram phase every effect frame. At a capped measurement rate, it continues smoothing toward the latest solved APL and calculates the boost from that smoothed value every effect frame.
 
 Enable `EOTF_Boost_1D_APL_LUT` in ReShade. Under **APL Input Mode**, select **PQ Decoded Normalized** for HDR10 (default) or **scRGB Normalized** for scRGB. [Download the X36 shader](Shaders/EOTF_Boost_X36.fx).
 
@@ -17,8 +17,8 @@ Enable `EOTF_Boost_1D_APL_LUT` in ReShade. Under **APL Input Mode**, select **PQ
 | Global APL Boost Strength | 0.5 | Scales the measured correction. 0 gives unity gain, 1 applies the full correction, and 2 applies the measured gain squared before roll-off. |
 | Boost Roll-Off Target (nits) | 1300 | Fades added boost to zero at the target so brighter source highlights keep their luminance. Set to 0 to disable roll-off. |
 | Boost Roll-Off Shape | 1.25 | Higher values start easing off the boost earlier. Lower values keep the full boost farther into the highlights. |
-| APL Measurement Rate (Hz) | 60 | Targets 1–240 histogram phase updates per second, up to one per effect execution. Set to 0 for the v9.1 every-execution cadence. At 60 Hz the default six phases cover the screen in about 100 ms. At 120 Hz they take about 50 ms if the effect runs that often. |
-| APL Smoothing Time (s) | 0.25 | Slows the boost response to changes in scene brightness. Set to 0 to disable this temporal smoothing. |
+| APL Measurement Rate (Hz) | 0 | Targets 1–240 histogram phase updates per second, up to one per effect execution. Set to 0 for the v9.1 every-execution cadence. At 60 Hz the default six phases cover the screen in about 100 ms. At 120 Hz they take about 50 ms if the effect runs that often. |
+| APL Smoothing Time (s) | 0.25 | Exponential smoothing time for solved APL. With a steady target, the smoothed APL covers about 63% of the gap in one time constant. The first measurement initializes it directly. Set to 0 to apply each measured target immediately. |
 | Preserve Color by Reducing Boost | Off | Reduces brightness gain near a channel limit so saturated highlights can retain their RGB ratios. |
 | HDR Saturation (%) | 100% | Adjusts color after boost and before the LUT while preserving signal luminance. 0% gives grayscale, 100% bypasses the adjustment, and increases up to 150% taper near channel limits. |
 | scRGB Signal Reference (nits) | 80 | Sets the luminance represented by a linear scRGB value of 1.0 for APL, boost and saturation. The optional calibration LUT uses the standard 80-nit scRGB conversion. |

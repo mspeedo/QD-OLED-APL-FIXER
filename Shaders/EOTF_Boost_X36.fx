@@ -294,7 +294,7 @@ uniform float TransitionSpeed <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "APL Smoothing Time (s)";
-    UI_TOOLTIP("Smooths APL changes over time. 0 disables smoothing.")
+    UI_TOOLTIP("Smooths solved APL on every effect frame, including between measurements. 0 applies the latest target immediately.")
 > = 0.25;
 
 uniform bool EnableColorPreservingBoostMode <
@@ -409,6 +409,7 @@ uniform bool GraphUsePQSpace <
 
 
 // GPU state and histogram resources.
+// Latest solved APL, smoothed APL, history valid, and applied log gain.
 texture TexAPL
 {
     Width = 1;
@@ -2669,7 +2670,7 @@ void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int max
 
 // Integer credit keeps fractional intervals at rates such as 60 Hz on a
 // 200 FPS stream. Allow 1 ms of clock quantization and carry that error forward.
-bool APL_MeasurementDue(bool hasPrevious, inout float elapsedMs)
+bool APL_MeasurementDue(bool hasPrevious)
 {
     int rate = clamp(APLMeasurementRate, 0, 240);
     uint lastMs = uint(tex2Dfetch(StorageAPLMeasurementClock, int2(0, 0)));
@@ -2678,7 +2679,6 @@ bool APL_MeasurementDue(bool hasPrevious, inout float elapsedMs)
     int credit = 0;
     if (hasPrevious && rate > 0)
     {
-        elapsedMs = float(deltaMs);
         if (rate == lastRate)
         {
             // One second or more always crosses a deadline. Drop missed ticks.
@@ -2717,15 +2717,13 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
         APL_SetupRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
 
         // A negative phase tells subsequent passes to reuse the completed measurement.
-        float elapsedMs = FrameTime;
         if (aplActive)
         {
-            if (!APL_MeasurementDue(previousAPL.b > 0.0, elapsedMs))
+            if (!APL_MeasurementDue(previousAPL.b > 0.0))
                 APL_SetupRollingPhase = -1;
         }
-        previousAPL.a = elapsedMs;
-        previousAPL.g = float(APL_SetupRollingPhase);
-        tex2Dstore(StorageAPLPrev, int2(0, 0), previousAPL);
+        tex2Dstore(StorageAPLPrev, int2(0, 0),
+            float4(previousAPL.r, float(APL_SetupRollingPhase), previousAPL.b, previousAPL.g));
     }
     barrier();
     if (APL_SetupRollingPhase < 0)
@@ -2998,6 +2996,20 @@ groupshared float APL_EvalPixelCount[APL_FFH_MAX_BINS];
     } \
     barrier();
 
+void UpdateSmoothedAPL(float targetAPL, float previousSmoothedAPL, bool hasHistory)
+{
+    float smoothedAPL = targetAPL;
+    if (hasHistory && TransitionSpeed > 0.0)
+    {
+        float alpha = ComputeTemporalBlendFactor(TransitionSpeed, FrameTime);
+        smoothedAPL = lerp(previousSmoothedAPL, targetAPL, alpha);
+    }
+
+    float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
+    tex2Dstore(StorageAPL, int2(0, 0), float4(targetAPL, smoothedAPL, 1.0, sceneLogGain));
+    tex2Dstore(StorageBoostParams, int2(0, 0), ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain));
+}
+
 [shader("compute")]
 // Pass 4: evaluate response, solve APL, smooth state, and write boost parameters.
 void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
@@ -3009,7 +3021,11 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
 
     float4 prevData = tex2Dfetch(SamplerAPLPrev, int2(0, 0));
     if (prevData.g < 0.0)
+    {
+        if (localIndex == 0)
+            UpdateSmoothedAPL(prevData.r, prevData.a, prevData.b > 0.0);
         return;
+    }
 
     float4 weighted = 0.0.xxxx;
     float pixelCount = 0.0;
@@ -3084,31 +3100,19 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
                 : 0.0;
         }
 
-        float prevSmoothedAPL = saturate(prevData.r);
-        float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
-        float alpha = ComputeTemporalBlendFactor(TransitionSpeed, prevData.a);
         int currentRollingPhase = APL_DecodeStoredRollingPhase(prevData.g);
         int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
 
 
         float gMax = ComputeCandidateMaxLogGain();
         float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
-        float smoothedAPL = lerp(
-            currentDisplayAPL,
-            lerp(prevSmoothedAPL, currentDisplayAPL, alpha),
-            hasPrev
-        );
-
-        float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
-
 
         tex2Dstore(
             StorageAPLInstant,
             int2(0, 0),
             float4(rawAPL, exactRollingMaxNits, float(nextRollingPhase), (totalPixelCount > 0.0) ? 1.0 : 0.0)
         );
-        tex2Dstore(StorageAPL, int2(0, 0), float4(smoothedAPL, smoothedAPL, 1.0, sceneLogGain));
-        tex2Dstore(StorageBoostParams, int2(0, 0), ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain));
+        UpdateSmoothedAPL(currentDisplayAPL, prevData.a, prevData.b > 0.0);
     }
 }
 
