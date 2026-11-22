@@ -1575,7 +1575,9 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams)
 
 
         float outputChannelLimit = ((BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0) / max(SIGNAL_REFERENCE_NITS, 1.0);
-        float maxHuePreservingScale = ComputeMaxHuePreservingScale(max(linearColor, 0.0.xxx), outputChannelLimit);
+        // Preserve signed scRGB through conversion before checking Rec.2020 channel headroom.
+        float3 rec2020Color = HDRSaturationRec709ToRec2020(linearColor);
+        float maxHuePreservingScale = ComputeMaxHuePreservingScale(rec2020Color, outputChannelLimit);
         colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
     }
 
@@ -2630,8 +2632,8 @@ void APL_DecodePackedFullFrameSample(
         sceneNits = max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
         if (needsMaxHistogram)
         {
-            float3 positiveColor = max(color, 0.0.xxx);
-            maxChannelNits = max(max(positiveColor.r, positiveColor.g), positiveColor.b) * SIGNAL_REFERENCE_NITS;
+            float3 rec2020Color = HDRSaturationRec709ToRec2020(color);
+            maxChannelNits = max(Max3(rec2020Color), 0.0) * SIGNAL_REFERENCE_NITS;
         }
     }
 
