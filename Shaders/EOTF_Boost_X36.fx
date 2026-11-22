@@ -288,7 +288,7 @@ uniform int APLMeasurementRate <
     ui_min = 0; ui_max = 240; ui_step = 1;
     ui_label = "APL Measurement Rate (Hz)";
     UI_TOOLTIP("Targets this many histogram phase updates per second. 0 updates every execution. Six updates refresh the full histogram by default.")
-> = 60;
+> = 0;
 
 uniform float TransitionSpeed <
     ui_type = "slider";
