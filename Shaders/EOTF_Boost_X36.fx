@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v9.3
+    EOTF Boost v9.4
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
@@ -8,8 +8,9 @@
 
     A rolling full-frame histogram estimates raw APL and three boosted response
     points. A bracketed solver finds display-side APL, then temporal smoothing
-    produces the final gain. PQ highlight roll-off removes added boost near the
-    configured target. The boost stage never falls below the source signal.
+    in log-gain (stops) space produces the final gain. PQ highlight roll-off
+    removes added boost near the configured target. The boost stage never falls
+    below the source signal.
 
     Live pipeline:
       1. Frame setup and rolling-row clear
@@ -293,9 +294,16 @@ uniform int APLMeasurementRate <
 uniform float TransitionSpeed <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
-    ui_label = "APL Smoothing Time (s)";
-    UI_TOOLTIP("Smooths solved APL on every effect frame, including between measurements. 0 applies the latest target immediately.")
-> = 0.25;
+    ui_label = "Boost Smoothing Time (s)";
+    UI_TOOLTIP("Exponential smoothing time constant in log-gain (stops) space on every effect frame. 0 applies the target immediately.")
+> = 0.15;
+
+uniform float TransitionFallScale <
+    ui_type = "slider";
+    ui_min = 0.1; ui_max = 2.0; ui_step = 0.05;
+    ui_label = "Drop Smoothing Scale";
+    UI_TOOLTIP("Scales Boost Smoothing Time when boost is decreasing (bright-to-dark). 1.0 = symmetric rise/fall; lower values release boost faster to prevent dark-scene flash.")
+> = 0.65;
 
 uniform bool EnableColorPreservingBoostMode <
     ui_label = "Preserve Color by Reducing Boost";
@@ -347,7 +355,6 @@ uniform float OSDBrightness <
     UI_TOOLTIP("Sets OSD and graph brightness.")
 > = 0.5;
 
-uniform float FrameTime < source = "frametime"; >;
 uniform uint MeasurementClockMs < source = "timer"; >;
 
 #if ENABLE_APL_GRAPH
@@ -409,7 +416,7 @@ uniform bool GraphUsePQSpace <
 
 
 // GPU state and histogram resources.
-// Latest solved APL, smoothed APL, history valid, and applied log gain.
+// Latest solved APL (r, g), history valid (b), and smoothed log gain (a).
 texture TexAPL
 {
     Width = 1;
@@ -501,13 +508,22 @@ storage2D<float4> StorageAPLInstant
     Texture = TexAPLInstant;
 };
 
-// Only lane zero of the setup pass accesses this clock. Single-channel R32I
-// supports typed UAV reads on D3D11. Slots hold last sample time, credit and rate.
+// Only lane zero of the setup pass writes this clock. Single-channel R32I
+// supports typed UAV reads on D3D11.
+// Slots 0..2: measurement cadence (lastMs, credit, lastRate).
+// Slots 3..4: wall-clock smoothing (lastSmoothMs, deltaMs).
 texture TexAPLMeasurementClock
 {
-    Width = 3;
+    Width = 5;
     Height = 1;
     Format = R32I;
+};
+sampler2D<int> SamplerAPLMeasurementClock
+{
+    Texture = TexAPLMeasurementClock;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
 };
 storage2D<int> StorageAPLMeasurementClock
 {
@@ -2695,6 +2711,22 @@ bool APL_MeasurementDue(bool hasPrevious)
     return true;
 }
 
+void APL_UpdateSmoothClock(bool hasPrevious)
+{
+    uint nowMs = MeasurementClockMs;
+    if (!hasPrevious)
+    {
+        tex2Dstore(StorageAPLMeasurementClock, int2(3, 0), int(nowMs));
+        tex2Dstore(StorageAPLMeasurementClock, int2(4, 0), 0);
+        return;
+    }
+
+    uint lastSmoothMs = uint(tex2Dfetch(StorageAPLMeasurementClock, int2(3, 0)));
+    uint deltaMs = min(nowMs - lastSmoothMs, 1000u);
+    tex2Dstore(StorageAPLMeasurementClock, int2(3, 0), int(nowMs));
+    tex2Dstore(StorageAPLMeasurementClock, int2(4, 0), int(deltaMs));
+}
+
 [shader("compute")]
 // Pass 1: build frame constants, copy APL history, and clear updated rows.
 void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID)
@@ -2716,6 +2748,8 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
             : 0.0;
         APL_SetupRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
 
+        APL_UpdateSmoothClock(aplActive && (previousAPL.b > 0.0));
+
         // A negative phase tells subsequent passes to reuse the completed measurement.
         if (aplActive)
         {
@@ -2723,7 +2757,7 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
                 APL_SetupRollingPhase = -1;
         }
         tex2Dstore(StorageAPLPrev, int2(0, 0),
-            float4(previousAPL.r, float(APL_SetupRollingPhase), previousAPL.b, previousAPL.g));
+            float4(previousAPL.r, float(APL_SetupRollingPhase), previousAPL.b, previousAPL.a));
     }
     barrier();
     if (APL_SetupRollingPhase < 0)
@@ -2996,18 +3030,30 @@ groupshared float APL_EvalPixelCount[APL_FFH_MAX_BINS];
     } \
     barrier();
 
-void UpdateSmoothedAPL(float targetAPL, float previousSmoothedAPL, bool hasHistory)
+void UpdateSmoothedLogGain(float targetAPL, float previousLogGain, bool hasHistory)
 {
-    float smoothedAPL = targetAPL;
+    float targetLogGain = ComputeSceneLogGainFromAPL(targetAPL);
+    float smoothedLogGain = targetLogGain;
     if (hasHistory && TransitionSpeed > 0.0)
     {
-        float alpha = ComputeTemporalBlendFactor(TransitionSpeed, FrameTime);
-        smoothedAPL = lerp(previousSmoothedAPL, targetAPL, alpha);
+        // Smooth directly in perceptual log-gain (stops) space using wall-clock
+        // timer deltas so brightness transitions stay uniform across the APL
+        // curve and unaffected by Frame Gen frametime reporting.
+        float tau = (targetLogGain < previousLogGain)
+            ? TransitionSpeed * max(TransitionFallScale, 0.0)
+            : TransitionSpeed;
+        float dtMs = min(max(float(tex2Dfetch(SamplerAPLMeasurementClock, int2(4, 0))), 0.0), 100.0);
+        float alpha = ComputeTemporalBlendFactor(tau, dtMs);
+        smoothedLogGain = lerp(previousLogGain, targetLogGain, alpha);
+
+        // Snap within 1e-5 stops (~0.0007% luminance) so dark scenes cleanly
+        // reach exact 0.0 and take the main-pass fast bypass.
+        if (abs(targetLogGain - smoothedLogGain) < 1e-5)
+            smoothedLogGain = targetLogGain;
     }
 
-    float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
-    tex2Dstore(StorageAPL, int2(0, 0), float4(targetAPL, smoothedAPL, 1.0, sceneLogGain));
-    tex2Dstore(StorageBoostParams, int2(0, 0), ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain));
+    tex2Dstore(StorageAPL, int2(0, 0), float4(targetAPL, targetAPL, 1.0, smoothedLogGain));
+    tex2Dstore(StorageBoostParams, int2(0, 0), ComputeBoostRolloffParamsFromSceneLogGain(smoothedLogGain));
 }
 
 [shader("compute")]
@@ -3023,7 +3069,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     if (prevData.g < 0.0)
     {
         if (localIndex == 0)
-            UpdateSmoothedAPL(prevData.r, prevData.a, prevData.b > 0.0);
+            UpdateSmoothedLogGain(prevData.r, prevData.a, prevData.b > 0.0);
         return;
     }
 
@@ -3112,7 +3158,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             int2(0, 0),
             float4(rawAPL, exactRollingMaxNits, float(nextRollingPhase), (totalPixelCount > 0.0) ? 1.0 : 0.0)
         );
-        UpdateSmoothedAPL(currentDisplayAPL, prevData.a, prevData.b > 0.0);
+        UpdateSmoothedLogGain(currentDisplayAPL, prevData.a, prevData.b > 0.0);
     }
 }
 
