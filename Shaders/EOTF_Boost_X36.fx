@@ -1486,6 +1486,16 @@ float SampleHighlightBasePQ(int2 pixelCoord, float origPQ)
     return (sumW > 1e-6) ? (dot(s, w) / sumW) : origPQ;
 }
 
+bool IsHighlightDetailActive(float4 boostParams)
+{
+    return EnableEOTFBoost
+        && EnableHighlightDetailRecovery
+        && (HIGHLIGHT_DETAIL_RECOVERY > 1e-4)
+        && (BoostRollOff > 0.0)
+        && (boostParams.r > 1.000001)
+        && (boostParams.g > 0.0);
+}
+
 // Compute boosted luminance with edge-aware local highlight detail recovery
 // gated strictly by the analytical BT.2390 roll-off compression (1 - slope).
 float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boostParams, int2 pixelCoord)
@@ -1516,7 +1526,7 @@ float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boos
     float e2 = kneeStart + compressionSpan * (1.0 - oneMinusU * slope);
     float rolledOffPQ = saturate(e2 * pqRange + PQ_BLACK);
 
-    if (!EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4)
+    if (!IsHighlightDetailActive(boostParams))
         return max(PQToLinearScalar(rolledOffPQ) * 10000.0, safeInputLumaNits);
 
     float origPQ = NitsToPQ(safeInputLumaNits);
@@ -3532,16 +3542,6 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
 }
 
 // Pass 5: half-resolution PQ extract and separable bilateral filter for highlight detail recovery.
-bool IsHighlightDetailActive(float4 boostParams)
-{
-    return EnableEOTFBoost
-        && EnableHighlightDetailRecovery
-        && (HIGHLIGHT_DETAIL_RECOVERY > 1e-4)
-        && (BoostRollOff > 0.0)
-        && (boostParams.r > 1.000001)
-        && (boostParams.g > 0.0);
-}
-
 float ComputeHighlightDetailSourceKneePQ(float4 boostParams)
 {
     float boostedKneePQ = saturate(boostParams.b) * boostParams.g + PQ_BLACK;
@@ -3549,12 +3549,33 @@ float ComputeHighlightDetailSourceKneePQ(float4 boostParams)
     return NitsToPQ(sourceKneeNits);
 }
 
-float4 PS_HL_ExtractPQ(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+// Cull the fullscreen triangle off-screen when highlight detail recovery is inactive
+// so zero pixel shader threads or render-target writes run when boost/recovery is off
+// or in dark scenes. Also hoists sourceKneePQ out of the bilateral pixel shaders.
+void VS_HL_Pass(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 hlParams : TEXCOORD0)
 {
+    if (!EnableEOTFBoost || !EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4 || BoostRollOff <= 0.0)
+    {
+        hlParams = 0.0.xx;
+        position = float4(-2.0, -2.0, 0.0, 1.0);
+        return;
+    }
+
     float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
     if (!IsHighlightDetailActive(boostParams))
-        return 0.0.xxxx;
+    {
+        hlParams = 0.0.xx;
+        position = float4(-2.0, -2.0, 0.0, 1.0);
+        return;
+    }
 
+    float2 uv = float2((id == 2) ? 2.0 : 0.0, (id == 1) ? 2.0 : 0.0);
+    hlParams = float2(ComputeHighlightDetailSourceKneePQ(boostParams), 0.0);
+    position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 PS_HL_ExtractPQ(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) : SV_Target
+{
     int2 pHalf = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
     int2 pFull = min(pHalf * 2, int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
     float3 color = tex2Dfetch(ReShade::BackBuffer, pFull).rgb;
@@ -3565,16 +3586,12 @@ float4 PS_HL_ExtractPQ(float4 vpos : SV_Position, float2 texcoord : TexCoord) : 
     return float4(NitsToPQ(sceneNits), 0.0, 0.0, 1.0);
 }
 
-float4 PS_HL_BilateralH(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+float4 PS_HL_BilateralH(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) : SV_Target
 {
-    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-    if (!IsHighlightDetailActive(boostParams))
-        return 0.0.xxxx;
-
     int2 p = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
     float centerPQ = tex2Dfetch(SamplerHLPQ_A, p).r;
     float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
-    float sourceKneePQ = ComputeHighlightDetailSourceKneePQ(boostParams);
+    float sourceKneePQ = hlParams.x;
 
     if (centerPQ < sourceKneePQ - 3.0 * sigmaR)
         return float4(centerPQ, 0.0, 0.0, 1.0);
@@ -3607,16 +3624,12 @@ float4 PS_HL_BilateralH(float4 vpos : SV_Position, float2 texcoord : TexCoord) :
     return float4(sumVal / sumW, 0.0, 0.0, 1.0);
 }
 
-float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) : SV_Target
 {
-    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-    if (!IsHighlightDetailActive(boostParams))
-        return 0.0.xxxx;
-
     int2 p = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
     float centerPQ = tex2Dfetch(SamplerHLPQ_B, p).r;
     float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
-    float sourceKneePQ = ComputeHighlightDetailSourceKneePQ(boostParams);
+    float sourceKneePQ = hlParams.x;
 
     if (centerPQ < sourceKneePQ - 0.015)
         return float4(centerPQ, 0.0, 0.0, 1.0);
@@ -4047,21 +4060,21 @@ technique EOTF_Boost_1D_APL_LUT
 
     pass HL_Extract_PQ
     {
-        VertexShader = PostProcessVS;
+        VertexShader = VS_HL_Pass;
         PixelShader = PS_HL_ExtractPQ;
         RenderTarget = TexHLPQ_A;
     }
 
     pass HL_Bilateral_H
     {
-        VertexShader = PostProcessVS;
+        VertexShader = VS_HL_Pass;
         PixelShader = PS_HL_BilateralH;
         RenderTarget = TexHLPQ_B;
     }
 
     pass HL_Bilateral_V
     {
-        VertexShader = PostProcessVS;
+        VertexShader = VS_HL_Pass;
         PixelShader = PS_HL_BilateralV;
         RenderTarget = TexHLPQ_A;
     }
