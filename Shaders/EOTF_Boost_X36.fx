@@ -1566,22 +1566,21 @@ float ComputeMaxHuePreservingScale(float3 rgb, float channelLimit)
 
 float SoftLimitBoostScale(float desiredScale, float maxScale, float kneeFraction)
 {
+    // Only limit added boost (> 1.0); pass through negative highlight detail scales (<= 1.0).
+    if (desiredScale <= 1.0)
+        return max(desiredScale, 0.0);
 
-
-    // The limiter only removes added gain.
-    float safeDesired = max(desiredScale, 1.0);
     float safeMax = max(maxScale, 1.0);
-
-    if (safeDesired <= 1.0 || safeMax <= 1.0 + 1e-6)
+    if (safeMax <= 1.0 + 1e-6)
         return 1.0;
 
     float kneeStart = lerp(1.0, safeMax, saturate(kneeFraction));
 
-    if (safeDesired <= kneeStart)
-        return safeDesired;
+    if (desiredScale <= kneeStart)
+        return desiredScale;
 
     float span = max(safeMax - kneeStart, 1e-6);
-    float x = (safeDesired - kneeStart) / span;
+    float x = (desiredScale - kneeStart) / span;
 
     return min(kneeStart + span * (x / (1.0 + x)), safeMax);
 }
