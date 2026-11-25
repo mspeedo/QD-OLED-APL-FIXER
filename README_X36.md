@@ -1,6 +1,6 @@
-# EOTF Boost v9.4 for the MSI MPG 341CQR QD-OLED X36
+# EOTF Boost v9.5 for the MSI MPG 341CQR QD-OLED X36
 
-This ReShade shader compensates for the X36’s APL-dependent HDR dimming. It estimates average picture level (APL) with a rolling full-frame histogram and uses the monitor’s measured brightness response to set the boost. Highlight roll-off fades the added gain to zero at the target luminance (1300 nits by default).
+This ReShade shader compensates for the X36’s APL-dependent HDR dimming. It estimates average picture level (APL) with a rolling full-frame histogram and uses the monitor’s measured brightness response to set the boost. Highlight roll-off fades the added gain to zero at the target luminance (1300 nits by default), and optional edge-aware bilateral highlight detail recovery preserves local highlight contrast inside the compressed roll-off shoulder.
 
 By default the shader measures one histogram phase every effect frame. At a capped measurement rate, it continues smoothing the boost in log-gain (stops) space toward the latest solved APL on every effect frame.
 
@@ -17,6 +17,7 @@ Enable `EOTF_Boost_1D_APL_LUT` in ReShade. Under **APL Input Mode**, select **PQ
 | Global APL Boost Strength | 0.5 | Scales the measured correction. 0 gives unity gain, 1 applies the full correction, and 2 applies the measured gain squared before roll-off. |
 | Boost Roll-Off Target (nits) | 1300 | Fades added boost to zero at the target so brighter source highlights keep their luminance. Set to 0 to disable roll-off. |
 | Boost Roll-Off Shape | 1.25 | Higher values start easing off the boost earlier. Lower values keep the full boost farther into the highlights. |
+| Enable Highlight Detail Recovery | On | Restores local highlight contrast compressed inside the **Boost Roll-Off** shoulder using an edge-aware half-resolution bilateral filter. Pixels below the roll-off knee are untouched. Its tuning constants (`HIGHLIGHT_DETAIL_RECOVERY`, `HIGHLIGHT_DETAIL_RADIUS`, `HIGHLIGHT_DETAIL_EDGE_SIGMA`) can be edited directly in the shader if needed. |
 | APL Measurement Rate (Hz) | 0 | Targets 1–240 histogram phase updates per second, up to one per effect execution. Set to 0 for the v9.1 every-execution cadence. At 60 Hz the default six phases cover the screen in about 100 ms. At 120 Hz they take about 50 ms if the effect runs that often. |
 | Boost Smoothing Time (s) | 0.15 | Exponential smoothing time constant in log-gain (stops) space, updated every effect frame from the wall-clock timer (63% of the stop gap in one time constant). The first measurement initializes it directly. Set to 0 to apply each measured target immediately. |
 | Drop Smoothing Scale | 0.65 | Scales **Boost Smoothing Time (s)** when boost is decreasing (bright-to-dark transitions). `1.0` gives symmetric rise and fall; lower values release boost faster to prevent dark-scene flash when OLED ABL releases. |

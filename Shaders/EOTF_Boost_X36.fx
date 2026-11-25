@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v9.4
+    EOTF Boost v9.5
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
@@ -9,15 +9,17 @@
     A rolling full-frame histogram estimates raw APL and three boosted response
     points. A bracketed solver finds display-side APL, then temporal smoothing
     in log-gain (stops) space produces the final gain. PQ highlight roll-off
-    removes added boost near the configured target. The boost stage never falls
-    below the source signal.
+    removes added boost near the configured target, and optional edge-aware
+    bilateral highlight detail recovery restores local highlight contrast inside
+    the compressed roll-off shoulder.
 
     Live pipeline:
       1. Frame setup and rolling-row clear
       2. Full-frame row histogram build
       3. Global histogram reduction
       4. Response solve, smoothing, and boost parameters
-      5. Fullscreen boost, HDR saturation, and optional calibration LUT
+      5. Half-resolution PQ extract and separable bilateral filter for highlight detail
+      6. Fullscreen boost, highlight detail recovery, HDR saturation, and optional calibration LUT
 
     Max Raw Nits is tracked only while the OSD is visible.
     Each scheduled measurement advances one rolling phase. Rendering continues every execution.
@@ -282,6 +284,16 @@ uniform float BoostRollOffShape <
     ui_label = "Boost Roll-Off Shape";
     UI_TOOLTIP("Controls the roll-off knee. Lower values start later; higher values start earlier.")
 > = 1.25;
+
+uniform bool EnableHighlightDetailRecovery <
+    ui_label = "Enable Highlight Detail Recovery";
+    UI_TOOLTIP("Restores local highlight contrast compressed by Boost Roll-Off using an edge-aware bilateral filter.")
+> = true;
+
+// Highlight Detail Recovery tuning constants (edit here if needed).
+static const float HIGHLIGHT_DETAIL_RECOVERY   = 0.75;  // Strength (0.0 - 1.5)
+static const float HIGHLIGHT_DETAIL_RADIUS     = 2.0;   // Bilateral stride (0.5 - 4.0)
+static const float HIGHLIGHT_DETAIL_EDGE_SIGMA = 0.065; // Bilateral PQ range sigma (0.02 - 0.15)
 
 
 uniform int APLMeasurementRate <
@@ -701,6 +713,43 @@ sampler2D<float> SamplerAPLGlobalHistMaxNits
 storage2D<float> StorageAPLGlobalHistMaxNits
 {
     Texture = TexAPLGlobalHistMaxNits;
+};
+
+// Half-resolution PQ luminance ping-pong textures for edge-aware bilateral
+// highlight detail recovery (Extract -> Bilateral H -> Bilateral V -> JBU Main).
+#define APL_HL_WIDTH  ((BUFFER_WIDTH  + 1) / 2)
+#define APL_HL_HEIGHT ((BUFFER_HEIGHT + 1) / 2)
+
+texture TexHLPQ_A
+{
+    Width = APL_HL_WIDTH;
+    Height = APL_HL_HEIGHT;
+    Format = R16F;
+};
+sampler SamplerHLPQ_A
+{
+    Texture = TexHLPQ_A;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+
+texture TexHLPQ_B
+{
+    Width = APL_HL_WIDTH;
+    Height = APL_HL_HEIGHT;
+    Format = R16F;
+};
+sampler SamplerHLPQ_B
+{
+    Texture = TexHLPQ_B;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
 };
 
 
@@ -1408,6 +1457,87 @@ float ComputeBoostedLumaNitsFromPrecomputedParams(float inputLumaNits, float4 bo
     return max(ApplyBT2390EETFToNitsWithPrecomputedParams(fullyBoostedNits, boostParams), safeInputLumaNits);
 }
 
+// 4-tap Joint Bilateral Upsample from half-res base PQ layer (halo-free at full-res edges).
+float SampleHighlightBasePQ(int2 pixelCoord, float origPQ)
+{
+    float2 fh = float2(pixelCoord) * 0.5;
+    int2 p0 = clamp(int2(floor(fh)), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
+    int2 p1 = min(p0 + int2(1, 1), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
+    float2 f = saturate(fh - float2(p0));
+
+    float4 s = float4(
+        tex2Dfetch(SamplerHLPQ_A, int2(p0.x, p0.y)).r,
+        tex2Dfetch(SamplerHLPQ_A, int2(p1.x, p0.y)).r,
+        tex2Dfetch(SamplerHLPQ_A, int2(p0.x, p1.y)).r,
+        tex2Dfetch(SamplerHLPQ_A, int2(p1.x, p1.y)).r
+    );
+
+    float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
+    float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
+    float4 d = s - origPQ.xxxx;
+    float4 bw = float4(
+        (1.0 - f.x) * (1.0 - f.y),
+        f.x * (1.0 - f.y),
+        (1.0 - f.x) * f.y,
+        f.x * f.y
+    );
+    float4 w = bw * exp2(-(d * d) * inv2R2Log2);
+    float sumW = dot(w, 1.0.xxxx);
+    return (sumW > 1e-6) ? (dot(s, w) / sumW) : origPQ;
+}
+
+// Compute boosted luminance with edge-aware local highlight detail recovery
+// gated strictly by the analytical BT.2390 roll-off compression (1 - slope).
+float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boostParams, int2 pixelCoord)
+{
+    float safeInputLumaNits = max(inputLumaNits, 0.0);
+    float fullyBoostedNits = safeInputLumaNits * max(boostParams.r, 0.0);
+    float pqRange = boostParams.g;
+
+    if (pqRange <= 0.0)
+        return fullyBoostedNits;
+
+    float fullyBoostedPQ = NitsToPQ(fullyBoostedNits);
+    float kneeStart = saturate(boostParams.b);
+    float e1 = saturate((fullyBoostedPQ - PQ_BLACK) / pqRange);
+
+    if (e1 < kneeStart)
+        return fullyBoostedNits;
+
+    float shoulderSpan = max(1.0 - kneeStart, 1e-6);
+    float compressionSpan = max(boostParams.a, 1e-6);
+    float u = saturate((e1 - kneeStart) / shoulderSpan);
+    float shoulderPower = max(shoulderSpan / compressionSpan, 1.0);
+    float oneMinusU = max(1.0 - u, 0.0);
+
+    // Exact analytical derivative de2/de1 = (1 - u)^(shoulderPower - 1),
+    // and (1 - u)^shoulderPower = (1 - u) * slope.
+    float slope = pow(oneMinusU, max(shoulderPower - 1.0, 0.0));
+    float e2 = kneeStart + compressionSpan * (1.0 - oneMinusU * slope);
+    float rolledOffPQ = saturate(e2 * pqRange + PQ_BLACK);
+
+    if (!EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4)
+        return max(PQToLinearScalar(rolledOffPQ) * 10000.0, safeInputLumaNits);
+
+    float origPQ = NitsToPQ(safeInputLumaNits);
+    if (rolledOffPQ <= origPQ)
+        return safeInputLumaNits;
+
+    float compression = saturate(1.0 - slope);
+    if (compression > 1e-4)
+    {
+        float basePQ = SampleHighlightBasePQ(pixelCoord, origPQ);
+        float detailPQ = clamp(origPQ - basePQ, -0.06, 0.06);
+
+        float rollOffCeilingPQ = saturate((kneeStart + compressionSpan) * pqRange + PQ_BLACK);
+        float ceilingPQ = max(origPQ, rollOffCeilingPQ);
+        float floorPQ = max(origPQ - 0.030, PQ_BLACK);
+        rolledOffPQ = clamp(rolledOffPQ + HIGHLIGHT_DETAIL_RECOVERY * compression * detailPQ, floorPQ, ceilingPQ);
+    }
+
+    return max(PQToLinearScalar(rolledOffPQ) * 10000.0, 0.0);
+}
+
 float Max3(float3 v)
 {
     return max(max(v.r, v.g), v.b);
@@ -1542,7 +1672,7 @@ float3 HDRSaturationBuffer(float3 color)
     return LinearToPQBT2100(adjusted / 10000.0);
 }
 
-float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams)
+float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, int2 pixelCoord)
 {
     if (boostParams.r <= 1.000001 && boostParams.g <= 0.0)
         return HDRSaturationBuffer(color);
@@ -1555,7 +1685,7 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams)
         if (originalLumaNits <= 1e-6)
             return HDRSaturationBuffer(color);
 
-        float boostedLumaNits = ComputeBoostedLumaNitsFromPrecomputedParams(originalLumaNits, boostParams);
+        float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
         float colorScale = boostedLumaNits / originalLumaNits;
 
         if (EnableColorPreservingBoostMode)
@@ -1584,7 +1714,7 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams)
     if (originalLumaNits <= 1e-6)
         return HDRSaturationBuffer(color);
 
-    float boostedLumaNits = ComputeBoostedLumaNitsFromPrecomputedParams(originalLumaNits, boostParams);
+    float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
     float colorScale = boostedLumaNits / originalLumaNits;
 
     if (EnableColorPreservingBoostMode)
@@ -3401,8 +3531,126 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     return result;
 }
 
+// Pass 5: half-resolution PQ extract and separable bilateral filter for highlight detail recovery.
+bool IsHighlightDetailActive(float4 boostParams)
+{
+    return EnableEOTFBoost
+        && EnableHighlightDetailRecovery
+        && (HIGHLIGHT_DETAIL_RECOVERY > 1e-4)
+        && (BoostRollOff > 0.0)
+        && (boostParams.r > 1.000001)
+        && (boostParams.g > 0.0);
+}
 
-// Pass 5: apply boost and saturation, calibrate, then draw the OSD and graph.
+float ComputeHighlightDetailSourceKneePQ(float4 boostParams)
+{
+    float boostedKneePQ = saturate(boostParams.b) * boostParams.g + PQ_BLACK;
+    float sourceKneeNits = (PQToLinearScalar(boostedKneePQ) * 10000.0) / max(boostParams.r, 1.0);
+    return NitsToPQ(sourceKneeNits);
+}
+
+float4 PS_HL_ExtractPQ(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
+    if (!IsHighlightDetailActive(boostParams))
+        return 0.0.xxxx;
+
+    int2 pHalf = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
+    int2 pFull = min(pHalf * 2, int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+    float3 color = tex2Dfetch(ReShade::BackBuffer, pFull).rgb;
+    float sceneNits = (APLInputMode == 1)
+        ? max(GetLuma2020(APL_FastPQToNits(color)), 0.0)
+        : max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
+
+    return float4(NitsToPQ(sceneNits), 0.0, 0.0, 1.0);
+}
+
+float4 PS_HL_BilateralH(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
+    if (!IsHighlightDetailActive(boostParams))
+        return 0.0.xxxx;
+
+    int2 p = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
+    float centerPQ = tex2Dfetch(SamplerHLPQ_A, p).r;
+    float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
+    float sourceKneePQ = ComputeHighlightDetailSourceKneePQ(boostParams);
+
+    if (centerPQ < sourceKneePQ - 3.0 * sigmaR)
+        return float4(centerPQ, 0.0, 0.0, 1.0);
+
+    float stepHalf = max(HIGHLIGHT_DETAIL_RADIUS, 0.5) * 0.85;
+    const float inv2S2Log2 = 0.05888551; // 0.5 * log2(e) / (3.5 * 3.5)
+    float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
+
+    float sumVal = centerPQ;
+    float sumW = 1.0;
+    [unroll]
+    for (int k = 1; k <= 7; ++k)
+    {
+        int off = max(1, int(round(float(k) * stepHalf)));
+        float spatialTerm = float(k * k) * inv2S2Log2;
+
+        float sPos = tex2Dfetch(SamplerHLPQ_A, int2(min(p.x + off, APL_HL_WIDTH - 1), p.y)).r;
+        float dPos = sPos - centerPQ;
+        float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
+        sumVal += sPos * wPos;
+        sumW += wPos;
+
+        float sNeg = tex2Dfetch(SamplerHLPQ_A, int2(max(p.x - off, 0), p.y)).r;
+        float dNeg = sNeg - centerPQ;
+        float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
+        sumVal += sNeg * wNeg;
+        sumW += wNeg;
+    }
+
+    return float4(sumVal / sumW, 0.0, 0.0, 1.0);
+}
+
+float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
+    if (!IsHighlightDetailActive(boostParams))
+        return 0.0.xxxx;
+
+    int2 p = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
+    float centerPQ = tex2Dfetch(SamplerHLPQ_B, p).r;
+    float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
+    float sourceKneePQ = ComputeHighlightDetailSourceKneePQ(boostParams);
+
+    if (centerPQ < sourceKneePQ - 0.015)
+        return float4(centerPQ, 0.0, 0.0, 1.0);
+
+    float stepHalf = max(HIGHLIGHT_DETAIL_RADIUS, 0.5) * 0.85;
+    const float inv2S2Log2 = 0.05888551; // 0.5 * log2(e) / (3.5 * 3.5)
+    float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
+
+    float sumVal = centerPQ;
+    float sumW = 1.0;
+    [unroll]
+    for (int k = 1; k <= 7; ++k)
+    {
+        int off = max(1, int(round(float(k) * stepHalf)));
+        float spatialTerm = float(k * k) * inv2S2Log2;
+
+        float sPos = tex2Dfetch(SamplerHLPQ_B, int2(p.x, min(p.y + off, APL_HL_HEIGHT - 1))).r;
+        float dPos = sPos - centerPQ;
+        float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
+        sumVal += sPos * wPos;
+        sumW += wPos;
+
+        float sNeg = tex2Dfetch(SamplerHLPQ_B, int2(p.x, max(p.y - off, 0))).r;
+        float dNeg = sNeg - centerPQ;
+        float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
+        sumVal += sNeg * wNeg;
+        sumW += wNeg;
+    }
+
+    return float4(sumVal / sumW, 0.0, 0.0, 1.0);
+}
+
+
+// Pass 6: apply boost, highlight detail recovery, and saturation, calibrate, then draw the OSD and graph.
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
@@ -3414,7 +3662,8 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
     if (aplData.a > 1e-6)
     {
         float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-        finalColor = ApplyBoostAndHDRSaturation(color, boostParams);
+        int2 pixelCoord = clamp(int2(vpos.xy), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+        finalColor = ApplyBoostAndHDRSaturation(color, boostParams, pixelCoord);
     }
     else
     {
@@ -3795,6 +4044,27 @@ technique EOTF_Boost_1D_APL_LUT
         RenderTarget = TexGraphCurves;
     }
 #endif
+
+    pass HL_Extract_PQ
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = PS_HL_ExtractPQ;
+        RenderTarget = TexHLPQ_A;
+    }
+
+    pass HL_Bilateral_H
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = PS_HL_BilateralH;
+        RenderTarget = TexHLPQ_B;
+    }
+
+    pass HL_Bilateral_V
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = PS_HL_BilateralV;
+        RenderTarget = TexHLPQ_A;
+    }
 
     pass Main_Boost
     {
