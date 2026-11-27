@@ -85,8 +85,9 @@
 
 // Monitor-specific default UI targets and slider bounds.
 #define MONITOR_DEFAULT_REF_WHITE_NITS  1300.0
+#define MONITOR_REF_WHITE_SLIDER_MAX    1500.0
 #define MONITOR_DEFAULT_ROLLOFF_NITS    1300.0
-#define MONITOR_PEAK_UI_MAX_NITS        1500.0
+#define MONITOR_ROLLOFF_SLIDER_MAX      1500.0
 #define MONITOR_DEFAULT_FREEZE_APL      50.0
 #define MONITOR_FREEZE_APL_UI_MAX       95.0
 #define MONITOR_DEFAULT_GRAPH_AXIS_NITS 1300.0
@@ -301,7 +302,7 @@ uniform int APLInputMode <
 
 uniform float APLReferenceWhiteNits <
     ui_type = "slider";
-    ui_min = 10.0; ui_max = MONITOR_PEAK_UI_MAX_NITS; ui_step = 1.0;
+    ui_min = 10.0; ui_max = MONITOR_REF_WHITE_SLIDER_MAX; ui_step = 1.0;
     ui_label = "APL Reference White (nits)";
     UI_TOOLTIP("Sets the luminance represented by 100% APL.")
 > = MONITOR_DEFAULT_REF_WHITE_NITS;
@@ -421,7 +422,7 @@ uniform float APLBoostStrength50 <
 
 uniform float BoostRollOff <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = MONITOR_PEAK_UI_MAX_NITS; ui_step = 1.0;
+    ui_min = 0.0; ui_max = MONITOR_ROLLOFF_SLIDER_MAX; ui_step = 1.0;
     ui_label = "Boost Roll-Off Target (nits)";
     UI_TOOLTIP("Sets the luminance where added boost fades to zero.")
 > = MONITOR_DEFAULT_ROLLOFF_NITS;
