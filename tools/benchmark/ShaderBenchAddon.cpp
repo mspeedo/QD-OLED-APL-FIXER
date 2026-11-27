@@ -3,6 +3,7 @@
 // Measures exact hardware GPU time around ReShade effect execution using D3D11/D3D12 timestamp queries.
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -286,10 +287,14 @@ static void ResetTimerRing(BenchRuntimeData &data)
 
 static std::string GetBufferColorSpaceString(reshade::api::effect_runtime *runtime)
 {
-    char buf[32] = {};
-    if (runtime->get_preprocessor_definition("BUFFER_COLOR_SPACE", buf))
-        return std::string(buf);
-    return "0";
+    switch (runtime->get_color_space())
+    {
+    case reshade::api::color_space::srgb_nonlinear:       return "1(sRGB)";
+    case reshade::api::color_space::extended_srgb_linear: return "2(scRGB)";
+    case reshade::api::color_space::hdr10_st2084:         return "3(PQ)";
+    case reshade::api::color_space::hdr10_hlg:            return "4(HLG)";
+    default:                                              return "0(Unknown)";
+    }
 }
 
 static void WriteCsvRow(
