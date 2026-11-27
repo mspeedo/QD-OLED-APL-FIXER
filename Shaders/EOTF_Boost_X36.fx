@@ -1395,8 +1395,6 @@ float ApplyBT2390EETFToNits(float inputNits, float sourcePeakNits, float targetP
 {
     return ApplyBT2390EETFToNitsWithShape(inputNits, sourcePeakNits, targetPeakNits, 1.0);
 }
-#endif
-
 
 float GetDigit(int digit, float2 uv)
 {
@@ -1410,28 +1408,8 @@ float GetDigit(int digit, float2 uv)
 
     return (num >> (x + y * 3)) & 1;
 }
+#endif
 
-float GetPercent(float2 uv)
-{
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-        return 0.0;
-
-    float2 d0 = uv - float2(0.3, 0.25);
-    float2 d1 = uv - float2(0.7, 0.75);
-    bool slash = abs(uv.x - (1.0 - uv.y)) < 0.15;
-    bool circles = (dot(d0, d0) < 0.04) || (dot(d1, d1) < 0.04);
-
-    return (slash || circles) ? 1.0 : 0.0;
-}
-
-float GetDot(float2 uv)
-{
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-        return 0.0;
-
-    float y = 1.0 - uv.y;
-    return (uv.x > 0.35 && uv.x < 0.65 && y > 0.00 && y < 0.20) ? 1.0 : 0.0;
-}
 
 float Remap01(float x, float a, float b)
 {
@@ -3426,315 +3404,181 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
 
 
 // ============================================================================
-// 8. OSD RENDERING
+// 8. OSD RENDERING (4x16 MONOSPACE GRID)
 // ============================================================================
 
-float DrawOSDDigitAt(float2 texcoord, float2 topRight, float scale, float aspect, int digit)
+#define OSD_G_DOT 10
+#define OSD_G_PCT 11
+#define OSD_G_SP  12
+#define OSD_G_A   13
+#define OSD_G_B   14
+#define OSD_G_C   15
+#define OSD_G_D   16
+#define OSD_G_E   17
+#define OSD_G_G   18
+#define OSD_G_I   19
+#define OSD_G_K   20
+#define OSD_G_L   21
+#define OSD_G_M   22
+#define OSD_G_N   23
+#define OSD_G_O   24
+#define OSD_G_P   25
+#define OSD_G_Q   26
+#define OSD_G_R   27
+#define OSD_G_S   28
+#define OSD_G_T   29
+#define OSD_G_U   30
+#define OSD_G_W   31
+
+// 3x5 bitpacked glyphs (bit = x + y * 3, x=0..2 left-to-right, y=0..4 bottom-to-top).
+// Indices 0..9 match digits '0'..'9'; 10..31 match symbols and letters above.
+static const uint OSD_GLYPHS[32] =
 {
-    float2 uv = texcoord;
-    uv.x *= aspect;
+    31599u,  9362u, 31183u, 31143u, 23524u, 29671u, 29679u, 31012u, 31727u, 31719u,
+        2u,  6284u,     0u,
+    11245u, 15083u, 25166u, 15211u, 29391u, 25454u, 29847u, 23277u,  4687u, 24557u,
+    24573u, 31599u, 15049u, 31612u, 15085u, 29671u, 29842u, 23407u, 23421u
+};
 
-    float2 anchor = topRight;
-    anchor.x *= aspect;
+// Fixed 8-column row labels (rows 0..3).
+static const int OSD_LABELS[32] =
+{
+    OSD_G_R, OSD_G_A, OSD_G_W, OSD_G_SP, OSD_G_A, OSD_G_P, OSD_G_L, OSD_G_SP,
+    OSD_G_O, OSD_G_U, OSD_G_T, OSD_G_SP, OSD_G_A, OSD_G_P, OSD_G_L, OSD_G_SP,
+    OSD_G_R, OSD_G_A, OSD_G_W, OSD_G_SP, OSD_G_N, OSD_G_I, OSD_G_T, OSD_G_S,
+    OSD_G_A, OSD_G_P, OSD_G_L, OSD_G_SP, OSD_G_M, OSD_G_O, OSD_G_D, OSD_G_E
+};
 
-    uv -= anchor;
-    uv.x = -uv.x;
+// Right-aligned 5-column mode strings indexed by APL_MODE_* (0=SCRGB, 1=PQ, 2=SDR, 3=UNK).
+static const int OSD_MODES[20] =
+{
+    OSD_G_S,  OSD_G_C,  OSD_G_R,  OSD_G_G, OSD_G_B,
+    OSD_G_SP, OSD_G_SP, OSD_G_SP, OSD_G_P, OSD_G_Q,
+    OSD_G_SP, OSD_G_SP, OSD_G_S,  OSD_G_D, OSD_G_R,
+    OSD_G_SP, OSD_G_SP, OSD_G_U,  OSD_G_N, OSD_G_K
+};
 
-    return GetDigit(digit, uv / scale);
+static const uint OSD_POW10[5] = { 10000u, 1000u, 100u, 10u, 1u };
+
+int OSD_FormatPercentCell(uint pctX100, int col)
+{
+    int ch = OSD_G_SP;
+    uint integerPart = pctX100 / 100u;
+    uint fracPart = pctX100 % 100u;
+
+    if (col == 9)       ch = (integerPart >= 100u) ? int((integerPart / 100u) % 10u) : OSD_G_SP;
+    else if (col == 10) ch = (integerPart >= 10u)  ? int((integerPart / 10u) % 10u)  : OSD_G_SP;
+    else if (col == 11) ch = int(integerPart % 10u);
+    else if (col == 12) ch = OSD_G_DOT;
+    else if (col == 13) ch = int((fracPart / 10u) % 10u);
+    else if (col == 14) ch = int(fracPart % 10u);
+    else if (col == 15) ch = OSD_G_PCT;
+
+    return ch;
 }
 
-float DrawOSDPercentAt(float2 texcoord, float2 topRight, float scale, float aspect)
+int OSD_FormatUint5Cell(uint value, int col)
 {
-    float2 uv = texcoord;
-    uv.x *= aspect;
-
-    float2 anchor = topRight;
-    anchor.x -= scale / max(aspect, 1e-6);
-    anchor.x *= aspect;
-
-    uv -= anchor;
-
-    return GetPercent(uv / scale);
-}
-
-float DrawOSDDotAt(float2 texcoord, float2 topRight, float scale, float aspect)
-{
-    float2 uv = texcoord;
-    uv.x *= aspect;
-
-    float2 anchor = topRight;
-    anchor.x *= aspect;
-
-    uv -= anchor;
-    uv.x = -uv.x;
-
-    return GetDot(uv / scale);
-}
-
-float DrawOSDAPLPercent2(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, float currentAPL)
-{
-    uint aplPctX100 = uint(clamp(int(floor(saturate(currentAPL) * 10000.0 + 0.5)), 0, 10000));
-    uint integerPart = aplPctX100 / 100u;
-    uint fractionalPart = aplPctX100 % 100u;
-
-    float mask = 0.0;
-
-
-    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, int(fractionalPart % 10u));
-    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, int((fractionalPart / 10u) % 10u));
-    mask += DrawOSDDotAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect);
-    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, int(integerPart % 10u));
-
-    if (integerPart >= 10u)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, int((integerPart / 10u) % 10u));
-
-    if (integerPart >= 100u)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 5.0, 0.0), scale, aspect, int((integerPart / 100u) % 10u));
-
-    return saturate(mask);
-}
-
-float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
-{
-    uint v = (uint)clamp(value, 0, 99999);
-    float mask = 0.0;
-
-    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, (int)(v % 10));
-
-    if (v >= 10)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (int)((v / 10) % 10));
-
-    if (v >= 100)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (int)((v / 100) % 10));
-
-    if (v >= 1000)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, (int)((v / 1000) % 10));
-
-    if (v >= 10000)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (int)((v / 10000) % 10));
-
-    return saturate(mask);
-}
-
-
-#define OSD_CHAR_SPACE -1
-#define OSD_CHAR_A 0
-#define OSD_CHAR_B 1
-#define OSD_CHAR_C 2
-#define OSD_CHAR_D 3
-#define OSD_CHAR_E 4
-#define OSD_CHAR_G 6
-#define OSD_CHAR_I 8
-#define OSD_CHAR_K 10
-#define OSD_CHAR_L 11
-#define OSD_CHAR_M 12
-#define OSD_CHAR_N 13
-#define OSD_CHAR_O 14
-#define OSD_CHAR_P 15
-#define OSD_CHAR_Q 16
-#define OSD_CHAR_R 17
-#define OSD_CHAR_S 18
-#define OSD_CHAR_T 19
-#define OSD_CHAR_U 20
-#define OSD_CHAR_W 22
-#define OSD_CHAR_X 23
-
-float GetOSDLetter(int letter, float2 uv)
-{
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-        return 0.0;
-
-    int pattern = 0;
-
-
-    if (letter == OSD_CHAR_A) pattern = 11245;
-    else if (letter == OSD_CHAR_B) pattern = 15083;
-    else if (letter == OSD_CHAR_C) pattern = 25166;
-    else if (letter == OSD_CHAR_D) pattern = 15211;
-    else if (letter == OSD_CHAR_E) pattern = 29391;
-    else if (letter == OSD_CHAR_G) pattern = 25454;
-    else if (letter == OSD_CHAR_I) pattern = 29847;
-    else if (letter == OSD_CHAR_K) pattern = 23277;
-    else if (letter == OSD_CHAR_L) pattern = 4687;
-    else if (letter == OSD_CHAR_M) pattern = 24557;
-    else if (letter == OSD_CHAR_N) pattern = 24573;
-    else if (letter == OSD_CHAR_O) pattern = 31599;
-    else if (letter == OSD_CHAR_P) pattern = 15049;
-    else if (letter == OSD_CHAR_Q) pattern = 31612;
-    else if (letter == OSD_CHAR_R) pattern = 15085;
-    else if (letter == OSD_CHAR_S) pattern = 29671;
-    else if (letter == OSD_CHAR_T) pattern = 29842;
-    else if (letter == OSD_CHAR_U) pattern = 23407;
-    else if (letter == OSD_CHAR_W) pattern = 23421;
-    else if (letter == OSD_CHAR_X) pattern = 23213;
-
-    int x = int(uv.x * 3.0);
-    int y = int((1.0 - uv.y) * 5.0);
-
-    return (pattern >> (x + y * 3)) & 1;
-}
-
-float DrawOSDLetterAt(float2 texcoord, float2 topLeft, float scale, float aspect, int letter)
-{
-    float2 uv = texcoord;
-    uv.x *= aspect;
-
-    float2 anchor = topLeft;
-    anchor.x *= aspect;
-
-    uv -= anchor;
-
-    return GetOSDLetter(letter, uv / scale);
-}
-
-float DrawOSDLabel8(float2 texcoord, float2 topLeft, float scale, float stepX, float aspect, int c0, int c1, int c2, int c3, int c4, int c5, int c6, int c7)
-{
-    float mask = 0.0;
-    if (c0 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, c0);
-    if (c1 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, c1);
-    if (c2 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, c2);
-    if (c3 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 3.0, 0.0), scale, aspect, c3);
-    if (c4 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 4.0, 0.0), scale, aspect, c4);
-    if (c5 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 5.0, 0.0), scale, aspect, c5);
-    if (c6 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 6.0, 0.0), scale, aspect, c6);
-    if (c7 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 7.0, 0.0), scale, aspect, c7);
-    return saturate(mask);
-}
-
-float DrawOSDModeValue(float2 texcoord, float2 topRight, float scale, float stepX, float glyphWidth, float aspect, int inputMode)
-{
-    float mask = 0.0;
-    if (inputMode == APL_MODE_PQ)
+    int ch = OSD_G_SP;
+    if (col >= 11 && col <= 15)
     {
-        float2 topLeft = float2(topRight.x - (stepX + glyphWidth), topRight.y);
-        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_P);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_Q);
+        int idx = col - 11;
+        uint divisor = OSD_POW10[idx];
+        if (idx == 4 || value >= divisor)
+            ch = int((value / divisor) % 10u);
     }
-    else if (inputMode == APL_MODE_SCRGB)
-    {
-        float2 topLeft = float2(topRight.x - (stepX * 4.0 + glyphWidth), topRight.y);
-        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_S);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_C);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, OSD_CHAR_R);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 3.0, 0.0), scale, aspect, OSD_CHAR_G);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 4.0, 0.0), scale, aspect, OSD_CHAR_B);
-    }
-    else if (inputMode == APL_MODE_SDR)
-    {
-        float2 topLeft = float2(topRight.x - (stepX * 2.0 + glyphWidth), topRight.y);
-        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_S);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_D);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, OSD_CHAR_R);
-    }
-    else
-    {
-        float2 topLeft = float2(topRight.x - (stepX * 2.0 + glyphWidth), topRight.y);
-        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_U);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_N);
-        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, OSD_CHAR_K);
-    }
-    return saturate(mask);
+    return ch;
 }
 
+int OSD_GetCellChar(int row, int col, float rawInputAPL, float outputAPL, float maxSceneNits, int inputMode)
+{
+    int ch = OSD_G_SP;
+
+    if (col < 8)
+    {
+        ch = OSD_LABELS[row * 8 + col];
+    }
+    else if (row == 0 && col >= 9)
+    {
+        uint rawPctX100 = uint(clamp(int(floor(saturate(rawInputAPL) * 10000.0 + 0.5)), 0, 10000));
+        ch = OSD_FormatPercentCell(rawPctX100, col);
+    }
+    else if (row == 1 && col >= 9)
+    {
+        uint outPctX100 = uint(clamp(int(floor(saturate(outputAPL) * 10000.0 + 0.5)), 0, 10000));
+        ch = OSD_FormatPercentCell(outPctX100, col);
+    }
+    else if (row == 2 && col >= 11)
+    {
+        uint nitDisplay = uint(clamp(int(floor(max(maxSceneNits, 0.0) + 0.5)), 0, 99999));
+        ch = OSD_FormatUint5Cell(nitDisplay, col);
+    }
+    else if (row == 3 && col >= 11)
+    {
+        int modeIdx = clamp(inputMode, 0, 3);
+        ch = OSD_MODES[modeIdx * 5 + (col - 11)];
+    }
+
+    return ch;
+}
 
 // Returns premultiplied RGBA (rgb = premultiplied overlay color, a = coverage/darken alpha)
 // so both HDR DrawStatsOverlay and SDR hardware-blended PS_SDR_OSD produce identical output.
 float4 ComputeStatsOverlayBlend(float2 texcoord, float rawInputAPL, float outputAPL, float maxSceneNits, int inputMode)
 {
+    float4 result = 0.0.xxxx;
+
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float invAspect = 1.0 / max(aspect, 1e-6);
 
+    float glyphH = 0.022;
+    float glyphW = glyphH * 0.72 * invAspect;
+    float cellStepX = glyphW * 1.28;
+    float cellStepY = glyphH * 1.32;
 
-    float scale = 0.022;
-    float glyphWidth = scale * invAspect;
-    float stepX = glyphWidth * 1.06;
-    float lineSpacing = scale * 1.18;
-    float percentGap = glyphWidth * 0.20;
+    float totalW = cellStepX * 15.0 + glyphW;
+    float totalH = cellStepY * 3.0 + glyphH;
 
-    float labelScale = scale * 0.92;
-    float labelGlyphWidth = labelScale * invAspect;
-    float labelStepX = labelGlyphWidth * 1.18;
-    float labelTotalWidth = labelStepX * 7.0 + labelGlyphWidth;
-    float labelGap = glyphWidth * 0.82;
+    float right = 1.0 - 0.016;
+    float left = right - totalW;
+    float top = 0.034;
+    float bottom = top + totalH;
 
+    float padX = glyphW * 0.65;
+    float padY = glyphH * 0.28;
 
-    float rightMargin = 0.016;
-    float2 inputPercentRight = float2(1.0 - rightMargin, 0.034);
-    float2 inputRowRight = inputPercentRight - float2(glyphWidth + percentGap, 0.0);
-    float2 outputPercentRight = inputPercentRight + float2(0.0, lineSpacing);
-    float2 outputRowRight = inputRowRight + float2(0.0, lineSpacing);
-    float2 nitsRowRight = inputRowRight + float2(0.0, lineSpacing * 2.0);
-    float2 modeRowRight = inputRowRight + float2(0.0, lineSpacing * 3.0);
+    if (texcoord.x >= left - padX && texcoord.x <= right + padX && texcoord.y >= top - padY && texcoord.y <= bottom + padY)
+    {
+        float bgAlpha = 0.18 * OSDBrightness;
+        result = float4(0.0.xxx, bgAlpha);
 
-    float valueLeft = inputRowRight.x - stepX * 5.0 - glyphWidth;
-    float2 inputLabelTopLeft = float2(valueLeft - labelGap - labelTotalWidth, inputRowRight.y);
-    float2 outputLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing);
-    float2 nitsLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing * 2.0);
-    float2 modeLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing * 3.0);
+        float2 local = texcoord - float2(left, top);
+        int row = int(floor(local.y / cellStepY));
+        int col = int(floor(local.x / cellStepX));
+        float2 cellUV = float2(
+            (local.x - float(col) * cellStepX) / glyphW,
+            (local.y - float(row) * cellStepY) / glyphH
+        );
 
-    float left = inputLabelTopLeft.x;
-    float right = inputPercentRight.x;
-    float top = inputRowRight.y;
-    float bottom = modeRowRight.y + scale;
+        if (row >= 0 && row < 4 && col >= 0 && col < 16 &&
+            cellUV.x >= 0.0 && cellUV.x < 1.0 && cellUV.y >= 0.0 && cellUV.y < 1.0)
+        {
+            int ch = OSD_GetCellChar(row, col, rawInputAPL, outputAPL, maxSceneNits, inputMode);
+            int gx = clamp(int(cellUV.x * 3.0), 0, 2);
+            int gy = clamp(int((1.0 - cellUV.y) * 5.0), 0, 4);
+            float glyphMask = float((OSD_GLYPHS[ch] >> uint(gx + gy * 3)) & 1u);
 
-    float padX = glyphWidth * 0.48;
-    float padY = scale * 0.20;
+            float3 rowColor = (row == 0) ? float3(0.30, 1.00, 0.30)
+                            : ((row == 1) ? float3(1.00, 0.90, 0.18)
+                            : ((row == 2) ? float3(0.60, 0.85, 1.00)
+                            : ((inputMode >= APL_MODE_SDR) ? float3(1.00, 0.45, 0.35) : float3(0.85, 0.85, 0.85))));
+            rowColor *= OSDBrightness;
 
-    if (texcoord.x < left - padX || texcoord.x > right + padX || texcoord.y < top - padY || texcoord.y > bottom + padY)
-        return 0.0.xxxx;
+            result = float4(rowColor * glyphMask, lerp(bgAlpha, 1.0, glyphMask));
+        }
+    }
 
-    int nitDisplay = clamp(int(floor(max(maxSceneNits, 0.0) + 0.5)), 0, 99999);
-
-    float bgMask = (texcoord.x >= left - padX && texcoord.x <= right + padX && texcoord.y >= top - padY && texcoord.y <= bottom + padY) ? 1.0 : 0.0;
-
-    float rawLabelMask = DrawOSDLabel8(texcoord, inputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
-    float outputLabelMask = DrawOSDLabel8(texcoord, outputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_O, OSD_CHAR_U, OSD_CHAR_T, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
-    float nitsLabelMask = DrawOSDLabel8(texcoord, nitsLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_N, OSD_CHAR_I, OSD_CHAR_T, OSD_CHAR_S);
-    float modeLabelMask = DrawOSDLabel8(texcoord, modeLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE, OSD_CHAR_M, OSD_CHAR_O, OSD_CHAR_D, OSD_CHAR_E);
-
-    float inputMask = 0.0;
-    inputMask += DrawOSDAPLPercent2(texcoord, inputRowRight, scale, stepX, aspect, rawInputAPL);
-    inputMask += DrawOSDPercentAt(texcoord, inputPercentRight, scale, aspect);
-    inputMask = saturate(inputMask);
-
-    float outputMask = 0.0;
-    outputMask += DrawOSDAPLPercent2(texcoord, outputRowRight, scale, stepX, aspect, outputAPL);
-    outputMask += DrawOSDPercentAt(texcoord, outputPercentRight, scale, aspect);
-    outputMask = saturate(outputMask);
-
-    float nitsMask = DrawOSDRow5(texcoord, nitsRowRight, scale, stepX, aspect, nitDisplay);
-    float modeMask = DrawOSDModeValue(texcoord, modeRowRight, labelScale, labelStepX, labelGlyphWidth, aspect, inputMode);
-
-    float bgAlpha = 0.18 * OSDBrightness * bgMask;
-
-    float3 inputColor = float3(0.30, 1.00, 0.30) * OSDBrightness;
-    float3 outputColor = float3(1.00, 0.90, 0.18) * OSDBrightness;
-    float3 nitsColor = float3(0.60, 0.85, 1.00) * OSDBrightness;
-    float3 modeColor = (inputMode >= APL_MODE_SDR)
-        ? float3(1.00, 0.45, 0.35) * OSDBrightness
-        : float3(0.85, 0.85, 0.85) * OSDBrightness;
-
-    float row1 = saturate(rawLabelMask + inputMask);
-    float row2 = saturate(outputLabelMask + outputMask);
-    float row3 = saturate(nitsLabelMask + nitsMask);
-    float row4 = saturate(modeLabelMask + modeMask);
-
-    float3 premulRGB = 0.0.xxx;
-    float alpha = bgAlpha;
-
-    premulRGB = lerp(premulRGB, inputColor, row1);
-    alpha = lerp(alpha, 1.0, row1);
-
-    premulRGB = lerp(premulRGB, outputColor, row2);
-    alpha = lerp(alpha, 1.0, row2);
-
-    premulRGB = lerp(premulRGB, nitsColor, row3);
-    alpha = lerp(alpha, 1.0, row3);
-
-    premulRGB = lerp(premulRGB, modeColor, row4);
-    alpha = lerp(alpha, 1.0, row4);
-
-    return float4(premulRGB, alpha);
+    return result;
 }
 
 float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSceneNits, int inputMode)
