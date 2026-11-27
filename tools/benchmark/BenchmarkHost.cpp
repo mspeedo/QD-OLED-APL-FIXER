@@ -294,7 +294,7 @@ int main(int argc, char **argv)
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wc.lpszClassName = L"QDOLEDShaderBenchHost";
     RegisterClassExW(&wc);
 
