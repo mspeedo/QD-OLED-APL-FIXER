@@ -3771,7 +3771,7 @@ void CS_HL_ExtractAndBilateralH(uint3 groupID : SV_GroupID, uint3 threadID : SV_
             centerPQ = HL_ExtractPQAt(hx, hy, isPQ);
             HL_TileRow[sIdx] = centerPQ;
             if (hx < APL_HL_WIDTH && centerPQ >= hThresh)
-                HL_RowHasBright = 1u;
+                atomicOr(HL_RowHasBright, 1u);
         }
         barrier();
 
@@ -3848,6 +3848,7 @@ void CS_HL_BilateralV(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThrea
     barrier();
 
     float vThresh = HL_SourceKneePQ_V - 0.015;
+    bool hasBright = false;
 
     [unroll]
     for (int r = 0; r < 8; ++r)
@@ -3857,8 +3858,10 @@ void CS_HL_BilateralV(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThrea
         float v = tex2Dfetch(SamplerHLPQ_B, int2(clampedX, min(hy, APL_HL_HEIGHT - 1))).r;
         HL_TileCol[(APL_HL_HALO + ly) * 16 + tx] = v;
         if (hx < APL_HL_WIDTH && hy < APL_HL_HEIGHT && v >= vThresh)
-            HL_TileHasBright = 1u;
+            hasBright = true;
     }
+    if (hasBright)
+        atomicOr(HL_TileHasBright, 1u);
     barrier();
 
     if (HL_TileHasBright != 0u)
