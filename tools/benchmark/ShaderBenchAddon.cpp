@@ -310,6 +310,36 @@ static std::string GetBufferColorSpaceString(reshade::api::effect_runtime *runti
     return "unknown";
 }
 
+static std::string GetSystemListSeparator()
+{
+    char buf[16] = {};
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SLIST, buf, static_cast<int>(sizeof(buf))) > 1 && buf[0] != '\0')
+        return std::string(buf);
+    return ",";
+}
+
+static std::string GetSystemDecimalSeparator()
+{
+    char buf[16] = {};
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SDECIMAL, buf, static_cast<int>(sizeof(buf))) > 1 && buf[0] != '\0')
+        return std::string(buf);
+    return ".";
+}
+
+static std::string FormatLocaleDouble(double v, const std::string &decSep)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.4f", v);
+    std::string s(buf);
+    if (decSep != ".")
+    {
+        size_t pos = s.find('.');
+        if (pos != std::string::npos)
+            s.replace(pos, 1, decSep);
+    }
+    return s;
+}
+
 static void WriteCsvRow(
     reshade::api::effect_runtime *runtime,
     BenchRuntimeData &data,
@@ -322,6 +352,9 @@ static void WriteCsvRow(
     double maxMs,
     size_t validSamples)
 {
+    const std::string sep = GetSystemListSeparator();
+    const std::string dec = GetSystemDecimalSeparator();
+
     std::ios::openmode mode = data.csvHeaderWritten ? (std::ios::out | std::ios::app) : (std::ios::out | std::ios::trunc);
     std::ofstream out(data.cfg.outputCsv, mode);
     if (!out.is_open())
@@ -329,7 +362,9 @@ static void WriteCsvRow(
 
     if (!data.csvHeaderWritten)
     {
-        out << "case,status,color_space,width,height,timer,samples,median_ms,mean_ms,p95_ms,min_ms,max_ms\n";
+        out << "case" << sep << "status" << sep << "color_space" << sep << "width" << sep << "height" << sep
+            << "timer" << sep << "samples" << sep << "median_ms" << sep << "mean_ms" << sep
+            << "p95_ms" << sep << "min_ms" << sep << "max_ms\n";
         data.csvHeaderWritten = true;
     }
 
@@ -339,21 +374,24 @@ static void WriteCsvRow(
         ? (data.api == reshade::api::device_api::d3d12 ? "d3d12_gpu" : "d3d11_gpu")
         : "cpu_qpc";
 
-    char line[512];
-    std::snprintf(
-        line, sizeof(line),
-        "%s,%s,%s,%u,%u,%s,%zu,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-        caseName.c_str(),
-        status.c_str(),
-        GetBufferColorSpaceString(runtime).c_str(),
-        w, h,
-        timerName,
-        validSamples,
-        medianMs, meanMs, p95Ms, minMs, maxMs);
+    std::ostringstream oss;
+    oss << caseName << sep
+        << status << sep
+        << GetBufferColorSpaceString(runtime) << sep
+        << w << sep << h << sep
+        << timerName << sep
+        << validSamples << sep
+        << FormatLocaleDouble(medianMs, dec) << sep
+        << FormatLocaleDouble(meanMs, dec) << sep
+        << FormatLocaleDouble(p95Ms, dec) << sep
+        << FormatLocaleDouble(minMs, dec) << sep
+        << FormatLocaleDouble(maxMs, dec) << "\n";
+
+    std::string line = oss.str();
     out << line;
     out.flush();
 
-    reshade::log::message(reshade::log::level::info, line);
+    reshade::log::message(reshade::log::level::info, line.c_str());
 }
 
 static void WriteDoneFlag(const std::string &path)

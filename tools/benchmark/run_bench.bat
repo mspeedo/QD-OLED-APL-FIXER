@@ -51,7 +51,7 @@ if errorlevel 1 (
 echo.
 if exist "results.csv" (
     echo ====================== RESULTS ^(results.csv^) ======================
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Import-Csv .\results.csv | Format-Table case,status,color_space,timer,samples,median_ms,mean_ms,p95_ms -AutoSize"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Import-Csv -UseCulture .\results.csv | Format-Table case,status,color_space,timer,samples,median_ms,mean_ms,p95_ms -AutoSize"
     echo ===================================================================
 )
 pause
