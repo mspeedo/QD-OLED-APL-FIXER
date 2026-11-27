@@ -35,7 +35,7 @@ jobs:
           mkdir dist\shaders_main
           mkdir dist\shaders_new
 
-          cl /nologo /O2 /EHsc /W3 /std:c++17 /Fe:dist\BenchmarkHost.exe tools\benchmark\BenchmarkHost.cpp d3d11.lib dxgi.lib d3dcompiler.lib user32.lib
+          cl /nologo /O2 /EHsc /W3 /std:c++17 /Fe:dist\BenchmarkHost.exe tools\benchmark\BenchmarkHost.cpp d3d11.lib dxgi.lib d3dcompiler.lib user32.lib winmm.lib
           if errorlevel 1 exit /b 1
 
           cl /nologo /O2 /EHsc /W3 /std:c++17 /LD /I _deps\reshade\include /Fe:dist\ShaderBench.addon64 tools\benchmark\ShaderBenchAddon.cpp user32.lib

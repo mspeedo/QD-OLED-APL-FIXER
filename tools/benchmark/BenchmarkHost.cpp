@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <timeapi.h>
 #include <d3d11.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
@@ -29,6 +30,7 @@ struct HostConfig
     int height = 0;                // 0 = auto (interactive: ~80% desktop; bench: 1440)
     std::string doneFile = "bench_done.flag";
     int timeoutSec = 0;            // 0 = no timeout (interactive); bench defaults to 300
+    int fpsLimit = 120;            // default 120 FPS (0 = uncapped)
     bool benchMode = false;
 };
 
@@ -240,6 +242,8 @@ static HostConfig ParseArgs(int argc, char **argv)
             cfg.doneFile = argv[++i];
         else if (std::strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
             cfg.timeoutSec = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc)
+            cfg.fpsLimit = std::max(0, std::atoi(argv[++i]));
     }
 
     if (cfg.benchMode)
@@ -469,6 +473,16 @@ int main(int argc, char **argv)
     bool running = true;
     int exitCode = 0;
 
+    LARGE_INTEGER qpcFreq = {};
+    LARGE_INTEGER nextFrameTime = {};
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&nextFrameTime);
+    const double ticksPerFrame = (cfg.fpsLimit > 0)
+        ? (static_cast<double>(qpcFreq.QuadPart) / static_cast<double>(cfg.fpsLimit))
+        : 0.0;
+    if (cfg.fpsLimit > 0)
+        timeBeginPeriod(1);
+
     while (running)
     {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -540,18 +554,36 @@ int main(int argc, char **argv)
         context->PSSetConstantBuffers(0, 1, cbs);
         context->Draw(3, 0);
 
-        if (cfg.benchMode)
-        {
-            UINT presentFlags = allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-            swapChain1->Present(0, presentFlags);
-        }
-        else
-        {
-            // VSync ON in interactive mode keeps CPU/GPU cool and ReShade overlay input 100% responsive.
-            swapChain1->Present(1, 0);
-        }
+        UINT presentFlags = (cfg.benchMode && allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        swapChain1->Present(0, presentFlags);
         ++frameCount;
+
+        if (cfg.fpsLimit > 0 && qpcFreq.QuadPart > 0)
+        {
+            nextFrameTime.QuadPart += static_cast<LONGLONG>(ticksPerFrame);
+            LARGE_INTEGER now = {};
+            QueryPerformanceCounter(&now);
+            if (now.QuadPart >= nextFrameTime.QuadPart)
+            {
+                // Resync if a reload/stall took longer than one frame interval
+                nextFrameTime.QuadPart = now.QuadPart;
+            }
+            else
+            {
+                double remainMs = static_cast<double>(nextFrameTime.QuadPart - now.QuadPart) * 1000.0 /
+                                  static_cast<double>(qpcFreq.QuadPart);
+                if (remainMs > 2.0)
+                    Sleep(static_cast<DWORD>(remainMs - 1.5));
+                do
+                {
+                    QueryPerformanceCounter(&now);
+                } while (now.QuadPart < nextFrameTime.QuadPart);
+            }
+        }
     }
+
+    if (cfg.fpsLimit > 0)
+        timeEndPeriod(1);
 
     DestroyWindow(hwnd);
     return exitCode;
