@@ -68,7 +68,7 @@ for %%M in (pq scrgb sdr) do (
     del /Q "results_%%M.csv" 2>nul
     del /Q "bench_done.flag" 2>nul
     del /Q "BenchPreset.ini" 2>nul
-    BenchmarkHost.exe --mode %%M --width %WIDTH% --height %HEIGHT% --done-file bench_done.flag --timeout 240
+    BenchmarkHost.exe --bench --mode %%M --width %WIDTH% --height %HEIGHT% --done-file bench_done.flag --timeout 240
     if errorlevel 1 (
         echo   [ERROR] BenchmarkHost exited with error during %LABEL% mode=%%M.
         exit /b 1

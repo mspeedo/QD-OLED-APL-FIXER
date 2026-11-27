@@ -1,13 +1,20 @@
-// Lightweight deterministic D3D11 HDR/SDR swapchain host for ReShade shader benchmarking.
+// Lightweight deterministic D3D11 HDR/SDR swapchain host for ReShade shader testing & benchmarking.
+// - Double-click (no --bench): Interactive windowed mode with VSync ON so ReShade menu (Home)
+//   and all mouse/keyboard inputs stay fully responsive for configuring ReShade.
+// - --bench mode (used by run_compare.bat): Sets SHADER_BENCH_AUTO=1, runs uncapped at target
+//   resolution, and exits automatically once ShaderBench.addon64 writes bench_done.flag.
+//
 // Builds with: cl /O2 /EHsc /W3 BenchmarkHost.cpp d3d11.lib dxgi.lib d3dcompiler.lib user32.lib
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,11 +24,12 @@ using Microsoft::WRL::ComPtr;
 
 struct HostConfig
 {
-    std::string mode = "pq";      // pq | scrgb | sdr
-    int width = 3440;
-    int height = 1440;
+    std::string mode = "pq";       // pq | scrgb | sdr
+    int width = 0;                 // 0 = auto (interactive: ~80% desktop; bench: 3440)
+    int height = 0;                // 0 = auto (interactive: ~80% desktop; bench: 1440)
     std::string doneFile = "bench_done.flag";
-    int timeoutSec = 300;
+    int timeoutSec = 0;            // 0 = no timeout (interactive); bench defaults to 300
+    bool benchMode = false;
 };
 
 struct SceneCB
@@ -30,6 +38,16 @@ struct SceneCB
     float framePhase;
     float pad0;
     float pad1;
+};
+
+struct WindowState
+{
+    bool benchMode = false;
+    bool isFullscreen = false;
+    WINDOWPLACEMENT savedPlacement = { sizeof(WINDOWPLACEMENT) };
+    UINT pendingWidth = 0;
+    UINT pendingHeight = 0;
+    bool needsResize = false;
 };
 
 static const char *g_SceneShaderHLSL = R"HLSL(
@@ -122,7 +140,7 @@ float4 PSMain(VSOut i) : SV_Target
         nits += float3(680.0, 710.0, 760.0) * rim * tex;
     }
 
-    if (g_ModeId == 2) // HDR10 PQ (Rec.2020 approx)
+    if (g_ModeId == 2) // HDR10 PQ
     {
         return float4(LinearToPQ(nits / 10000.0), 1.0);
     }
@@ -130,24 +148,77 @@ float4 PSMain(VSOut i) : SV_Target
     {
         return float4(nits / 80.0, 1.0);
     }
-    else // SDR sRGB (1.0 = 200 nits display-referred)
+    else // SDR sRGB
     {
         return float4(LinearToSRGB(nits / 250.0), 1.0);
     }
 }
 )HLSL";
 
+static void ToggleBorderlessFullscreen(HWND hwnd, WindowState &st)
+{
+    DWORD style = static_cast<DWORD>(GetWindowLongW(hwnd, GWL_STYLE));
+    if (!st.isFullscreen)
+    {
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetWindowPlacement(hwnd, &st.savedPlacement) &&
+            GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi))
+        {
+            SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+            SetWindowPos(hwnd, HWND_TOP,
+                         mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            st.isFullscreen = true;
+        }
+    }
+    else
+    {
+        SetWindowLongW(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &st.savedPlacement);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        st.isFullscreen = false;
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_DESTROY)
+    WindowState *st = reinterpret_cast<WindowState *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    switch (msg)
     {
+    case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
-    }
-    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE)
-    {
-        PostQuitMessage(0);
+    case WM_SIZE:
+        if (st && wParam != SIZE_MINIMIZED)
+        {
+            UINT w = LOWORD(lParam);
+            UINT h = HIWORD(lParam);
+            if (w >= 64 && h >= 64)
+            {
+                st->pendingWidth = w;
+                st->pendingHeight = h;
+                st->needsResize = true;
+            }
+        }
         return 0;
+    case WM_KEYDOWN:
+        if (st && st->benchMode && wParam == VK_ESCAPE)
+        {
+            PostQuitMessage(0);
+            return 0;
+        }
+        if (st && !st->benchMode && wParam == VK_F11)
+        {
+            ToggleBorderlessFullscreen(hwnd, *st);
+            return 0;
+        }
+        break;
+    default:
+        break;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -157,7 +228,9 @@ static HostConfig ParseArgs(int argc, char **argv)
     HostConfig cfg;
     for (int i = 1; i < argc; ++i)
     {
-        if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
+        if (std::strcmp(argv[i], "--bench") == 0)
+            cfg.benchMode = true;
+        else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
             cfg.mode = argv[++i];
         else if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc)
             cfg.width = std::atoi(argv[++i]);
@@ -168,6 +241,21 @@ static HostConfig ParseArgs(int argc, char **argv)
         else if (std::strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
             cfg.timeoutSec = std::atoi(argv[++i]);
     }
+
+    if (cfg.benchMode)
+    {
+        if (cfg.width <= 0) cfg.width = 3440;
+        if (cfg.height <= 0) cfg.height = 1440;
+        if (cfg.timeoutSec <= 0) cfg.timeoutSec = 300;
+    }
+    else
+    {
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        if (cfg.width <= 0) cfg.width = std::min(1920, std::max(800, (screenW * 4) / 5));
+        if (cfg.height <= 0) cfg.height = std::min(1080, std::max(600, (screenH * 4) / 5));
+    }
+
     if (cfg.width < 320) cfg.width = 320;
     if (cfg.height < 240) cfg.height = 240;
     return cfg;
@@ -183,11 +271,21 @@ int main(int argc, char **argv)
 {
     HostConfig cfg = ParseArgs(argc, argv);
 
-    // Clear stale completion flag before starting
-    DeleteFileA(cfg.doneFile.c_str());
+    // Signal ShaderBench.addon64 ONLY in explicit --bench mode so interactive double-click
+    // lets the user open and configure ReShade freely without auto-reloading.
+    if (cfg.benchMode)
+    {
+        SetEnvironmentVariableA("SHADER_BENCH_AUTO", "1");
+        DeleteFileA(cfg.doneFile.c_str());
+    }
+    else
+    {
+        SetEnvironmentVariableA("SHADER_BENCH_AUTO", nullptr);
+    }
 
-    std::printf("[BenchmarkHost] Mode=%s  Resolution=%dx%d  Timeout=%ds\n",
-                cfg.mode.c_str(), cfg.width, cfg.height, cfg.timeoutSec);
+    std::printf("[BenchmarkHost] %s  Mode=%s  Resolution=%dx%d\n",
+                cfg.benchMode ? "BENCHMARK" : "INTERACTIVE",
+                cfg.mode.c_str(), cfg.width, cfg.height);
     std::fflush(stdout);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -196,17 +294,28 @@ int main(int argc, char **argv)
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = L"QDOLEDShaderBenchHost";
     RegisterClassExW(&wc);
 
-    // Use a borderless popup window sized to the requested backbuffer resolution
-    // so ReShade sees the exact target BUFFER_WIDTH x BUFFER_HEIGHT (e.g. 3440x1440).
+    DWORD winStyle = cfg.benchMode ? (WS_POPUP | WS_VISIBLE) : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+    RECT rect = { 0, 0, cfg.width, cfg.height };
+    AdjustWindowRect(&rect, winStyle, FALSE);
+    int winW = rect.right - rect.left;
+    int winH = rect.bottom - rect.top;
+    int posX = cfg.benchMode ? 0 : std::max(0, (GetSystemMetrics(SM_CXSCREEN) - winW) / 2);
+    int posY = cfg.benchMode ? 0 : std::max(0, (GetSystemMetrics(SM_CYSCREEN) - winH) / 2);
+
+    std::wstring title = cfg.benchMode
+        ? L"QD-OLED Shader Benchmark [Running - ESC to abort]"
+        : L"QD-OLED Shader Host (Interactive) - Press Home for ReShade | F11 Fullscreen";
+
     HWND hwnd = CreateWindowExW(
         0,
         wc.lpszClassName,
-        L"QD-OLED Shader Benchmark Host (ESC to abort)",
-        WS_POPUP | WS_VISIBLE,
-        0, 0, cfg.width, cfg.height,
+        title.c_str(),
+        winStyle,
+        posX, posY, winW, winH,
         nullptr, nullptr, hInst, nullptr);
 
     if (!hwnd)
@@ -215,10 +324,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    WindowState winState;
+    winState.benchMode = cfg.benchMode;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&winState));
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+
+    // Create DXGI factory first so ReShade's dxgi.dll hook is initialized before D3D11CreateDevice.
+    ComPtr<IDXGIFactory2> factory2;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory2));
+    if (FAILED(hr))
+    {
+        std::fprintf(stderr, "[BenchmarkHost] ERROR: CreateDXGIFactory1 failed (0x%08lX).\n", hr);
+        return 3;
+    }
+
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
-    HRESULT hr = D3D11CreateDevice(
+    hr = D3D11CreateDevice(
         nullptr,
         D3D_DRIVER_TYPE_HARDWARE,
         nullptr,
@@ -233,14 +358,6 @@ int main(int argc, char **argv)
     {
         std::fprintf(stderr, "[BenchmarkHost] ERROR: D3D11CreateDevice failed (0x%08lX).\n", hr);
         return 2;
-    }
-
-    ComPtr<IDXGIFactory2> factory2;
-    hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory2));
-    if (FAILED(hr))
-    {
-        std::fprintf(stderr, "[BenchmarkHost] ERROR: CreateDXGIFactory1 failed (0x%08lX).\n", hr);
-        return 3;
     }
 
     BOOL allowTearing = FALSE;
@@ -267,6 +384,8 @@ int main(int argc, char **argv)
         modeId = 0;
     }
 
+    UINT scFlags = (cfg.benchMode && allowTearing) ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
     DXGI_SWAP_CHAIN_DESC1 scDesc = {};
     scDesc.Width = static_cast<UINT>(cfg.width);
     scDesc.Height = static_cast<UINT>(cfg.height);
@@ -277,7 +396,7 @@ int main(int argc, char **argv)
     scDesc.Scaling = DXGI_SCALING_STRETCH;
     scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    scDesc.Flags = allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    scDesc.Flags = scFlags;
 
     ComPtr<IDXGISwapChain1> swapChain1;
     hr = factory2->CreateSwapChainForHwnd(device.Get(), hwnd, &scDesc, nullptr, nullptr, &swapChain1);
@@ -287,52 +406,37 @@ int main(int argc, char **argv)
         return 4;
     }
 
+    // Disable DXGI Alt+Enter exclusive fullscreen hijack so F11 borderless works cleanly.
+    factory2->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+
     ComPtr<IDXGISwapChain3> swapChain3;
     if (SUCCEEDED(swapChain1.As(&swapChain3)))
     {
-        UINT support = 0;
-        hr = swapChain3->CheckColorSpaceSupport(colorSpace, &support);
-        if (SUCCEEDED(hr) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
-        {
-            HRESULT csHr = swapChain3->SetColorSpace1(colorSpace);
-            if (FAILED(csHr))
-                std::printf("[BenchmarkHost] WARN: SetColorSpace1 returned 0x%08lX (is Windows HDR enabled?).\n", csHr);
-            else
-                std::printf("[BenchmarkHost] Swapchain color space configured cleanly.\n");
-        }
+        HRESULT csHr = swapChain3->SetColorSpace1(colorSpace);
+        if (FAILED(csHr))
+            std::printf("[BenchmarkHost] WARN: SetColorSpace1 returned 0x%08lX (is Windows HDR enabled?).\n", csHr);
         else
-        {
-            // Still try setting it so ReShade's DXGI hook sees the requested swapchain color space
-            HRESULT csHr = swapChain3->SetColorSpace1(colorSpace);
-            std::printf("[BenchmarkHost] WARN: Display did not advertise support flag for mode=%s (SetColorSpace1=0x%08lX).\n",
-                        cfg.mode.c_str(), csHr);
-        }
+            std::printf("[BenchmarkHost] Swapchain color space configured cleanly.\n");
     }
 
-    ComPtr<ID3D11Texture2D> backBuffer;
-    hr = swapChain1->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-    if (FAILED(hr)) return 5;
-
     ComPtr<ID3D11RenderTargetView> rtv;
-    hr = device->CreateRenderTargetView(backBuffer.Get(), nullptr, &rtv);
-    if (FAILED(hr)) return 6;
+    auto createBackBufferRTV = [&]() -> bool {
+        rtv.Reset();
+        ComPtr<ID3D11Texture2D> bb;
+        if (FAILED(swapChain1->GetBuffer(0, IID_PPV_ARGS(&bb))))
+            return false;
+        return SUCCEEDED(device->CreateRenderTargetView(bb.Get(), nullptr, &rtv));
+    };
+    if (!createBackBufferRTV())
+        return 6;
 
-    // Compile built-in synthetic test scene shader
     ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
     hr = D3DCompile(g_SceneShaderHLSL, std::strlen(g_SceneShaderHLSL), "Scene.hlsl", nullptr, nullptr,
                     "VSMain", "vs_5_0", 0, 0, &vsBlob, &errBlob);
-    if (FAILED(hr))
-    {
-        if (errBlob) std::fprintf(stderr, "VS compile error: %s\n", (const char *)errBlob->GetBufferPointer());
-        return 7;
-    }
+    if (FAILED(hr)) return 7;
     hr = D3DCompile(g_SceneShaderHLSL, std::strlen(g_SceneShaderHLSL), "Scene.hlsl", nullptr, nullptr,
                     "PSMain", "ps_5_0", 0, 0, &psBlob, &errBlob);
-    if (FAILED(hr))
-    {
-        if (errBlob) std::fprintf(stderr, "PS compile error: %s\n", (const char *)errBlob->GetBufferPointer());
-        return 8;
-    }
+    if (FAILED(hr)) return 8;
 
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
@@ -372,7 +476,7 @@ int main(int argc, char **argv)
             if (msg.message == WM_QUIT)
             {
                 running = false;
-                exitCode = 10; // Aborted by user
+                exitCode = cfg.benchMode ? 10 : 0;
                 break;
             }
             TranslateMessage(&msg);
@@ -380,7 +484,22 @@ int main(int argc, char **argv)
         }
         if (!running) break;
 
-        if (FileExists(cfg.doneFile))
+        if (!cfg.benchMode && winState.needsResize)
+        {
+            winState.needsResize = false;
+            context->OMSetRenderTargets(0, nullptr, nullptr);
+            rtv.Reset();
+            if (SUCCEEDED(swapChain1->ResizeBuffers(0, winState.pendingWidth, winState.pendingHeight, DXGI_FORMAT_UNKNOWN, scFlags)))
+            {
+                if (swapChain3)
+                    swapChain3->SetColorSpace1(colorSpace);
+                createBackBufferRTV();
+                vp.Width = static_cast<float>(winState.pendingWidth);
+                vp.Height = static_cast<float>(winState.pendingHeight);
+            }
+        }
+
+        if (cfg.benchMode && FileExists(cfg.doneFile))
         {
             std::printf("[BenchmarkHost] Completion flag detected after %llu frames. Exiting cleanly.\n",
                         (unsigned long long)frameCount);
@@ -421,8 +540,16 @@ int main(int argc, char **argv)
         context->PSSetConstantBuffers(0, 1, cbs);
         context->Draw(3, 0);
 
-        UINT presentFlags = allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        swapChain1->Present(0, presentFlags);
+        if (cfg.benchMode)
+        {
+            UINT presentFlags = allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+            swapChain1->Present(0, presentFlags);
+        }
+        else
+        {
+            // VSync ON in interactive mode keeps CPU/GPU cool and ReShade overlay input 100% responsive.
+            swapChain1->Present(1, 0);
+        }
         ++frameCount;
     }
 

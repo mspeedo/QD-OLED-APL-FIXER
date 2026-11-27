@@ -501,6 +501,16 @@ static void FinishCurrentCase(reshade::api::effect_runtime *runtime, BenchRuntim
 static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
 {
     auto &data = *runtime->create_private_data<BenchRuntimeData>();
+
+    char autoEnv[16] = {};
+    DWORD envLen = GetEnvironmentVariableA("SHADER_BENCH_AUTO", autoEnv, static_cast<DWORD>(sizeof(autoEnv)));
+    if (envLen == 0 || std::strcmp(autoEnv, "1") != 0)
+    {
+        data.enabled = false;
+        reshade::log::message(reshade::log::level::info, "[ShaderBench] Interactive mode (SHADER_BENCH_AUTO != 1); add-on idle.");
+        return;
+    }
+
     if (!LoadBenchConfig("bench_config.txt", data.cfg))
     {
         data.enabled = false;

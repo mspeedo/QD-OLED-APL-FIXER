@@ -60,6 +60,7 @@ jobs:
 
           cmd /c "git show origin/main:Shaders/EOTF_Boost_X36.fx > dist\shaders_main\EOTF_Boost_X36.fx"
           cmd /c "git show origin/test/x36-refactor-structure:Shaders/EOTF_Boost_X36.fx > dist\shaders_new\EOTF_Boost_X36.fx"
+          Copy-Item dist\shaders_new\EOTF_Boost_X36.fx dist\Shaders\EOTF_Boost_X36.fx
 
           Get-ChildItem -Recurse dist | Select-Object FullName, Length
 
