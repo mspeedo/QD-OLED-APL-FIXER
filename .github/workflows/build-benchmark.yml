@@ -1,0 +1,71 @@
+name: Build Windows Shader Benchmark Suite
+
+on:
+  push:
+    branches:
+      - tools/shader-benchmark
+  workflow_dispatch:
+
+jobs:
+  build-win64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch official ReShade SDK headers & ReShade.fxh
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/crosire/reshade.git _deps/reshade
+          git clone --depth 1 --branch slim https://github.com/crosire/reshade-shaders.git _deps/reshade-shaders
+
+      - name: Setup MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile BenchmarkHost.exe and ShaderBench.addon64
+        shell: cmd
+        run: |
+          mkdir dist
+          mkdir dist\Shaders
+          mkdir dist\Textures
+          mkdir dist\shaders_main
+          mkdir dist\shaders_new
+
+          cl /nologo /O2 /EHsc /W3 /std:c++17 /Fe:dist\BenchmarkHost.exe tools\benchmark\BenchmarkHost.cpp d3d11.lib dxgi.lib d3dcompiler.lib user32.lib
+          if errorlevel 1 exit /b 1
+
+          cl /nologo /O2 /EHsc /W3 /std:c++17 /LD /I _deps\reshade\include /Fe:dist\ShaderBench.addon64 tools\benchmark\ShaderBenchAddon.cpp user32.lib
+          if errorlevel 1 exit /b 1
+
+          del /Q *.obj *.exp *.lib 2>nul
+          del /Q dist\*.exp dist\*.lib 2>nul
+
+      - name: Stage benchmark scripts, configs, ReShade headers, and both shader versions
+        shell: pwsh
+        run: |
+          Copy-Item tools\benchmark\ReShade.ini dist\
+          Copy-Item tools\benchmark\bench_cases_pq.txt dist\
+          Copy-Item tools\benchmark\bench_cases_scrgb.txt dist\
+          Copy-Item tools\benchmark\bench_cases_sdr.txt dist\
+          Copy-Item tools\benchmark\compare_results.ps1 dist\
+          Copy-Item tools\benchmark\run_compare.bat dist\
+          Copy-Item tools\benchmark\README.txt dist\
+
+          Copy-Item _deps\reshade-shaders\Shaders\ReShade.fxh dist\Shaders\
+          Copy-Item _deps\reshade-shaders\Shaders\ReShadeUI.fxh dist\Shaders\
+
+          cmd /c "git show origin/main:Shaders/EOTF_Boost_X36.fx > dist\shaders_main\EOTF_Boost_X36.fx"
+          cmd /c "git show origin/test/x36-refactor-structure:Shaders/EOTF_Boost_X36.fx > dist\shaders_new\EOTF_Boost_X36.fx"
+
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
+      - name: Upload Windows Benchmark Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QD-OLED-Shader-Benchmark-win64
+          path: dist/
+          retention-days: 30
