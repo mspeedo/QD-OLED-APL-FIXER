@@ -1488,7 +1488,7 @@ float ComputeSceneBoostStrength(float currentAPL)
 #else
     float boostStrength = MaxAPLBoostStrength;
 #endif
-    return saturate(boostStrength);
+    return max(boostStrength, 0.0);
 }
 
 
@@ -1522,7 +1522,7 @@ float ComputeCandidateMaxLogGain()
     }
 #endif
 
-    return max(log2(maxComp) * saturate(maxStrength), 0.0);
+    return max(log2(maxComp) * max(maxStrength, 0.0), 0.0);
 }
 
 
