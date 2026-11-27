@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v9.6
+    EOTF Boost v9.7
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table:
@@ -810,6 +810,47 @@ storage2D<float> StorageAPLFastPQNits
     Texture = TexAPLFastPQNits;
 };
 
+// Frame-built 1024-entry PQ LUTs (4 KB each: linear nits decode and fused below-knee boosted PQ).
+texture TexPQFrameNits
+{
+    Width = 1024;
+    Height = 1;
+    Format = R32F;
+};
+sampler SamplerPQFrameNits
+{
+    Texture = TexPQFrameNits;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = POINT;
+};
+storage2D<float> StoragePQFrameNits
+{
+    Texture = TexPQFrameNits;
+};
+
+texture TexPQFrameBoost
+{
+    Width = 1024;
+    Height = 1;
+    Format = R32F;
+};
+sampler SamplerPQFrameBoost
+{
+    Texture = TexPQFrameBoost;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = POINT;
+};
+storage2D<float> StoragePQFrameBoost
+{
+    Texture = TexPQFrameBoost;
+};
+
 
 // Persistent row histograms. The count texture also stores the row maximum.
 texture TexAPLRowHistCount
@@ -966,6 +1007,10 @@ sampler SamplerHLPQ_A
     MagFilter = POINT;
     MipFilter = POINT;
 };
+storage2D<float> StorageHLPQ_A
+{
+    Texture = TexHLPQ_A;
+};
 
 texture TexHLPQ_B
 {
@@ -981,6 +1026,10 @@ sampler SamplerHLPQ_B
     MinFilter = POINT;
     MagFilter = POINT;
     MipFilter = POINT;
+};
+storage2D<float> StorageHLPQ_B
+{
+    Texture = TexHLPQ_B;
 };
 
 
@@ -1140,6 +1189,26 @@ float PQToLinearScalar(float v)
 float NitsToPQ(float nits)
 {
     return LinearToPQBT2100(saturate(nits / 10000.0));
+}
+
+float3 PQFrameLUT_ToNits(float3 pq)
+{
+    float3 u = saturate(pq) * (1023.0 / 1024.0) + (0.5 / 1024.0);
+    return float3(
+        tex2Dlod(SamplerPQFrameNits, float4(u.r, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameNits, float4(u.g, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameNits, float4(u.b, 0.5, 0.0, 0.0)).r
+    );
+}
+
+float3 PQFrameLUT_Boosted(float3 pq)
+{
+    float3 u = saturate(pq) * (1023.0 / 1024.0) + (0.5 / 1024.0);
+    return float3(
+        tex2Dlod(SamplerPQFrameBoost, float4(u.r, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameBoost, float4(u.g, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameBoost, float4(u.b, 0.5, 0.0, 0.0)).r
+    );
 }
 
 static const int APL_MODE_SCRGB   = 0;
@@ -1643,25 +1712,21 @@ float ComputeBoostedLumaNitsFromPrecomputedParams(float inputLumaNits, float4 bo
 float SampleHighlightBasePQ(int2 pixelCoord, float origPQ)
 {
     float2 fh = float2(pixelCoord) * 0.5;
-    int2 p0 = clamp(int2(floor(fh)), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
-    int2 p1 = min(p0 + int2(1, 1), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
-    float2 f = saturate(fh - float2(p0));
+    float2 p0 = clamp(floor(fh), 0.0.xx, float2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
+    float2 f = saturate(fh - p0);
 
-    float4 s = float4(
-        tex2Dfetch(SamplerHLPQ_A, int2(p0.x, p0.y)).r,
-        tex2Dfetch(SamplerHLPQ_A, int2(p1.x, p0.y)).r,
-        tex2Dfetch(SamplerHLPQ_A, int2(p0.x, p1.y)).r,
-        tex2Dfetch(SamplerHLPQ_A, int2(p1.x, p1.y)).r
-    );
+    // GatherRed order: .x=(p0.x, p0.y+1), .y=(p0.x+1, p0.y+1), .z=(p0.x+1, p0.y), .w=(p0.x, p0.y).
+    float2 gatherUV = (p0 + 1.0) / float2(APL_HL_WIDTH, APL_HL_HEIGHT);
+    float4 s = tex2DgatherR(SamplerHLPQ_A, gatherUV);
 
     float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
     float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
     float4 d = s - origPQ.xxxx;
     float4 bw = float4(
-        (1.0 - f.x) * (1.0 - f.y),
-        f.x * (1.0 - f.y),
         (1.0 - f.x) * f.y,
-        f.x * f.y
+        f.x * f.y,
+        f.x * (1.0 - f.y),
+        (1.0 - f.x) * (1.0 - f.y)
     );
     float4 w = bw * exp2(-(d * d) * inv2R2Log2);
     float sumW = dot(w, 1.0.xxxx);
@@ -1853,7 +1918,7 @@ float3 HDRSaturationBuffer(float3 color)
     if (ResolveEffectiveAPLInputMode() != APL_MODE_PQ)
         return HDRSaturationLinearRGB(color, false);
 
-    float3 nits = PQToLinearBT2100(color) * 10000.0;
+    float3 nits = PQFrameLUT_ToNits(color);
     float3 adjusted = HDRSaturationLinearRGB(nits, true);
     if (all(adjusted == nits))
         return color;
@@ -1861,7 +1926,7 @@ float3 HDRSaturationBuffer(float3 color)
     return LinearToPQBT2100(adjusted / 10000.0);
 }
 
-float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, float boostedKneeNits, int2 pixelCoord)
+float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, float boostedKneeNits, float sourceKneePQ, int2 pixelCoord)
 {
     float3 result = color;
 
@@ -1871,32 +1936,40 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, float booste
     }
     else if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
     {
-        float3 linearColorNits = PQToLinearBT2100(saturate(color)) * 10000.0;
-        float originalLumaNits = max(GetLuma2020(linearColorNits), 0.0);
-
-        if (originalLumaNits <= 1e-6)
+        float3 satColor = saturate(color);
+        if (HDRSaturationPercent == 100 && !EnableColorPreservingBoostMode && (boostParams.g <= 0.0 || Max3(satColor) <= sourceKneePQ))
         {
-            result = HDRSaturationBuffer(color);
+            result = PQFrameLUT_Boosted(satColor);
         }
         else
         {
-            float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, boostedKneeNits, pixelCoord);
-            float colorScale = boostedLumaNits / originalLumaNits;
+            float3 linearColorNits = PQFrameLUT_ToNits(satColor);
+            float originalLumaNits = max(GetLuma2020(linearColorNits), 0.0);
 
-            if (EnableColorPreservingBoostMode)
+            if (originalLumaNits <= 1e-6)
             {
-                float outputChannelLimitNits = (BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0;
-                float maxHuePreservingScale = ComputeMaxHuePreservingScale(linearColorNits, outputChannelLimitNits);
-                colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+                result = HDRSaturationBuffer(color);
             }
+            else
+            {
+                float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, boostedKneeNits, pixelCoord);
+                float colorScale = boostedLumaNits / originalLumaNits;
 
-            float3 boostedColorNits = linearColorNits * colorScale;
+                if (EnableColorPreservingBoostMode)
+                {
+                    float outputChannelLimitNits = (BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0;
+                    float maxHuePreservingScale = ComputeMaxHuePreservingScale(linearColorNits, outputChannelLimitNits);
+                    colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+                }
 
-            // Clamp boosted PQ luminance to [0, 10000] nits before adjusting chroma.
-            if (HDRSaturationPercent != 100)
-                boostedColorNits = HDRSaturationLinearRGB(clamp(boostedColorNits, 0.0, 10000.0), true);
+                float3 boostedColorNits = linearColorNits * colorScale;
 
-            result = LinearToPQBT2100(saturate(max(boostedColorNits, 0.0) / 10000.0));
+                // Clamp boosted PQ luminance to [0, 10000] nits before adjusting chroma.
+                if (HDRSaturationPercent != 100)
+                    boostedColorNits = HDRSaturationLinearRGB(clamp(boostedColorNits, 0.0, 10000.0), true);
+
+                result = LinearToPQBT2100(saturate(max(boostedColorNits, 0.0) / 10000.0));
+            }
         }
     }
     else
@@ -3241,6 +3314,7 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
 
 groupshared float4 APL_EvalWeightedMetrics[APL_FFH_MAX_BINS];
 groupshared float APL_EvalPixelCount[APL_FFH_MAX_BINS];
+groupshared float APL_FrameLutGain;
 
 #define APL_REDUCE_EVAL_STAGE(S) \
     if (localIndex < S) { \
@@ -3249,7 +3323,7 @@ groupshared float APL_EvalPixelCount[APL_FFH_MAX_BINS];
     } \
     barrier();
 
-void UpdateSmoothedLogGain(float targetAPL, float previousLogGain, bool hasHistory)
+float UpdateSmoothedLogGain(float targetAPL, float previousLogGain, bool hasHistory)
 {
     float targetLogGain = ComputeSceneLogGainFromAPL(targetAPL);
     float smoothedLogGain = targetLogGain;
@@ -3271,12 +3345,14 @@ void UpdateSmoothedLogGain(float targetAPL, float previousLogGain, bool hasHisto
             smoothedLogGain = targetLogGain;
     }
 
+    float4 finalParams = ComputeBoostRolloffParamsFromSceneLogGain(smoothedLogGain);
     tex2Dstore(StorageAPL, int2(0, 0), float4(targetAPL, targetAPL, 1.0, smoothedLogGain));
-    tex2Dstore(StorageBoostParams, int2(0, 0), ComputeBoostRolloffParamsFromSceneLogGain(smoothedLogGain));
+    tex2Dstore(StorageBoostParams, int2(0, 0), finalParams);
+    return finalParams.r;
 }
 
 [shader("compute")]
-// Pass 4: evaluate response, solve APL, smooth state, and write boost parameters.
+// Pass 4: evaluate response, solve APL, smooth state, write boost parameters, and build 1024-entry PQ frame LUT.
 void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
 {
     bool aplActive = NeedsAPLProcessing();
@@ -3289,6 +3365,17 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             tex2Dstore(StorageAPL, int2(0, 0), 0.0.xxxx);
             tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
         }
+        if (IsShaderActiveForInputMode() && (ResolveEffectiveAPLInputMode() == APL_MODE_PQ) && (HDRSaturationPercent != 100))
+        {
+            [unroll]
+            for (int k = 0; k < 4; ++k)
+            {
+                int idx = localIndex + k * 256;
+                float pqCode = float(idx) * (1.0 / 1023.0);
+                float nits = PQToLinearScalar(pqCode) * 10000.0;
+                tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
+            }
+        }
         return;
     }
 
@@ -3297,27 +3384,12 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     int activeBins = colorHistogram ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
 
     float4 prevData = tex2Dfetch(SamplerAPLPrev, int2(0, 0));
-    if (prevData.g < 0.0)
-    {
-        if (localIndex == 0)
-        {
-            if (boostActive)
-            {
-                UpdateSmoothedLogGain(prevData.r, prevData.a, prevData.b > 0.0);
-            }
-            else
-            {
-                tex2Dstore(StorageAPL, int2(0, 0), float4(prevData.r, prevData.r, 1.0, 0.0));
-                tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
-            }
-        }
-        return;
-    }
+    bool runHistogram = (prevData.g >= 0.0);
 
     float4 weighted = 0.0.xxxx;
     float pixelCount = 0.0;
 
-    if (localIndex < activeBins)
+    if (runHistogram && localIndex < activeBins)
     {
         int2 binCoord = APL_HistogramBlockCoord(localIndex);
         int pixelCountI = tex2Dfetch(SamplerAPLGlobalHistCount, binCoord);
@@ -3362,40 +3434,78 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
 
     if (localIndex == 0)
     {
-        float rawAPL = 0.0;
-        float3 responseNodes = 0.0.xxx;
-        float exactRollingMaxNits = 0.0;
-        float totalPixelCount = APL_EvalPixelCount[0];
+        float frameGain = 1.0;
 
-        if (totalPixelCount > 0.0)
+        if (!runHistogram)
         {
-            float4 averages = APL_EvalWeightedMetrics[0] / totalPixelCount;
-            rawAPL = saturate(averages.r);
-            responseNodes = saturate(averages.gba);
-            exactRollingMaxNits = ShowOSD
-                ? float(tex2Dfetch(SamplerAPLGlobalHistCount, APL_GlobalExactMaxLumaCoord())) * 0.25
-                : 0.0;
-        }
-
-        int currentRollingPhase = APL_DecodeStoredRollingPhase(prevData.g);
-        int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
-
-        tex2Dstore(
-            StorageAPLInstant,
-            int2(0, 0),
-            float4(rawAPL, exactRollingMaxNits, float(nextRollingPhase), (totalPixelCount > 0.0) ? 1.0 : 0.0)
-        );
-
-        if (boostActive)
-        {
-            float gMax = ComputeCandidateMaxLogGain();
-            float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
-            UpdateSmoothedLogGain(currentDisplayAPL, prevData.a, prevData.b > 0.0);
+            if (boostActive)
+            {
+                frameGain = UpdateSmoothedLogGain(prevData.r, prevData.a, prevData.b > 0.0);
+            }
+            else
+            {
+                tex2Dstore(StorageAPL, int2(0, 0), float4(prevData.r, prevData.r, 1.0, 0.0));
+                tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
+            }
         }
         else
         {
-            tex2Dstore(StorageAPL, int2(0, 0), float4(rawAPL, rawAPL, 1.0, 0.0));
-            tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
+            float rawAPL = 0.0;
+            float3 responseNodes = 0.0.xxx;
+            float exactRollingMaxNits = 0.0;
+            float totalPixelCount = APL_EvalPixelCount[0];
+
+            if (totalPixelCount > 0.0)
+            {
+                float4 averages = APL_EvalWeightedMetrics[0] / totalPixelCount;
+                rawAPL = saturate(averages.r);
+                responseNodes = saturate(averages.gba);
+                exactRollingMaxNits = ShowOSD
+                    ? float(tex2Dfetch(SamplerAPLGlobalHistCount, APL_GlobalExactMaxLumaCoord())) * 0.25
+                    : 0.0;
+            }
+
+            int currentRollingPhase = APL_DecodeStoredRollingPhase(prevData.g);
+            int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
+
+            tex2Dstore(
+                StorageAPLInstant,
+                int2(0, 0),
+                float4(rawAPL, exactRollingMaxNits, float(nextRollingPhase), (totalPixelCount > 0.0) ? 1.0 : 0.0)
+            );
+
+            if (boostActive)
+            {
+                float gMax = ComputeCandidateMaxLogGain();
+                float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
+                frameGain = UpdateSmoothedLogGain(currentDisplayAPL, prevData.a, prevData.b > 0.0);
+            }
+            else
+            {
+                tex2Dstore(StorageAPL, int2(0, 0), float4(rawAPL, rawAPL, 1.0, 0.0));
+                tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
+            }
+        }
+
+        APL_FrameLutGain = frameGain;
+    }
+    barrier();
+
+    if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
+    {
+        float frameGain = max(APL_FrameLutGain, 0.0);
+        bool buildFusedBoost = (frameGain > 1.000001) && (HDRSaturationPercent == 100) && !EnableColorPreservingBoostMode;
+        [unroll]
+        for (int k = 0; k < 4; ++k)
+        {
+            int idx = localIndex + k * 256;
+            float pqCode = float(idx) * (1.0 / 1023.0);
+            float nits = PQToLinearScalar(pqCode) * 10000.0;
+            float boostedPQ = buildFusedBoost
+                ? LinearToPQBT2100(saturate((nits * frameGain) / 10000.0))
+                : pqCode;
+            tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
+            tex2Dstore(StoragePQFrameBoost, int2(idx, 0), boostedPQ);
         }
     }
 }
@@ -3592,7 +3702,9 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
 // 9. HIGHLIGHT DETAIL RECOVERY PASSES (PASS 5)
 // ============================================================================
 
-// Pass 5: half-resolution PQ extract and separable bilateral filter for highlight detail recovery.
+// Pass 5: half-resolution fused PQ extract + separable groupshared bilateral filter for highlight detail recovery.
+#define APL_HL_HALO 24
+
 float ComputeHighlightDetailSourceKneePQ(float4 boostParams)
 {
     float boostedKneePQ = saturate(boostParams.b) * boostParams.g + PQ_BLACK;
@@ -3600,117 +3712,215 @@ float ComputeHighlightDetailSourceKneePQ(float4 boostParams)
     return NitsToPQ(sourceKneeNits);
 }
 
-// Cull the fullscreen triangle off-screen when highlight detail recovery is inactive
-// so zero pixel shader threads or render-target writes run when boost/recovery is off
-// or in dark scenes. Also hoists sourceKneePQ out of the bilateral pixel shaders.
-void VS_HL_Pass(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 hlParams : TEXCOORD0)
+float HL_ExtractPQAt(int hx, int hy, bool isPQ)
 {
-    if (!IsEOTFBoostActive() || !EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4 || BoostRollOff <= 0.0)
-    {
-        hlParams = 0.0.xx;
-        position = float4(-2.0, -2.0, 0.0, 1.0);
-        return;
-    }
-
-    float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-    if (!IsHighlightDetailActive(boostParams))
-    {
-        hlParams = 0.0.xx;
-        position = float4(-2.0, -2.0, 0.0, 1.0);
-        return;
-    }
-
-    float2 uv = float2((id == 2) ? 2.0 : 0.0, (id == 1) ? 2.0 : 0.0);
-    hlParams = float2(ComputeHighlightDetailSourceKneePQ(boostParams), 0.0);
-    position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-}
-
-float4 PS_HL_ExtractPQ(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) : SV_Target
-{
-    int2 pHalf = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
+    int2 pHalf = clamp(int2(hx, hy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
     int2 pFull = min(pHalf * 2, int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
     float3 color = tex2Dfetch(ReShade::BackBuffer, pFull).rgb;
-    float sceneNits = (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
-        ? max(GetLuma2020(APL_FastPQToNits(color)), 0.0)
+    float sceneNits = isPQ
+        ? max(GetLuma2020(PQFrameLUT_ToNits(color)), 0.0)
         : max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
-
-    return float4(NitsToPQ(sceneNits), 0.0, 0.0, 1.0);
+    return NitsToPQ(sceneNits);
 }
 
-float4 PS_HL_BilateralH(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) : SV_Target
+groupshared float HL_TileRow[256 + APL_HL_HALO * 2];
+groupshared uint HL_RowHasBright;
+groupshared float HL_SourceKneePQ_H;
+
+[shader("compute")]
+void CS_HL_ExtractAndBilateralH(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
 {
-    int2 p = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
-    float centerPQ = tex2Dfetch(SamplerHLPQ_A, p).r;
+    if (!IsEOTFBoostActive() || !EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4 || BoostRollOff <= 0.0)
+        return;
+
+    float4 boostParams = tex2Dfetch(SamplerBoostParams, int2(0, 0));
+    if (!IsHighlightDetailActive(boostParams))
+        return;
+
+    int lx = int(threadID.x);
+    int groupBaseX = int(groupID.x) * 256;
+    int groupBaseY = int(groupID.y) * 8;
+    int hx = groupBaseX + lx;
+
+    bool isPQ = (ResolveEffectiveAPLInputMode() == APL_MODE_PQ);
     float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
-    float sourceKneePQ = hlParams.x;
-
-    if (centerPQ < sourceKneePQ - 3.0 * sigmaR)
-        return float4(centerPQ, 0.0, 0.0, 1.0);
-
     float stepHalf = max(HIGHLIGHT_DETAIL_RADIUS, 0.5) * 0.85;
+    int maxOff = min(max(1, int(round(7.0 * stepHalf))), APL_HL_HALO);
+    const float inv2S2Log2 = 0.05888551; // 0.5 * log2(e) / (3.5 * 3.5)
+    float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
+    int sIdx = APL_HL_HALO + lx;
+
+    if (lx == 0)
+        HL_SourceKneePQ_H = ComputeHighlightDetailSourceKneePQ(boostParams);
+    barrier();
+
+    float hThresh = HL_SourceKneePQ_H - 3.0 * sigmaR;
+
+    [loop]
+    for (int rowOffset = 0; rowOffset < 8; ++rowOffset)
+    {
+        int hy = groupBaseY + rowOffset;
+
+        if (lx == 0)
+            HL_RowHasBright = 0u;
+        barrier();
+
+        float centerPQ = 0.0;
+        if (hy < APL_HL_HEIGHT)
+        {
+            centerPQ = HL_ExtractPQAt(hx, hy, isPQ);
+            HL_TileRow[sIdx] = centerPQ;
+            if (hx < APL_HL_WIDTH && centerPQ >= hThresh)
+                atomicOr(HL_RowHasBright, 1u);
+        }
+        barrier();
+
+        if (hy < APL_HL_HEIGHT && HL_RowHasBright != 0u && lx < maxOff)
+        {
+            HL_TileRow[APL_HL_HALO - 1 - lx] = HL_ExtractPQAt(groupBaseX - 1 - lx, hy, isPQ);
+            HL_TileRow[APL_HL_HALO + 256 + lx] = HL_ExtractPQAt(groupBaseX + 256 + lx, hy, isPQ);
+        }
+        barrier();
+
+        if (hy < APL_HL_HEIGHT && hx < APL_HL_WIDTH)
+        {
+            float outPQ = centerPQ;
+            if (centerPQ >= hThresh)
+            {
+                float sumVal = centerPQ;
+                float sumW = 1.0;
+                [unroll]
+                for (int k = 1; k <= 7; ++k)
+                {
+                    int off = min(max(1, int(round(float(k) * stepHalf))), APL_HL_HALO);
+                    float spatialTerm = float(k * k) * inv2S2Log2;
+
+                    float sPos = HL_TileRow[sIdx + off];
+                    float dPos = sPos - centerPQ;
+                    float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
+                    sumVal += sPos * wPos;
+                    sumW += wPos;
+
+                    float sNeg = HL_TileRow[sIdx - off];
+                    float dNeg = sNeg - centerPQ;
+                    float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
+                    sumVal += sNeg * wNeg;
+                    sumW += wNeg;
+                }
+                outPQ = sumVal / sumW;
+            }
+
+            tex2Dstore(StorageHLPQ_B, int2(hx, hy), outPQ);
+        }
+    }
+}
+
+groupshared float HL_TileCol[(128 + APL_HL_HALO * 2) * 16];
+groupshared uint HL_TileHasBright;
+groupshared float HL_SourceKneePQ_V;
+
+[shader("compute")]
+void CS_HL_BilateralV(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    if (!IsEOTFBoostActive() || !EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4 || BoostRollOff <= 0.0)
+        return;
+
+    float4 boostParams = tex2Dfetch(SamplerBoostParams, int2(0, 0));
+    if (!IsHighlightDetailActive(boostParams))
+        return;
+
+    int tx = int(threadID.x);
+    int ty = int(threadID.y);
+    int groupBaseX = int(groupID.x) * 16;
+    int groupBaseY = int(groupID.y) * 128;
+    int hx = groupBaseX + tx;
+    int clampedX = min(hx, APL_HL_WIDTH - 1);
+
+    float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
+    float stepHalf = max(HIGHLIGHT_DETAIL_RADIUS, 0.5) * 0.85;
+    int maxOff = min(max(1, int(round(7.0 * stepHalf))), APL_HL_HALO);
+
+    if (tx == 0 && ty == 0)
+    {
+        HL_TileHasBright = 0u;
+        HL_SourceKneePQ_V = ComputeHighlightDetailSourceKneePQ(boostParams);
+    }
+    barrier();
+
+    float vThresh = HL_SourceKneePQ_V - 0.015;
+    bool hasBright = false;
+
+    [unroll]
+    for (int r = 0; r < 8; ++r)
+    {
+        int ly = ty + r * 16;
+        int hy = groupBaseY + ly;
+        float v = tex2Dfetch(SamplerHLPQ_B, int2(clampedX, min(hy, APL_HL_HEIGHT - 1))).r;
+        HL_TileCol[(APL_HL_HALO + ly) * 16 + tx] = v;
+        if (hx < APL_HL_WIDTH && hy < APL_HL_HEIGHT && v >= vThresh)
+            hasBright = true;
+    }
+    if (hasBright)
+        atomicOr(HL_TileHasBright, 1u);
+    barrier();
+
+    if (HL_TileHasBright != 0u)
+    {
+        for (int h = ty; h < maxOff; h += 16)
+        {
+            int hyTop = max(groupBaseY - 1 - h, 0);
+            int hyBot = min(groupBaseY + 128 + h, APL_HL_HEIGHT - 1);
+            HL_TileCol[(APL_HL_HALO - 1 - h) * 16 + tx] = tex2Dfetch(SamplerHLPQ_B, int2(clampedX, hyTop)).r;
+            HL_TileCol[(APL_HL_HALO + 128 + h) * 16 + tx] = tex2Dfetch(SamplerHLPQ_B, int2(clampedX, hyBot)).r;
+        }
+    }
+    barrier();
+
+    if (hx >= APL_HL_WIDTH)
+        return;
+
     const float inv2S2Log2 = 0.05888551; // 0.5 * log2(e) / (3.5 * 3.5)
     float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
 
-    float sumVal = centerPQ;
-    float sumW = 1.0;
     [unroll]
-    for (int k = 1; k <= 7; ++k)
+    for (int r = 0; r < 8; ++r)
     {
-        int off = max(1, int(round(float(k) * stepHalf)));
-        float spatialTerm = float(k * k) * inv2S2Log2;
+        int ly = ty + r * 16;
+        int hy = groupBaseY + ly;
+        if (hy < APL_HL_HEIGHT)
+        {
+            int sy = APL_HL_HALO + ly;
+            float centerPQ = HL_TileCol[sy * 16 + tx];
+            float outPQ = centerPQ;
 
-        float sPos = tex2Dfetch(SamplerHLPQ_A, int2(min(p.x + off, APL_HL_WIDTH - 1), p.y)).r;
-        float dPos = sPos - centerPQ;
-        float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
-        sumVal += sPos * wPos;
-        sumW += wPos;
+            if (centerPQ >= vThresh)
+            {
+                float sumVal = centerPQ;
+                float sumW = 1.0;
+                [unroll]
+                for (int k = 1; k <= 7; ++k)
+                {
+                    int off = min(max(1, int(round(float(k) * stepHalf))), APL_HL_HALO);
+                    float spatialTerm = float(k * k) * inv2S2Log2;
 
-        float sNeg = tex2Dfetch(SamplerHLPQ_A, int2(max(p.x - off, 0), p.y)).r;
-        float dNeg = sNeg - centerPQ;
-        float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
-        sumVal += sNeg * wNeg;
-        sumW += wNeg;
+                    float sPos = HL_TileCol[(sy + off) * 16 + tx];
+                    float dPos = sPos - centerPQ;
+                    float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
+                    sumVal += sPos * wPos;
+                    sumW += wPos;
+
+                    float sNeg = HL_TileCol[(sy - off) * 16 + tx];
+                    float dNeg = sNeg - centerPQ;
+                    float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
+                    sumVal += sNeg * wNeg;
+                    sumW += wNeg;
+                }
+                outPQ = sumVal / sumW;
+            }
+
+            tex2Dstore(StorageHLPQ_A, int2(hx, hy), outPQ);
+        }
     }
-
-    return float4(sumVal / sumW, 0.0, 0.0, 1.0);
-}
-
-float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) : SV_Target
-{
-    int2 p = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
-    float centerPQ = tex2Dfetch(SamplerHLPQ_B, p).r;
-    float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
-    float sourceKneePQ = hlParams.x;
-
-    if (centerPQ < sourceKneePQ - 0.015)
-        return float4(centerPQ, 0.0, 0.0, 1.0);
-
-    float stepHalf = max(HIGHLIGHT_DETAIL_RADIUS, 0.5) * 0.85;
-    const float inv2S2Log2 = 0.05888551; // 0.5 * log2(e) / (3.5 * 3.5)
-    float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
-
-    float sumVal = centerPQ;
-    float sumW = 1.0;
-    [unroll]
-    for (int k = 1; k <= 7; ++k)
-    {
-        int off = max(1, int(round(float(k) * stepHalf)));
-        float spatialTerm = float(k * k) * inv2S2Log2;
-
-        float sPos = tex2Dfetch(SamplerHLPQ_B, int2(p.x, min(p.y + off, APL_HL_HEIGHT - 1))).r;
-        float dPos = sPos - centerPQ;
-        float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
-        sumVal += sPos * wPos;
-        sumW += wPos;
-
-        float sNeg = tex2Dfetch(SamplerHLPQ_B, int2(p.x, max(p.y - off, 0))).r;
-        float dNeg = sNeg - centerPQ;
-        float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
-        sumVal += sNeg * wNeg;
-        sumW += wNeg;
-    }
-
-    return float4(sumVal / sumW, 0.0, 0.0, 1.0);
 }
 
 
@@ -3734,6 +3944,7 @@ void VS_MainPass(
     float4 aplData = 0.0.xxxx;
     float4 boostParams = float4(1.0, 0.0, 1.0, 0.0);
     float boostedKneeNits = 0.0;
+    float sourceKneePQ = 1.0;
 
     if (boostActive)
     {
@@ -3745,6 +3956,7 @@ void VS_MainPass(
             {
                 float kneePQ = saturate(saturate(boostParams.b) * boostParams.g + PQ_BLACK);
                 boostedKneeNits = PQToLinearScalar(kneePQ) * 10000.0;
+                sourceKneePQ = NitsToPQ(boostedKneeNits / max(boostParams.r, 1.0));
             }
         }
     }
@@ -3764,7 +3976,7 @@ void VS_MainPass(
     }
 
     outBoostParams = boostParams;
-    outMainMeta = float4(aplData.g, aplData.a, boostedKneeNits, 0.0);
+    outMainMeta = float4(aplData.g, aplData.a, boostedKneeNits, sourceKneePQ);
 
     if (!needsMainPass)
     {
@@ -3796,7 +4008,7 @@ float4 PS_MainPass(
         if (boostActive && mainMeta.y > 1e-6)
         {
             int2 pixelCoord = clamp(int2(vpos.xy), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
-            finalColor = ApplyBoostAndHDRSaturation(color, boostParams, mainMeta.z, pixelCoord);
+            finalColor = ApplyBoostAndHDRSaturation(color, boostParams, mainMeta.z, mainMeta.w, pixelCoord);
         }
         else
         {
@@ -4213,25 +4425,22 @@ technique EOTF_Boost_1D_APL_LUT
     }
 #endif
 
-    pass HL_Extract_PQ
+    pass HL_Extract_And_Bilateral_H
     {
-        VertexShader = VS_HL_Pass;
-        PixelShader = PS_HL_ExtractPQ;
-        RenderTarget = TexHLPQ_A;
-    }
-
-    pass HL_Bilateral_H
-    {
-        VertexShader = VS_HL_Pass;
-        PixelShader = PS_HL_BilateralH;
-        RenderTarget = TexHLPQ_B;
+        ComputeShader = CS_HL_ExtractAndBilateralH<256, 1, 1>;
+        DispatchSizeX = (APL_HL_WIDTH + 255) / 256;
+        DispatchSizeY = (APL_HL_HEIGHT + 7) / 8;
+        DispatchSizeZ = 1;
+        GenerateMipMaps = false;
     }
 
     pass HL_Bilateral_V
     {
-        VertexShader = VS_HL_Pass;
-        PixelShader = PS_HL_BilateralV;
-        RenderTarget = TexHLPQ_A;
+        ComputeShader = CS_HL_BilateralV<16, 16, 1>;
+        DispatchSizeX = (APL_HL_WIDTH + 15) / 16;
+        DispatchSizeY = (APL_HL_HEIGHT + 127) / 128;
+        DispatchSizeZ = 1;
+        GenerateMipMaps = false;
     }
 
     pass Main_Boost

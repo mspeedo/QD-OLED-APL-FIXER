@@ -1,4 +1,4 @@
-# EOTF Boost v9.6 for the MSI MPG 341CQR QD-OLED X36
+# EOTF Boost v9.7 for the MSI MPG 341CQR QD-OLED X36
 
 This ReShade shader compensates for the X36’s APL-dependent HDR dimming. It estimates average picture level (APL) with a rolling full-frame histogram and uses the monitor’s measured brightness response to set the boost. Highlight roll-off fades the added gain to zero at the target luminance (1300 nits by default), and optional edge-aware bilateral highlight detail recovery preserves local highlight contrast inside the compressed roll-off shoulder.
 
