@@ -1914,7 +1914,7 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, int2 pixelCo
 
             float3 boostedColorNits = linearColorNits * colorScale;
 
-            // Match the original PQ boost output boundary before adjusting chroma.
+            // Clamp boosted PQ luminance to [0, 10000] nits before adjusting chroma.
             if (HDRSaturationPercent != 100)
                 boostedColorNits = HDRSaturationLinearRGB(clamp(boostedColorNits, 0.0, 10000.0), true);
 
@@ -4241,8 +4241,8 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
 #endif
 
 #if !HDR_PIPELINE_COMPILED
-// Lightweight SDR-only pass: never reads ReShade::BackBuffer (skips BackBuffer copy),
-// culls off-screen when OSD is hidden, and hardware-blends the SDR OSD when visible.
+// Lightweight SDR-only pass: strips HDR compute/bilateral passes, culls off-screen
+// when the OSD is hidden, and hardware-blends the SDR OSD when visible.
 void VS_SDR_OSD(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD0)
 {
     if (!ShowOSD)
