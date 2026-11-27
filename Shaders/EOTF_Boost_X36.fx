@@ -3725,6 +3725,7 @@ float HL_ExtractPQAt(int hx, int hy, bool isPQ)
 
 groupshared float HL_TileRow[256 + APL_HL_HALO * 2];
 groupshared uint HL_RowHasBright;
+groupshared float HL_SourceKneePQ_H;
 
 [shader("compute")]
 void CS_HL_ExtractAndBilateralH(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
@@ -3738,71 +3739,85 @@ void CS_HL_ExtractAndBilateralH(uint3 groupID : SV_GroupID, uint3 threadID : SV_
 
     int lx = int(threadID.x);
     int groupBaseX = int(groupID.x) * 256;
+    int groupBaseY = int(groupID.y) * 8;
     int hx = groupBaseX + lx;
-    int hy = int(groupID.y);
 
     bool isPQ = (ResolveEffectiveAPLInputMode() == APL_MODE_PQ);
     float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
-    float sourceKneePQ = ComputeHighlightDetailSourceKneePQ(boostParams);
-    float hThresh = sourceKneePQ - 3.0 * sigmaR;
     float stepHalf = max(HIGHLIGHT_DETAIL_RADIUS, 0.5) * 0.85;
     int maxOff = min(max(1, int(round(7.0 * stepHalf))), APL_HL_HALO);
+    const float inv2S2Log2 = 0.05888551; // 0.5 * log2(e) / (3.5 * 3.5)
+    float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
+    int sIdx = APL_HL_HALO + lx;
 
     if (lx == 0)
-        HL_RowHasBright = 0u;
+        HL_SourceKneePQ_H = ComputeHighlightDetailSourceKneePQ(boostParams);
     barrier();
 
-    float centerPQ = HL_ExtractPQAt(hx, hy, isPQ);
-    HL_TileRow[APL_HL_HALO + lx] = centerPQ;
-    if (hx < APL_HL_WIDTH && centerPQ >= hThresh)
-        HL_RowHasBright = 1u;
-    barrier();
+    float hThresh = HL_SourceKneePQ_H - 3.0 * sigmaR;
 
-    if (HL_RowHasBright != 0u && lx < maxOff)
+    [loop]
+    for (int rowOffset = 0; rowOffset < 8; ++rowOffset)
     {
-        HL_TileRow[APL_HL_HALO - 1 - lx] = HL_ExtractPQAt(groupBaseX - 1 - lx, hy, isPQ);
-        HL_TileRow[APL_HL_HALO + 256 + lx] = HL_ExtractPQAt(groupBaseX + 256 + lx, hy, isPQ);
-    }
-    barrier();
+        int hy = groupBaseY + rowOffset;
 
-    if (hx >= APL_HL_WIDTH)
-        return;
+        if (lx == 0)
+            HL_RowHasBright = 0u;
+        barrier();
 
-    float outPQ = centerPQ;
-    if (centerPQ >= hThresh)
-    {
-        const float inv2S2Log2 = 0.05888551; // 0.5 * log2(e) / (3.5 * 3.5)
-        float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
-        int sIdx = APL_HL_HALO + lx;
-
-        float sumVal = centerPQ;
-        float sumW = 1.0;
-        [unroll]
-        for (int k = 1; k <= 7; ++k)
+        float centerPQ = 0.0;
+        if (hy < APL_HL_HEIGHT)
         {
-            int off = min(max(1, int(round(float(k) * stepHalf))), APL_HL_HALO);
-            float spatialTerm = float(k * k) * inv2S2Log2;
-
-            float sPos = HL_TileRow[sIdx + off];
-            float dPos = sPos - centerPQ;
-            float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
-            sumVal += sPos * wPos;
-            sumW += wPos;
-
-            float sNeg = HL_TileRow[sIdx - off];
-            float dNeg = sNeg - centerPQ;
-            float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
-            sumVal += sNeg * wNeg;
-            sumW += wNeg;
+            centerPQ = HL_ExtractPQAt(hx, hy, isPQ);
+            HL_TileRow[sIdx] = centerPQ;
+            if (hx < APL_HL_WIDTH && centerPQ >= hThresh)
+                HL_RowHasBright = 1u;
         }
-        outPQ = sumVal / sumW;
-    }
+        barrier();
 
-    tex2Dstore(StorageHLPQ_B, int2(hx, hy), outPQ);
+        if (hy < APL_HL_HEIGHT && HL_RowHasBright != 0u && lx < maxOff)
+        {
+            HL_TileRow[APL_HL_HALO - 1 - lx] = HL_ExtractPQAt(groupBaseX - 1 - lx, hy, isPQ);
+            HL_TileRow[APL_HL_HALO + 256 + lx] = HL_ExtractPQAt(groupBaseX + 256 + lx, hy, isPQ);
+        }
+        barrier();
+
+        if (hy < APL_HL_HEIGHT && hx < APL_HL_WIDTH)
+        {
+            float outPQ = centerPQ;
+            if (centerPQ >= hThresh)
+            {
+                float sumVal = centerPQ;
+                float sumW = 1.0;
+                [unroll]
+                for (int k = 1; k <= 7; ++k)
+                {
+                    int off = min(max(1, int(round(float(k) * stepHalf))), APL_HL_HALO);
+                    float spatialTerm = float(k * k) * inv2S2Log2;
+
+                    float sPos = HL_TileRow[sIdx + off];
+                    float dPos = sPos - centerPQ;
+                    float wPos = exp2(-spatialTerm - (dPos * dPos) * inv2R2Log2);
+                    sumVal += sPos * wPos;
+                    sumW += wPos;
+
+                    float sNeg = HL_TileRow[sIdx - off];
+                    float dNeg = sNeg - centerPQ;
+                    float wNeg = exp2(-spatialTerm - (dNeg * dNeg) * inv2R2Log2);
+                    sumVal += sNeg * wNeg;
+                    sumW += wNeg;
+                }
+                outPQ = sumVal / sumW;
+            }
+
+            tex2Dstore(StorageHLPQ_B, int2(hx, hy), outPQ);
+        }
+    }
 }
 
-groupshared float HL_TileCol[(64 + APL_HL_HALO * 2) * 16];
+groupshared float HL_TileCol[(128 + APL_HL_HALO * 2) * 16];
 groupshared uint HL_TileHasBright;
+groupshared float HL_SourceKneePQ_V;
 
 [shader("compute")]
 void CS_HL_BilateralV(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
@@ -3817,22 +3832,25 @@ void CS_HL_BilateralV(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThrea
     int tx = int(threadID.x);
     int ty = int(threadID.y);
     int groupBaseX = int(groupID.x) * 16;
-    int groupBaseY = int(groupID.y) * 64;
+    int groupBaseY = int(groupID.y) * 128;
     int hx = groupBaseX + tx;
     int clampedX = min(hx, APL_HL_WIDTH - 1);
 
     float sigmaR = max(HIGHLIGHT_DETAIL_EDGE_SIGMA, 0.005);
-    float sourceKneePQ = ComputeHighlightDetailSourceKneePQ(boostParams);
-    float vThresh = sourceKneePQ - 0.015;
     float stepHalf = max(HIGHLIGHT_DETAIL_RADIUS, 0.5) * 0.85;
     int maxOff = min(max(1, int(round(7.0 * stepHalf))), APL_HL_HALO);
 
     if (tx == 0 && ty == 0)
+    {
         HL_TileHasBright = 0u;
+        HL_SourceKneePQ_V = ComputeHighlightDetailSourceKneePQ(boostParams);
+    }
     barrier();
 
+    float vThresh = HL_SourceKneePQ_V - 0.015;
+
     [unroll]
-    for (int r = 0; r < 4; ++r)
+    for (int r = 0; r < 8; ++r)
     {
         int ly = ty + r * 16;
         int hy = groupBaseY + ly;
@@ -3848,9 +3866,9 @@ void CS_HL_BilateralV(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThrea
         for (int h = ty; h < maxOff; h += 16)
         {
             int hyTop = max(groupBaseY - 1 - h, 0);
-            int hyBot = min(groupBaseY + 64 + h, APL_HL_HEIGHT - 1);
+            int hyBot = min(groupBaseY + 128 + h, APL_HL_HEIGHT - 1);
             HL_TileCol[(APL_HL_HALO - 1 - h) * 16 + tx] = tex2Dfetch(SamplerHLPQ_B, int2(clampedX, hyTop)).r;
-            HL_TileCol[(APL_HL_HALO + 64 + h) * 16 + tx] = tex2Dfetch(SamplerHLPQ_B, int2(clampedX, hyBot)).r;
+            HL_TileCol[(APL_HL_HALO + 128 + h) * 16 + tx] = tex2Dfetch(SamplerHLPQ_B, int2(clampedX, hyBot)).r;
         }
     }
     barrier();
@@ -3862,7 +3880,7 @@ void CS_HL_BilateralV(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThrea
     float inv2R2Log2 = 0.72134752 / (sigmaR * sigmaR);
 
     [unroll]
-    for (int r = 0; r < 4; ++r)
+    for (int r = 0; r < 8; ++r)
     {
         int ly = ty + r * 16;
         int hy = groupBaseY + ly;
@@ -4408,7 +4426,7 @@ technique EOTF_Boost_1D_APL_LUT
     {
         ComputeShader = CS_HL_ExtractAndBilateralH<256, 1, 1>;
         DispatchSizeX = (APL_HL_WIDTH + 255) / 256;
-        DispatchSizeY = APL_HL_HEIGHT;
+        DispatchSizeY = (APL_HL_HEIGHT + 7) / 8;
         DispatchSizeZ = 1;
         GenerateMipMaps = false;
     }
@@ -4417,7 +4435,7 @@ technique EOTF_Boost_1D_APL_LUT
     {
         ComputeShader = CS_HL_BilateralV<16, 16, 1>;
         DispatchSizeX = (APL_HL_WIDTH + 15) / 16;
-        DispatchSizeY = (APL_HL_HEIGHT + 63) / 64;
+        DispatchSizeY = (APL_HL_HEIGHT + 127) / 128;
         DispatchSizeZ = 1;
         GenerateMipMaps = false;
     }
