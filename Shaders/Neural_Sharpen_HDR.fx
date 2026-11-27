@@ -225,16 +225,16 @@ storage2D<float> StoragePQToLinearLUT
 int ResolveColorSpaceMode()
 {
 #if NSHDR_PIPELINE_COMPILED
-    if (ColorSpaceMode != 0)
-        return ColorSpaceMode;
-
 #if BUFFER_COLOR_SPACE == 3
-    return MODE_PQ;
+    int mode = MODE_PQ;
 #elif BUFFER_COLOR_SPACE == 2
-    return MODE_SCRGB;
+    int mode = MODE_SCRGB;
 #else
-    return MODE_SDR;
+    int mode = MODE_SDR;
 #endif
+    if (ColorSpaceMode != 0)
+        mode = ColorSpaceMode;
+    return mode;
 #else
     return MODE_SDR;
 #endif
@@ -301,18 +301,14 @@ float3 EncodeDebugGray(float gray, int mode)
 {
     float g = saturate(gray);
     float lin = (g <= 0.04045) ? (g / 12.92) : pow((g + 0.055) / 1.055, 2.4);
+    float3 result = g.xxx;
 
     if (mode == MODE_PQ)
-    {
-        float pq = LinearToPQScalar(lin * (DEBUG_HDR_WHITE_NITS / 10000.0));
-        return pq.xxx;
-    }
-    if (mode == MODE_SCRGB)
-    {
-        float sc = lin * (DEBUG_HDR_WHITE_NITS / 80.0);
-        return sc.xxx;
-    }
-    return g.xxx;
+        result = LinearToPQScalar(lin * (DEBUG_HDR_WHITE_NITS / 10000.0)).xxx;
+    else if (mode == MODE_SCRGB)
+        result = (lin * (DEBUG_HDR_WHITE_NITS / 80.0)).xxx;
+
+    return result;
 }
 #else
 float3 EncodeDebugGray(float gray, int mode)
@@ -540,11 +536,13 @@ min16float RunNeuralNet(
 #elif NEURAL_SHARPEN_MODEL == 2
     return RunModelB(p0, p1, p2, p3, p4, p5, p6, p7, p8);
 #else
+    min16float res = (min16float)0.0;
     [branch]
     if (ModelSelector == 0)
-        return RunModelA(p0, p1, p2, p3, p4, p5, p6, p7, p8);
+        res = RunModelA(p0, p1, p2, p3, p4, p5, p6, p7, p8);
     else
-        return RunModelB(p0, p1, p2, p3, p4, p5, p6, p7, p8);
+        res = RunModelB(p0, p1, p2, p3, p4, p5, p6, p7, p8);
+    return res;
 #endif
 }
 
@@ -554,20 +552,22 @@ min16float RunNeuralNet(
 // ============================================================================
 
 #if NSHDR_USE_PQ_LUT
-groupshared bool gs_PQLUTReady;
+groupshared bool gs_PQLUTSkip;
 
 void CS_InitPQLUT(uint3 tid : SV_DispatchThreadID)
 {
-    // Uniform early-out: skip entirely when bypassed or running in SDR mode.
-    if (!IsShaderActive() || (ResolveColorSpaceMode() == MODE_SDR))
-        return;
-
-    // Single-lane readiness check before barrier: race-free under D3D11/D3D12/Vulkan/OpenGL.
+    // Single-lane skip/readiness check before unconditional barrier:
+    // guarantees uniform sync convergence under FXC (no X3663), DXC, and Vulkan.
     if (tid.x == 0u)
-        gs_PQLUTReady = (tex2Dfetch(StoragePQToLinearLUT, int2(1023, 0)) > 0.5);
+    {
+        bool skipInit = !IsShaderActive() || (ResolveColorSpaceMode() == MODE_SDR);
+        if (!skipInit)
+            skipInit = (tex2Dfetch(StoragePQToLinearLUT, int2(1023, 0)) > 0.5);
+        gs_PQLUTSkip = skipInit;
+    }
     barrier();
 
-    if (gs_PQLUTReady)
+    if (gs_PQLUTSkip)
         return;
 
     [unroll]
