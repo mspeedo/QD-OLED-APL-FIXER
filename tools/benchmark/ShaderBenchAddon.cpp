@@ -81,7 +81,7 @@ enum class BenchState
     Done
 };
 
-struct BenchRuntimeData
+struct __declspec(uuid("7c4a9b12-8e34-4f1a-9d21-6c5e8a2f3b91")) BenchRuntimeData
 {
     bool enabled = false;
     BenchConfig cfg;
