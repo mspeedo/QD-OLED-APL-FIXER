@@ -65,13 +65,14 @@
     #define ENABLE_UI_TOOLTIPS 0
 #endif
 
-// 0 strips the HDR pipeline at compile time in SDR for minimal runtime cost.
-// 1 keeps the full pipeline compiled in SDR for manual PQ/scRGB override if a game misreports BUFFER_COLOR_SPACE.
+// 0 strips the HDR pipeline at compile time in confirmed SDR (BUFFER_COLOR_SPACE == 1) for minimal runtime cost,
+// while keeping the full pipeline compiled for HDR and Unknown (0, e.g. add-on custom render targets).
+// 1 keeps the full pipeline compiled in confirmed SDR as well for manual PQ/scRGB override.
 #ifndef ALLOW_SDR_MANUAL_OVERRIDE
     #define ALLOW_SDR_MANUAL_OVERRIDE 0
 #endif
 
-#if (BUFFER_COLOR_SPACE == 2) || (BUFFER_COLOR_SPACE == 3) || (ALLOW_SDR_MANUAL_OVERRIDE != 0)
+#if (BUFFER_COLOR_SPACE != 1) || (ALLOW_SDR_MANUAL_OVERRIDE != 0)
     #define HDR_PIPELINE_COMPILED 1
 #else
     #define HDR_PIPELINE_COMPILED 0
@@ -308,7 +309,7 @@ uniform int APLInputMode <
     ui_type = "combo";
     ui_items = "scRGB Normalized\0PQ Decoded Normalized\0Auto\0";
     ui_label = "APL Input Mode";
-    UI_TOOLTIP("Selects scRGB, PQ, or Auto detection from ReShade's buffer color space. Auto disables the shader in SDR; set ALLOW_SDR_MANUAL_OVERRIDE=1 to allow manual override in SDR.")
+    UI_TOOLTIP("Selects scRGB, PQ, or Auto detection from ReShade's buffer color space. Auto bypasses in SDR and Unknown; manual PQ/scRGB stays available in Unknown (set ALLOW_SDR_MANUAL_OVERRIDE=1 to also allow manual override in confirmed SDR).")
 > = 2;
 
 uniform float APLReferenceWhiteNits <
@@ -1141,9 +1142,10 @@ float NitsToPQ(float nits)
     return LinearToPQBT2100(saturate(nits / 10000.0));
 }
 
-static const int APL_MODE_SCRGB = 0;
-static const int APL_MODE_PQ    = 1;
-static const int APL_MODE_SDR   = 2;
+static const int APL_MODE_SCRGB   = 0;
+static const int APL_MODE_PQ      = 1;
+static const int APL_MODE_SDR     = 2;
+static const int APL_MODE_UNKNOWN = 3;
 
 int ResolveDetectedColorSpaceMode()
 {
@@ -1151,8 +1153,10 @@ int ResolveDetectedColorSpaceMode()
     return APL_MODE_SCRGB;
 #elif BUFFER_COLOR_SPACE == 3
     return APL_MODE_PQ;
-#else
+#elif BUFFER_COLOR_SPACE == 1
     return APL_MODE_SDR;
+#else
+    return APL_MODE_UNKNOWN;
 #endif
 }
 
@@ -1165,7 +1169,7 @@ int ResolveEffectiveAPLInputMode()
 
 bool IsShaderActiveForInputMode()
 {
-    return ResolveEffectiveAPLInputMode() != APL_MODE_SDR;
+    return ResolveEffectiveAPLInputMode() < APL_MODE_SDR;
 }
 
 bool IsEOTFBoostActive()
@@ -3521,6 +3525,7 @@ float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, fl
 #define OSD_CHAR_E 4
 #define OSD_CHAR_G 6
 #define OSD_CHAR_I 8
+#define OSD_CHAR_K 10
 #define OSD_CHAR_L 11
 #define OSD_CHAR_M 12
 #define OSD_CHAR_N 13
@@ -3549,6 +3554,7 @@ float GetOSDLetter(int letter, float2 uv)
     else if (letter == OSD_CHAR_E) pattern = 29391;
     else if (letter == OSD_CHAR_G) pattern = 25454;
     else if (letter == OSD_CHAR_I) pattern = 29847;
+    else if (letter == OSD_CHAR_K) pattern = 23277;
     else if (letter == OSD_CHAR_L) pattern = 4687;
     else if (letter == OSD_CHAR_M) pattern = 24557;
     else if (letter == OSD_CHAR_N) pattern = 24573;
@@ -3613,12 +3619,19 @@ float DrawOSDModeValue(float2 texcoord, float2 topRight, float scale, float step
         mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 3.0, 0.0), scale, aspect, OSD_CHAR_G);
         mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 4.0, 0.0), scale, aspect, OSD_CHAR_B);
     }
-    else
+    else if (inputMode == APL_MODE_SDR)
     {
         float2 topLeft = float2(topRight.x - (stepX * 2.0 + glyphWidth), topRight.y);
         mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_S);
         mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_D);
         mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, OSD_CHAR_R);
+    }
+    else
+    {
+        float2 topLeft = float2(topRight.x - (stepX * 2.0 + glyphWidth), topRight.y);
+        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_U);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_N);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, OSD_CHAR_K);
     }
     return saturate(mask);
 }
@@ -3697,7 +3710,7 @@ float4 ComputeStatsOverlayBlend(float2 texcoord, float rawInputAPL, float output
     float3 inputColor = float3(0.30, 1.00, 0.30) * OSDBrightness;
     float3 outputColor = float3(1.00, 0.90, 0.18) * OSDBrightness;
     float3 nitsColor = float3(0.60, 0.85, 1.00) * OSDBrightness;
-    float3 modeColor = (inputMode == APL_MODE_SDR)
+    float3 modeColor = (inputMode >= APL_MODE_SDR)
         ? float3(1.00, 0.45, 0.35) * OSDBrightness
         : float3(0.85, 0.85, 0.85) * OSDBrightness;
 
@@ -3897,7 +3910,7 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
     int inputMode = ResolveEffectiveAPLInputMode();
-    bool shaderActive = (inputMode != APL_MODE_SDR);
+    bool shaderActive = (inputMode < APL_MODE_SDR);
     bool boostActive = EnableEOTFBoost && shaderActive;
 
     float4 aplData = 0.0.xxxx;
