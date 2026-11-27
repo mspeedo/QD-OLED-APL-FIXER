@@ -294,10 +294,10 @@ uniform bool EnableEOTFBoost <
 
 uniform int APLInputMode <
     ui_type = "combo";
-    ui_items = "scRGB Normalized\0PQ Decoded Normalized\0";
+    ui_items = "scRGB Normalized\0PQ Decoded Normalized\0Auto\0";
     ui_label = "APL Input Mode";
-    UI_TOOLTIP("Selects scRGB or PQ decoding for APL and boost processing.")
-> = 1;
+    UI_TOOLTIP("Selects scRGB, PQ, or Auto detection from ReShade's buffer color space. Auto disables the shader in SDR.")
+> = 2;
 
 uniform float APLReferenceWhiteNits <
     ui_type = "slider";
@@ -506,7 +506,7 @@ uniform int PQHDRLUTInputColorSpace <
 
 uniform bool ShowOSD <
     ui_label = "Show APL Stats";
-    UI_TOOLTIP("Shows raw APL, solved APL, and Max Raw Nits. Max tracking runs only while visible.")
+    UI_TOOLTIP("Shows raw APL, solved APL, Max Raw Nits, and input mode. Max tracking runs only while visible.")
 > = false;
 
 uniform float OSDBrightness <
@@ -1129,9 +1129,43 @@ float NitsToPQ(float nits)
     return LinearToPQBT2100(saturate(nits / 10000.0));
 }
 
+static const int APL_MODE_SCRGB = 0;
+static const int APL_MODE_PQ    = 1;
+static const int APL_MODE_SDR   = 2;
+
+int ResolveDetectedColorSpaceMode()
+{
+#if BUFFER_COLOR_SPACE == 2
+    return APL_MODE_SCRGB;
+#elif BUFFER_COLOR_SPACE == 3
+    return APL_MODE_PQ;
+#else
+    return APL_MODE_SDR;
+#endif
+}
+
+int ResolveEffectiveAPLInputMode()
+{
+    if (APLInputMode == 0)
+        return APL_MODE_SCRGB;
+    if (APLInputMode == 1)
+        return APL_MODE_PQ;
+    return ResolveDetectedColorSpaceMode();
+}
+
+bool IsShaderActiveForInputMode()
+{
+    return ResolveEffectiveAPLInputMode() != APL_MODE_SDR;
+}
+
+bool IsEOTFBoostActive()
+{
+    return EnableEOTFBoost && IsShaderActiveForInputMode();
+}
+
 bool NeedsAPLProcessing()
 {
-    return EnableEOTFBoost;
+    return IsEOTFBoostActive();
 }
 
 // Optional PQ Rec.2020 calibration LUT.
@@ -1644,7 +1678,7 @@ float SampleHighlightBasePQ(int2 pixelCoord, float origPQ)
 
 bool IsHighlightDetailActive(float4 boostParams)
 {
-    return EnableEOTFBoost
+    return IsEOTFBoostActive()
         && EnableHighlightDetailRecovery
         && (HIGHLIGHT_DETAIL_RECOVERY > 1e-4)
         && (BoostRollOff > 0.0)
@@ -1824,7 +1858,7 @@ float3 HDRSaturationBuffer(float3 color)
     if (HDRSaturationPercent == 100)
         return color;
 
-    if (APLInputMode != 1)
+    if (ResolveEffectiveAPLInputMode() != APL_MODE_PQ)
         return HDRSaturationLinearRGB(color, false);
 
     float3 nits = PQToLinearBT2100(color) * 10000.0;
@@ -1840,7 +1874,7 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, int2 pixelCo
     if (boostParams.r <= 1.000001 && boostParams.g <= 0.0)
         return HDRSaturationBuffer(color);
 
-    if (APLInputMode == 1)
+    if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
     {
         float3 linearColorNits = PQToLinearBT2100(saturate(color)) * 10000.0;
         float originalLumaNits = max(GetLuma2020(linearColorNits), 0.0);
@@ -2642,7 +2676,7 @@ int APL_QuantizeMaxNits2(float nits)
 
 int APL_ActiveHistogramBins()
 {
-    return (EnableEOTFBoost && EnableColorPreservingBoostMode) ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
+    return (IsEOTFBoostActive() && EnableColorPreservingBoostMode) ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
 }
 
 int APL_HistogramLumaBin64(int lumaQ4)
@@ -2789,7 +2823,7 @@ int APL_GetRollingHistogramSignature(bool colorHistogram)
 
 
     int signalRef = clamp(int(SIGNAL_REFERENCE_NITS + 0.5), 1, 200);
-    return clamp(APLInputMode, 0, 1) + (colorHistogram ? 2 : 0) + signalRef * 4;
+    return clamp(ResolveEffectiveAPLInputMode(), 0, 1) + (colorHistogram ? 2 : 0) + signalRef * 4;
 }
 
 void APL_DecodePackedFullFrameSample(
@@ -2814,7 +2848,7 @@ void APL_DecodePackedFullFrameSample(
     float sceneNits = 0.0;
     float maxChannelNits = 0.0;
 
-    if (APLInputMode == 1)
+    if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
     {
         float3 channelNits = APL_FastPQToNits(color);
         sceneNits = max(GetLuma2020(channelNits), 0.0);
@@ -2911,7 +2945,7 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
     bool aplActive = NeedsAPLProcessing();
     int localIndex = int(threadID.x);
     int activeBins = APL_ActiveHistogramBins();
-    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    bool needsMaxHistogram = aplActive && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
 
@@ -3010,9 +3044,12 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
 {
 
     bool aplActive = NeedsAPLProcessing();
+    if (!aplActive)
+        return;
+
     uint localIndex = threadID.y * APL_FFH_THREADS_X + threadID.x;
     int activeBins = APL_ActiveHistogramBins();
-    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    bool needsMaxHistogram = aplActive && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
     int rollingPhase = int(tex2Dfetch(SamplerAPLPrev, int2(0, 0)).g);
@@ -3110,6 +3147,9 @@ groupshared float APL_ReduceMaxNits[APL_FFH_REDUCE_THREADS];
 void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
 {
     bool aplActive = NeedsAPLProcessing();
+    if (!aplActive)
+        return;
+
     int localIndex = int(threadID.x);
     int2 localBinCoord = int2(groupID.xy);
     int binIndex = localBinCoord.y * APL_FFH_BLOCK_W + localBinCoord.x;
@@ -3120,7 +3160,7 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
     if (tex2Dfetch(SamplerAPLPrev, int2(0, 0)).g < 0.0)
         return;
 
-    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    bool needsMaxHistogram = aplActive && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
     int countSum = 0;
@@ -3239,7 +3279,18 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
 {
     bool aplActive = NeedsAPLProcessing();
     int localIndex = int(threadID.x);
-    bool colorHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    if (!aplActive)
+    {
+        if (localIndex == 0)
+        {
+            tex2Dstore(StorageAPLInstant, int2(0, 0), 0.0.xxxx);
+            tex2Dstore(StorageAPL, int2(0, 0), 0.0.xxxx);
+            tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
+        }
+        return;
+    }
+
+    bool colorHistogram = aplActive && EnableColorPreservingBoostMode;
     int activeBins = colorHistogram ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
 
     float4 prevData = tex2Dfetch(SamplerAPLPrev, int2(0, 0));
@@ -3253,7 +3304,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     float4 weighted = 0.0.xxxx;
     float pixelCount = 0.0;
 
-    if (aplActive && localIndex < activeBins)
+    if (localIndex < activeBins)
     {
         int2 binCoord = APL_HistogramBlockCoord(localIndex);
         int pixelCountI = tex2Dfetch(SamplerAPLGlobalHistCount, binCoord);
@@ -3266,18 +3317,15 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             float rawMetric = saturate(sceneNits / max(APLReferenceWhiteNits, 1.0));
             float3 candidateMetrics = rawMetric.xxx;
 
-            if (EnableEOTFBoost)
+            float maxChannelNits = 0.0;
+            if (colorHistogram)
             {
-                float maxChannelNits = 0.0;
-                if (colorHistogram)
-                {
-                    float maxSumNits = tex2Dfetch(SamplerAPLGlobalHistMaxNits, binCoord);
-                    maxChannelNits = max((maxSumNits / pixelCount) * 2.0, sceneNits);
-                }
-                candidateMetrics.x = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(1));
-                candidateMetrics.y = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(2));
-                candidateMetrics.z = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(3));
+                float maxSumNits = tex2Dfetch(SamplerAPLGlobalHistMaxNits, binCoord);
+                maxChannelNits = max((maxSumNits / pixelCount) * 2.0, sceneNits);
             }
+            candidateMetrics.x = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(1));
+            candidateMetrics.y = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(2));
+            candidateMetrics.z = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(3));
 
             weighted = float4(rawMetric, candidateMetrics) * pixelCount;
         }
@@ -3436,12 +3484,18 @@ float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, fl
 
 #define OSD_CHAR_SPACE -1
 #define OSD_CHAR_A 0
+#define OSD_CHAR_B 1
+#define OSD_CHAR_C 2
+#define OSD_CHAR_D 3
+#define OSD_CHAR_E 4
+#define OSD_CHAR_G 6
 #define OSD_CHAR_I 8
 #define OSD_CHAR_L 11
 #define OSD_CHAR_M 12
 #define OSD_CHAR_N 13
 #define OSD_CHAR_O 14
 #define OSD_CHAR_P 15
+#define OSD_CHAR_Q 16
 #define OSD_CHAR_R 17
 #define OSD_CHAR_S 18
 #define OSD_CHAR_T 19
@@ -3458,12 +3512,18 @@ float GetOSDLetter(int letter, float2 uv)
 
 
     if (letter == OSD_CHAR_A) pattern = 11245;
+    else if (letter == OSD_CHAR_B) pattern = 15083;
+    else if (letter == OSD_CHAR_C) pattern = 25166;
+    else if (letter == OSD_CHAR_D) pattern = 15211;
+    else if (letter == OSD_CHAR_E) pattern = 29391;
+    else if (letter == OSD_CHAR_G) pattern = 25454;
     else if (letter == OSD_CHAR_I) pattern = 29847;
     else if (letter == OSD_CHAR_L) pattern = 4687;
     else if (letter == OSD_CHAR_M) pattern = 24557;
     else if (letter == OSD_CHAR_N) pattern = 24573;
     else if (letter == OSD_CHAR_O) pattern = 31599;
     else if (letter == OSD_CHAR_P) pattern = 15049;
+    else if (letter == OSD_CHAR_Q) pattern = 31612;
     else if (letter == OSD_CHAR_R) pattern = 15085;
     else if (letter == OSD_CHAR_S) pattern = 29671;
     else if (letter == OSD_CHAR_T) pattern = 29842;
@@ -3504,8 +3564,36 @@ float DrawOSDLabel8(float2 texcoord, float2 topLeft, float scale, float stepX, f
     return saturate(mask);
 }
 
+float DrawOSDModeValue(float2 texcoord, float2 topRight, float scale, float stepX, float glyphWidth, float aspect, int inputMode)
+{
+    float mask = 0.0;
+    if (inputMode == APL_MODE_PQ)
+    {
+        float2 topLeft = float2(topRight.x - (stepX + glyphWidth), topRight.y);
+        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_P);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_Q);
+    }
+    else if (inputMode == APL_MODE_SCRGB)
+    {
+        float2 topLeft = float2(topRight.x - (stepX * 4.0 + glyphWidth), topRight.y);
+        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_S);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_C);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, OSD_CHAR_R);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 3.0, 0.0), scale, aspect, OSD_CHAR_G);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 4.0, 0.0), scale, aspect, OSD_CHAR_B);
+    }
+    else
+    {
+        float2 topLeft = float2(topRight.x - (stepX * 2.0 + glyphWidth), topRight.y);
+        mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, OSD_CHAR_S);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, OSD_CHAR_D);
+        mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, OSD_CHAR_R);
+    }
+    return saturate(mask);
+}
 
-float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSceneNits)
+
+float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSceneNits, int inputMode)
 {
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float invAspect = 1.0 / max(aspect, 1e-6);
@@ -3530,16 +3618,18 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float2 outputPercentRight = inputPercentRight + float2(0.0, lineSpacing);
     float2 outputRowRight = inputRowRight + float2(0.0, lineSpacing);
     float2 nitsRowRight = inputRowRight + float2(0.0, lineSpacing * 2.0);
+    float2 modeRowRight = inputRowRight + float2(0.0, lineSpacing * 3.0);
 
     float valueLeft = inputRowRight.x - stepX * 5.0 - glyphWidth;
     float2 inputLabelTopLeft = float2(valueLeft - labelGap - labelTotalWidth, inputRowRight.y);
     float2 outputLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing);
     float2 nitsLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing * 2.0);
+    float2 modeLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing * 3.0);
 
     float left = inputLabelTopLeft.x;
     float right = inputPercentRight.x;
     float top = inputRowRight.y;
-    float bottom = nitsRowRight.y + scale;
+    float bottom = modeRowRight.y + scale;
 
     float padX = glyphWidth * 0.48;
     float padY = scale * 0.20;
@@ -3554,6 +3644,7 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float rawLabelMask = DrawOSDLabel8(texcoord, inputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
     float outputLabelMask = DrawOSDLabel8(texcoord, outputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_O, OSD_CHAR_U, OSD_CHAR_T, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
     float nitsLabelMask = DrawOSDLabel8(texcoord, nitsLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_N, OSD_CHAR_I, OSD_CHAR_T, OSD_CHAR_S);
+    float modeLabelMask = DrawOSDLabel8(texcoord, modeLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_I, OSD_CHAR_N, OSD_CHAR_SPACE, OSD_CHAR_M, OSD_CHAR_O, OSD_CHAR_D, OSD_CHAR_E, OSD_CHAR_SPACE);
 
     float inputMask = 0.0;
     inputMask += DrawOSDAPLPercent2(texcoord, inputRowRight, scale, stepX, aspect, rawInputAPL);
@@ -3566,6 +3657,7 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     outputMask = saturate(outputMask);
 
     float nitsMask = DrawOSDRow5(texcoord, nitsRowRight, scale, stepX, aspect, nitDisplay);
+    float modeMask = DrawOSDModeValue(texcoord, modeRowRight, labelScale, labelStepX, labelGlyphWidth, aspect, inputMode);
 
     float bgAlpha = 0.18 * OSDBrightness * bgMask;
     float3 shadedScene = sceneColor * (1.0 - bgAlpha);
@@ -3573,11 +3665,15 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float3 inputColor = float3(0.30, 1.00, 0.30) * OSDBrightness;
     float3 outputColor = float3(1.00, 0.90, 0.18) * OSDBrightness;
     float3 nitsColor = float3(0.60, 0.85, 1.00) * OSDBrightness;
+    float3 modeColor = (inputMode == APL_MODE_SDR)
+        ? float3(1.00, 0.45, 0.35) * OSDBrightness
+        : float3(0.85, 0.85, 0.85) * OSDBrightness;
 
     float3 result = shadedScene;
     result = lerp(result, inputColor, saturate(rawLabelMask + inputMask));
     result = lerp(result, outputColor, saturate(outputLabelMask + outputMask));
     result = lerp(result, nitsColor, saturate(nitsLabelMask + nitsMask));
+    result = lerp(result, modeColor, saturate(modeLabelMask + modeMask));
 
     return result;
 }
@@ -3600,7 +3696,7 @@ float ComputeHighlightDetailSourceKneePQ(float4 boostParams)
 // or in dark scenes. Also hoists sourceKneePQ out of the bilateral pixel shaders.
 void VS_HL_Pass(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 hlParams : TEXCOORD0)
 {
-    if (!EnableEOTFBoost || !EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4 || BoostRollOff <= 0.0)
+    if (!IsEOTFBoostActive() || !EnableHighlightDetailRecovery || HIGHLIGHT_DETAIL_RECOVERY <= 1e-4 || BoostRollOff <= 0.0)
     {
         hlParams = 0.0.xx;
         position = float4(-2.0, -2.0, 0.0, 1.0);
@@ -3625,7 +3721,7 @@ float4 PS_HL_ExtractPQ(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) :
     int2 pHalf = clamp(int2(vpos.xy), int2(0, 0), int2(APL_HL_WIDTH - 1, APL_HL_HEIGHT - 1));
     int2 pFull = min(pHalf * 2, int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
     float3 color = tex2Dfetch(ReShade::BackBuffer, pFull).rgb;
-    float sceneNits = (APLInputMode == 1)
+    float sceneNits = (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
         ? max(GetLuma2020(APL_FastPQToNits(color)), 0.0)
         : max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
 
@@ -3718,45 +3814,59 @@ float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) 
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
-    float4 aplData = 0.0.xxxx;
-    if (EnableEOTFBoost)
-        aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
+    int inputMode = ResolveEffectiveAPLInputMode();
+    bool shaderActive = (inputMode != APL_MODE_SDR);
+    bool boostActive = EnableEOTFBoost && shaderActive;
 
-    float3 finalColor;
-    if (aplData.a > 1e-6)
+    float4 aplData = 0.0.xxxx;
+    float3 finalColor = color;
+
+    if (shaderActive)
     {
-        float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
-        int2 pixelCoord = clamp(int2(vpos.xy), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
-        finalColor = ApplyBoostAndHDRSaturation(color, boostParams, pixelCoord);
-    }
-    else
-    {
-        finalColor = HDRSaturationBuffer(color);
-    }
+        if (boostActive)
+            aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
+
+        if (aplData.a > 1e-6)
+        {
+            float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
+            int2 pixelCoord = clamp(int2(vpos.xy), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+            finalColor = ApplyBoostAndHDRSaturation(color, boostParams, pixelCoord);
+        }
+        else
+        {
+            finalColor = HDRSaturationBuffer(color);
+        }
 
 #if PQHDRLUT_ENABLE
-    if (EnablePQHDRLUT)
-        finalColor = PQHDRLUT_Apply(finalColor);
+        if (EnablePQHDRLUT)
+            finalColor = PQHDRLUT_Apply(finalColor);
 #endif
+    }
 
     if (EnableEOTFBoost && ShowOSD)
     {
-        float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
-        float rawInputAPL = saturate(instantData.r);
-        float currentMaxSceneNits = max(instantData.g, 0.0);
+        float rawInputAPL = 0.0;
+        float currentMaxSceneNits = 0.0;
+        if (boostActive)
+        {
+            float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
+            rawInputAPL = saturate(instantData.r);
+            currentMaxSceneNits = max(instantData.g, 0.0);
+        }
         finalColor = DrawStatsOverlay(
             texcoord,
             finalColor,
             rawInputAPL,
             saturate(aplData.g),
-            currentMaxSceneNits
+            currentMaxSceneNits,
+            inputMode
         );
     }
 
 #if ENABLE_APL_GRAPH
 
 
-    if (ShowAPLGraph)
+    if (shaderActive && ShowAPLGraph)
         finalColor = DrawAPLGraphOverlay(texcoord, finalColor);
 #endif
 
@@ -3774,7 +3884,7 @@ float ComputeAPLGraphLiveOperatingPoint(float rawAPLPercent)
 
 float4 PS_CalcGraphParams(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
-    if (!ShowAPLGraph)
+    if (!IsShaderActiveForInputMode() || !ShowAPLGraph)
         return 0.0.xxxx;
 
     float graphAxisMaxNits = clamp(GraphAxisMaxNits, 1.0, 10000.0);
@@ -3825,7 +3935,7 @@ float4 ComputeAPLGraphLiveProjection(float displayAPL, float maxMeasuredNits, fl
 // Graph pass: compute live-equivalent projection at each x sample.
 float4 PS_CalcGraphProjection(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
-    if (!ShowAPLGraph)
+    if (!IsShaderActiveForInputMode() || !ShowAPLGraph)
         return 0.0.xxxx;
 
     int sampleIndex = min(int(vpos.x), GRAPH_CURVE_SAMPLES - 1);
@@ -3849,7 +3959,7 @@ float4 PS_CalcGraphProjection(float4 vpos : SV_Position, float2 texcoord : TexCo
 // Graph pass: build grid, tick, and identity-line segments.
 float4 PS_CalcGraphLines(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
-    if (!ShowAPLGraph)
+    if (!IsShaderActiveForInputMode() || !ShowAPLGraph)
         return float4(-1.0, -1.0, -1.0, -1.0);
 
     int idx = int(vpos.x);
@@ -3914,7 +4024,7 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
 {
     static const float4 SENTINEL = float4(-1.0, -1.0, -1.0, -1.0);
 
-    if (!ShowAPLGraph)
+    if (!IsShaderActiveForInputMode() || !ShowAPLGraph)
         return SENTINEL;
 
     int s   = int(vpos.x);
