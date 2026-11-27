@@ -1,5 +1,5 @@
 /*
-    EOTF Boost v9.6
+    EOTF Boost v9.7
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
     Applies a scene-uniform HDR gain from a measured 1D APL compensation table:
