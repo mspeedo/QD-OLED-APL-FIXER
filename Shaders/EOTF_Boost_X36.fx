@@ -2,7 +2,7 @@
     EOTF Boost v9.5
     Calibrated for MSI MPG 341CQR QD-OLED X36
 
-    Applies a scene-uniform HDR gain from a measured 1D APL compensation table.
+    Applies a scene-uniform HDR gain from a measured 1D APL compensation table:
 
         scene gain = compensation(solved APL) ^ strength
 
@@ -13,13 +13,17 @@
     bilateral highlight detail recovery restores local highlight contrast inside
     the compressed roll-off shoulder.
 
-    Live pipeline:
-      1. Frame setup and rolling-row clear
-      2. Full-frame row histogram build
-      3. Global histogram reduction
-      4. Response solve, smoothing, and boost parameters
-      5. Half-resolution PQ extract and separable bilateral filter for highlight detail
-      6. Fullscreen boost, highlight detail recovery, HDR saturation, and optional calibration LUT
+    File layout:
+      1. Compile-Time Feature Switches
+      2. Monitor Calibration & Measured Data  <-- edit here to port to another panel
+      3. UI Controls & Related Tuning Constants
+      4. Internal Pipeline Layout & GPU Resources
+      5. Color Science, PQ/EOTF, LUT & Roll-Off Math
+      6. Optional Debug Graph Simulation & Rendering
+      7. Live APL Measurement & Solver Passes (Passes 0 - 4)
+      8. OSD Rendering
+      9. Highlight Detail Recovery Passes (Pass 5)
+     10. Main Output Pass, Optional Graph Passes & Technique (Pass 6)
 
     Max Raw Nits is tracked only while the OSD is visible.
     Each scheduled measurement advances one rolling phase. Rendering continues every execution.
@@ -27,21 +31,31 @@
 
 #include "ReShade.fxh"
 
+
+// ============================================================================
+// 1. COMPILE-TIME FEATURE SWITCHES & PREPROCESSOR OPTIONS
+// ============================================================================
+
 #ifndef BUFFER_COLOR_SPACE
     #define BUFFER_COLOR_SPACE 0
 #endif
 
-
-// Compile-time features.
 #ifndef PQHDRLUT_ENABLE
     #define PQHDRLUT_ENABLE 0
 #endif
 
+#if PQHDRLUT_ENABLE
+    #ifndef PQHDRLUT_SIZE
+        #define PQHDRLUT_SIZE 65
+    #endif
+    #ifndef PQHDRLUT_FILE
+        #define PQHDRLUT_FILE "PQHDRLUT.cube"
+    #endif
+#endif
 
 #ifndef PER_APL_BOOST_STRENGTH_ENABLE
     #define PER_APL_BOOST_STRENGTH_ENABLE 0
 #endif
-
 
 #ifndef ENABLE_APL_GRAPH
     #define ENABLE_APL_GRAPH 0
@@ -51,76 +65,10 @@
     #define ENABLE_UI_TOOLTIPS 0
 #endif
 
-
-// Full-frame histogram layout. Each 16x16 group processes one 32x32 pixel tile.
-#define APL_FFH_TILE_SIZE             32
-#define APL_FFH_THREADS_X             16
-#define APL_FFH_THREADS_Y             16
-#define APL_FFH_PIXELS_X               2
-#define APL_FFH_PIXELS_Y               2
-#define APL_FFH_LUMA_BINS              64
-#define APL_FFH_COLOR_LUMA_BINS        64
-#define APL_FFH_COLOR_RATIO_BINS        4
-#define APL_FFH_MAX_BINS              256
-#define APL_FFH_BLOCK_W                16
-#define APL_FFH_BLOCK_H                16
-#define APL_FFH_AUX_X                  APL_FFH_BLOCK_W
-#define APL_FFH_REDUCE_THREADS         64
-
-
-// Packed value: pixel count in the upper bits and summed bin position in the lower bits.
-#define APL_FFH_PACK_COUNT_SHIFT       20
-#define APL_FFH_PACK_OFFSET_MASK       ((1 << APL_FFH_PACK_COUNT_SHIFT) - 1)
-#define APL_FFH_PACK_OFFSET_SCALE      1023
-#define APL_FFH_PACK_ONE_COUNT         (1 << APL_FFH_PACK_COUNT_SHIFT)
-
-#define APL_FFH_TILE_COUNT_X ((BUFFER_WIDTH  + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
-#define APL_FFH_TILE_COUNT_Y ((BUFFER_HEIGHT + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
-
-
-// Persistent 16x16 histogram block for each 32-pixel-high screen row.
-#define APL_FFH_ROW_HIST_TEX_W APL_FFH_BLOCK_W
-#define APL_FFH_ROW_COUNT_TEX_W (APL_FFH_BLOCK_W + 1)
-#define APL_FFH_ROW_TEX_H (APL_FFH_TILE_COUNT_Y * APL_FFH_BLOCK_H)
-
-
 // 0 refreshes all rows each frame. N refreshes one of N interleaved row phases.
 #ifndef APL_FULLFRAME_ROLLING_PHASES
     #define APL_FULLFRAME_ROLLING_PHASES 6
 #endif
-
-#if APL_FULLFRAME_ROLLING_PHASES < 0
-    #error "APL_FULLFRAME_ROLLING_PHASES must be >= 0"
-#endif
-
-#if APL_FULLFRAME_ROLLING_PHASES > APL_FFH_TILE_COUNT_Y
-    #error "APL_FULLFRAME_ROLLING_PHASES cannot exceed the number of full-frame tile rows"
-#endif
-
-#if APL_FULLFRAME_ROLLING_PHASES > 0
-    #define APL_FFH_ROLLING_ROW_SLOTS ((APL_FFH_TILE_COUNT_Y + APL_FULLFRAME_ROLLING_PHASES - 1) / APL_FULLFRAME_ROLLING_PHASES)
-
-
-    // Metadata stores a runtime signature and the completed row pixel count.
-    #define APL_FFH_ROW_META_COUNT_BITS 20
-    #define APL_FFH_ROW_META_COUNT_MASK ((1 << APL_FFH_ROW_META_COUNT_BITS) - 1)
-    #if (BUFFER_WIDTH * APL_FFH_TILE_SIZE) > APL_FFH_ROW_META_COUNT_MASK
-        #error "Rolling full-frame row pixel count exceeds the 20-bit metadata field"
-    #endif
-#else
-    #define APL_FFH_ROLLING_ROW_SLOTS APL_FFH_TILE_COUNT_Y
-#endif
-
-#if (APL_FFH_THREADS_X * APL_FFH_PIXELS_X != APL_FFH_TILE_SIZE) || (APL_FFH_THREADS_Y * APL_FFH_PIXELS_Y != APL_FFH_TILE_SIZE)
-    #error "Full-frame APL histogram tile/thread dimensions are inconsistent"
-#endif
-#if (APL_FFH_BLOCK_W * APL_FFH_BLOCK_H != APL_FFH_MAX_BINS)
-    #error "Full-frame APL histogram block dimensions do not match maximum bin count"
-#endif
-#if (APL_FFH_COLOR_LUMA_BINS * APL_FFH_COLOR_RATIO_BINS != APL_FFH_MAX_BINS)
-    #error "Color-preserving full-frame APL histogram dimensions are inconsistent"
-#endif
-
 
 // UI tooltips can be removed at compile time.
 #if ENABLE_UI_TOOLTIPS
@@ -130,15 +78,215 @@
 #endif
 
 
-#if PQHDRLUT_ENABLE
+// ============================================================================
+// 2. MONITOR CALIBRATION & MEASURED DATA
+//    Edit this section to port the shader to a different OLED monitor.
+// ============================================================================
 
-#ifndef PQHDRLUT_SIZE
-    #define PQHDRLUT_SIZE 65
+// Monitor-specific default UI targets and slider bounds.
+#define MONITOR_DEFAULT_REF_WHITE_NITS  1300.0
+#define MONITOR_DEFAULT_ROLLOFF_NITS    1300.0
+#define MONITOR_PEAK_UI_MAX_NITS        1500.0
+#define MONITOR_DEFAULT_FREEZE_APL      50.0
+#define MONITOR_FREEZE_APL_UI_MAX       95.0
+#define MONITOR_DEFAULT_GRAPH_AXIS_NITS 1300.0
+
+// Dense live 1D APL compensation table (REQUIRED when porting to another monitor).
+// Values in COMP_APL_1D correspond to APL percentages in COMP_APL_POINTS.
+static const int COMP_APL_COUNT = 20;
+
+static const float COMP_APL_POINTS[COMP_APL_COUNT] =
+{
+    2.000000,
+    3.000000,
+    4.000000,
+    5.000000,
+    6.000000,
+    7.000000,
+    8.000000,
+    9.000000,
+    10.000000,
+    11.000000,
+    15.000000,
+    20.000000,
+    25.000000,
+    30.000000,
+    35.000000,
+    40.000000,
+    50.000000,
+    60.000000,
+    70.000000,
+    95.000000
+};
+
+static const float COMP_APL_1D[COMP_APL_COUNT] =
+{
+    1.000000,
+    1.000000,
+    1.222800,
+    1.429226,
+    1.654645,
+    1.896584,
+    2.111334,
+    2.346582,
+    2.598814,
+    2.710108,
+    2.911658,
+    3.127065,
+    3.286341,
+    3.429106,
+    3.558611,
+    3.665642,
+    3.855918,
+    4.029733,
+    4.184151,
+    4.530331
+};
+
+// Measured APL data used by the optional graph and per-APL controls.
+static const int GRAPH_APL_COUNT = 10;
+static const int NIT_COUNT = 24;
+
+
+static const float GRAPH_APL_POINTS[GRAPH_APL_COUNT] =
+{
+    3.000000, 5.000000, 7.000000, 10.000000, 14.000000, 18.000000, 22.000000, 25.000000, 35.000000, 50.000000
+};
+
+static const float NIT_POINTS[NIT_COUNT] =
+{
+    3.575635, 5.171928, 7.225205, 10.050671, 13.609937, 18.423039, 24.669117, 32.378420, 42.624646, 55.159547, 71.694443, 92.698470, 118.169439, 151.523348, 191.827692, 244.458256, 307.922168, 390.672851, 494.833309, 620.319592, 783.927695, 981.175502, 1238.660348, 1350.000000
+};
+
+#if ENABLE_APL_GRAPH
+// Measured 2D APL x Nit compensation table and window curves (used only by the optional debug graph).
+static const float GRAPH_COMP_TABLE_2D[GRAPH_APL_COUNT * NIT_COUNT] =
+{
+
+    1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
+    1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
+    1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
+
+
+    1.426002, 1.418319, 1.418362, 1.408464, 1.446689, 1.439896, 1.430032, 1.417518,
+    1.426299, 1.433991, 1.438851, 1.438764, 1.444610, 1.457619, 1.461260, 1.451388,
+    1.439402, 1.439348, 1.449156, 1.454828, 1.475658, 1.465801, 1.461834, 1.465964,
+
+
+    1.901008, 1.891043, 1.866986, 1.852415, 1.892284, 1.878469, 1.864525, 1.844185,
+    1.871305, 1.866372, 1.897690, 1.864640, 1.867602, 1.873403, 1.906579, 1.916905,
+    1.903288, 1.889973, 1.892973, 1.909843, 1.900878, 1.893409, 1.890150, 1.903270,
+
+
+    2.696380, 2.656127, 2.571548, 2.531986, 2.572484, 2.587114, 2.581274, 2.553721,
+    2.578727, 2.589062, 2.576027, 2.594132, 2.565634, 2.567442, 2.589947, 2.602294,
+    2.608675, 2.599693, 2.594153, 2.625117, 2.597062, 2.594686, 2.627796, 2.652832,
+
+
+    3.014935, 2.957599, 2.863537, 2.788778, 2.823049, 2.829380, 2.853258, 2.837809,
+    2.827572, 2.835808, 2.841031, 2.833818, 2.847280, 2.824416, 2.807268, 2.818432,
+    2.831186, 2.839942, 2.825752, 2.826951, 2.820289, 2.822078, 2.817427, 2.881472,
+
+
+    3.261780, 3.193873, 3.084611, 2.979779, 3.016971, 3.011393, 3.028951, 3.025158,
+    3.010275, 3.016307, 3.016287, 3.005215, 3.010005, 3.005951, 2.977315, 2.976826,
+    2.990090, 3.010028, 2.998662, 2.990941, 2.983052, 2.984053, 2.983156, 3.050799,
+
+
+    3.447681, 3.384312, 3.275227, 3.149785, 3.193180, 3.166548, 3.178603, 3.166691,
+    3.149251, 3.159883, 3.163959, 3.164954, 3.146424, 3.145451, 3.112629, 3.112500,
+    3.125895, 3.142294, 3.139984, 3.133374, 3.112062, 3.117090, 3.123962, 3.183895,
+
+
+    3.581481, 3.477656, 3.383956, 3.274945, 3.311163, 3.272880, 3.270689, 3.271470,
+    3.238493, 3.255894, 3.252702, 3.255290, 3.245266, 3.237040, 3.207700, 3.208200,
+    3.209342, 3.225015, 3.219945, 3.227690, 3.204559, 3.204962, 3.212599, 3.278812,
+
+
+    3.930382, 3.875004, 3.743497, 3.582293, 3.612637, 3.575576, 3.551885, 3.544735,
+    3.527227, 3.523647, 3.522499, 3.513427, 3.497814, 3.499382, 3.462916, 3.449010,
+    3.444877, 3.457831, 3.466321, 3.467338, 3.438985, 3.438391, 3.457077, 3.529337,
+
+
+    4.419177, 4.341897, 4.162438, 3.959669, 3.972455, 3.940871, 3.907002, 3.879731,
+    3.879384, 3.844997, 3.833234, 3.805490, 3.812932, 3.811731, 3.775736, 3.739971,
+    3.720363, 3.743520, 3.761325, 3.752846, 3.717274, 3.713838, 3.738359, 3.835342,
+};
+
+
+// Measured 2D data used only by graph projection.
+static const int FULLFIELD_100_COUNT = 33;
+
+static const float FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT] =
+{
+    0.000000, 0.014036, 0.059603, 0.157591, 0.322069, 0.595511, 0.992458, 1.592344,
+    2.444660, 3.575635, 5.171928, 7.225205, 10.050671, 13.609937, 18.423039, 24.669117,
+    32.378420, 42.624646, 55.159547, 71.694443, 92.698470, 118.169439, 151.523348, 191.827692,
+    244.458256, 307.922168, 390.672851, 494.833309, 620.319592, 783.927695, 981.175502, 1238.660348,
+    1350.000000
+};
+
+static const float FULLFIELD_100_MEASURED_NITS[FULLFIELD_100_COUNT] =
+{
+    0.000000, 0.014648, 0.088214, 0.193289, 0.318997, 0.661295, 0.989292, 1.447618,
+    2.236296, 3.376542, 4.920436, 6.930280, 9.705878, 13.055362, 17.754820, 23.893304,
+    31.387134, 40.600344, 45.011469, 47.620761, 50.368808, 52.891721, 56.604813, 68.190830,
+    82.588125, 98.494626, 118.746210, 143.304828, 172.126608, 209.385482, 251.637523, 297.368081,
+    309.321642
+};
+
+
+static const int FULLFIELD_50_COUNT = 33;
+
+static const float FULLFIELD_50_MEASURED_NITS[FULLFIELD_50_COUNT] =
+{
+    0.000000, 0.015862, 0.091231, 0.191387, 0.312262, 0.671993, 1.005095, 1.466901,
+    2.286369, 3.449248, 5.001989, 7.038000, 9.801644, 13.156916, 17.924338, 24.163637,
+    31.789419, 41.683506, 53.627316, 69.185620, 84.080554, 92.334532, 96.520524, 101.008793,
+    104.432241, 114.183568, 137.227399, 166.211743, 199.071008, 240.682466, 287.937407, 345.551770,
+    363.939963
+};
+
+static const int FULLFIELD_25_COUNT = 33;
+
+static const float FULLFIELD_25_MEASURED_NITS[FULLFIELD_25_COUNT] =
+{
+    0.000000, 0.017065, 0.092684, 0.188695, 0.316532, 0.675762, 1.014760, 1.479035,
+    2.288388, 3.459781, 4.990658, 7.024088, 9.770902, 13.179701, 17.913331, 24.091540,
+    31.696396, 41.565991, 53.429244, 68.944165, 88.666517, 112.012512, 143.437406, 170.146931,
+    184.837337, 192.847953, 201.161006, 207.413333, 229.887560, 275.787536, 329.782519, 395.968809,
+    415.892980
+};
+
+static const int FULLFIELD_15_COUNT = 33;
+
+static const float FULLFIELD_15_MEASURED_NITS[FULLFIELD_15_COUNT] =
+{
+    0.000000, 0.016253, 0.094834, 0.187706, 0.317148, 0.676951, 1.015021, 1.479980,
+    2.287189, 3.448004, 4.994607, 7.041970, 9.784785, 13.150748, 17.905736, 24.049399,
+    31.633274, 41.473215, 53.281468, 69.049461, 88.784032, 112.346140, 143.356248, 182.754138,
+    234.099656, 278.571999, 300.521740, 315.031157, 328.402913, 344.764374, 366.215873, 440.577317,
+    462.133337
+};
+
+static const int FULLFIELD_10_COUNT = 33;
+
+static const float FULLFIELD_10_MEASURED_NITS[FULLFIELD_10_COUNT] =
+{
+    0.000000, 0.015782, 0.096480, 0.189964, 0.315951, 0.677001, 1.013099, 1.478316,
+    2.295147, 3.465727, 5.010710, 7.056289, 9.789478, 13.159489, 17.861715, 24.058224,
+    31.705232, 41.587231, 53.534239, 69.184716, 88.953048, 112.100670, 143.263472, 182.691020,
+    234.475162, 294.818124, 372.854232, 426.292189, 459.043502, 483.394124, 503.668346, 517.617448,
+    513.378666
+};
+
 #endif
-#endif
 
 
-// User settings.
+// ============================================================================
+// 3. UI CONTROLS & RELATED TUNING CONSTANTS
+// ============================================================================
+
 uniform bool EnableEOTFBoost <
     ui_label = "Enable EOTF Boost";
     UI_TOOLTIP("Enables APL-based HDR brightness compensation.")
@@ -153,21 +301,21 @@ uniform int APLInputMode <
 
 uniform float APLReferenceWhiteNits <
     ui_type = "slider";
-    ui_min = 10.0; ui_max = 1500.0; ui_step = 1.0;
+    ui_min = 10.0; ui_max = MONITOR_PEAK_UI_MAX_NITS; ui_step = 1.0;
     ui_label = "APL Reference White (nits)";
     UI_TOOLTIP("Sets the luminance represented by 100% APL.")
-> = 1300.0;
+> = MONITOR_DEFAULT_REF_WHITE_NITS;
 
 uniform float CompensationFreezeAPLPercent <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 95.0; ui_step = 0.1;
+    ui_min = 0.0; ui_max = MONITOR_FREEZE_APL_UI_MAX; ui_step = 0.1;
     ui_label = "Compensation Freeze APL %";
     UI_TOOLTIP("Holds compensation at this solved APL for all higher APL values. 0 disables it.")
-> = 50.0;
+> = MONITOR_DEFAULT_FREEZE_APL;
 
 uniform float MaxAPLBoostStrength <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_label = "Global APL Boost Strength";
     UI_TOOLTIP("Scales measured compensation. 1.0 applies the full correction.")
 > = 0.5;
@@ -181,7 +329,7 @@ uniform bool EnablePerAPLBoostStrength <
 
 uniform float APLBoostStrength03 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 3% Boost Strength";
@@ -190,7 +338,7 @@ uniform float APLBoostStrength03 <
 
 uniform float APLBoostStrength05 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 5% Boost Strength";
@@ -199,7 +347,7 @@ uniform float APLBoostStrength05 <
 
 uniform float APLBoostStrength07 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 7% Boost Strength";
@@ -208,7 +356,7 @@ uniform float APLBoostStrength07 <
 
 uniform float APLBoostStrength10 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 10% Boost Strength";
@@ -217,7 +365,7 @@ uniform float APLBoostStrength10 <
 
 uniform float APLBoostStrength14 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 14% Boost Strength";
@@ -226,7 +374,7 @@ uniform float APLBoostStrength14 <
 
 uniform float APLBoostStrength18 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 18% Boost Strength";
@@ -235,7 +383,7 @@ uniform float APLBoostStrength18 <
 
 uniform float APLBoostStrength22 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 22% Boost Strength";
@@ -244,7 +392,7 @@ uniform float APLBoostStrength22 <
 
 uniform float APLBoostStrength25 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 25% Boost Strength";
@@ -253,7 +401,7 @@ uniform float APLBoostStrength25 <
 
 uniform float APLBoostStrength35 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 35% Boost Strength";
@@ -262,7 +410,7 @@ uniform float APLBoostStrength35 <
 
 uniform float APLBoostStrength50 <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Advanced Per-APL Boost Strength";
     ui_category_closed = true;
     ui_label = "APL 50% Boost Strength";
@@ -273,10 +421,10 @@ uniform float APLBoostStrength50 <
 
 uniform float BoostRollOff <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = 1500.0; ui_step = 1.0;
+    ui_min = 0.0; ui_max = MONITOR_PEAK_UI_MAX_NITS; ui_step = 1.0;
     ui_label = "Boost Roll-Off Target (nits)";
     UI_TOOLTIP("Sets the luminance where added boost fades to zero.")
-> = 1300.0;
+> = MONITOR_DEFAULT_ROLLOFF_NITS;
 
 uniform float BoostRollOffShape <
     ui_type = "slider";
@@ -322,14 +470,15 @@ uniform bool EnableColorPreservingBoostMode <
     UI_TOOLTIP("Reduces added boost near channel limits to preserve RGB ratios.")
 > = false;
 
+// Soft-limiter knee fraction for Preserve Color by Reducing Boost (0.0 - 1.0).
+static const float COLOR_PRESERVING_BOOST_KNEE = 0.85;
+
 uniform int HDRSaturationPercent <
     ui_type = "slider";
     ui_label = "HDR Saturation (%)";
     ui_min = 0; ui_max = 150; ui_step = 1;
     UI_TOOLTIP("Preserves signal luminance. 100% keeps the original color. Increases taper near channel limits.")
 > = 100;
-
-static const float COLOR_PRESERVING_BOOST_KNEE = 0.85;
 
 uniform float SIGNAL_REFERENCE_NITS <
     ui_type = "slider";
@@ -411,7 +560,7 @@ uniform float GraphAxisMaxNits <
     ui_min = 100.0; ui_max = 10000.0; ui_step = 1.0;
     ui_label = "Graph Axis Max (nits)";
     UI_TOOLTIP("Sets the maximum value shown on both graph axes.")
-> = 1300.0;
+> = MONITOR_DEFAULT_GRAPH_AXIS_NITS;
 
 uniform float GraphOpacity <
     ui_type = "slider";
@@ -424,6 +573,75 @@ uniform bool GraphUsePQSpace <
     ui_label = "Graph PQ-Encoded Axes";
     UI_TOOLTIP("Uses PQ spacing on the graph axes while labels remain in nits.")
 > = true;
+#endif
+
+
+// ============================================================================
+// 4. INTERNAL PIPELINE LAYOUT & GPU RESOURCES
+// ============================================================================
+
+// Full-frame histogram layout. Each 16x16 group processes one 32x32 pixel tile.
+#define APL_FFH_TILE_SIZE             32
+#define APL_FFH_THREADS_X             16
+#define APL_FFH_THREADS_Y             16
+#define APL_FFH_PIXELS_X               2
+#define APL_FFH_PIXELS_Y               2
+#define APL_FFH_LUMA_BINS              64
+#define APL_FFH_COLOR_LUMA_BINS        64
+#define APL_FFH_COLOR_RATIO_BINS        4
+#define APL_FFH_MAX_BINS              256
+#define APL_FFH_BLOCK_W                16
+#define APL_FFH_BLOCK_H                16
+#define APL_FFH_AUX_X                  APL_FFH_BLOCK_W
+#define APL_FFH_REDUCE_THREADS         64
+
+
+// Packed value: pixel count in the upper bits and summed bin position in the lower bits.
+#define APL_FFH_PACK_COUNT_SHIFT       20
+#define APL_FFH_PACK_OFFSET_MASK       ((1 << APL_FFH_PACK_COUNT_SHIFT) - 1)
+#define APL_FFH_PACK_OFFSET_SCALE      1023
+#define APL_FFH_PACK_ONE_COUNT         (1 << APL_FFH_PACK_COUNT_SHIFT)
+
+#define APL_FFH_TILE_COUNT_X ((BUFFER_WIDTH  + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
+#define APL_FFH_TILE_COUNT_Y ((BUFFER_HEIGHT + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
+
+
+// Persistent 16x16 histogram block for each 32-pixel-high screen row.
+#define APL_FFH_ROW_HIST_TEX_W APL_FFH_BLOCK_W
+#define APL_FFH_ROW_COUNT_TEX_W (APL_FFH_BLOCK_W + 1)
+#define APL_FFH_ROW_TEX_H (APL_FFH_TILE_COUNT_Y * APL_FFH_BLOCK_H)
+
+
+#if APL_FULLFRAME_ROLLING_PHASES < 0
+    #error "APL_FULLFRAME_ROLLING_PHASES must be >= 0"
+#endif
+
+#if APL_FULLFRAME_ROLLING_PHASES > APL_FFH_TILE_COUNT_Y
+    #error "APL_FULLFRAME_ROLLING_PHASES cannot exceed the number of full-frame tile rows"
+#endif
+
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    #define APL_FFH_ROLLING_ROW_SLOTS ((APL_FFH_TILE_COUNT_Y + APL_FULLFRAME_ROLLING_PHASES - 1) / APL_FULLFRAME_ROLLING_PHASES)
+
+
+    // Metadata stores a runtime signature and the completed row pixel count.
+    #define APL_FFH_ROW_META_COUNT_BITS 20
+    #define APL_FFH_ROW_META_COUNT_MASK ((1 << APL_FFH_ROW_META_COUNT_BITS) - 1)
+    #if (BUFFER_WIDTH * APL_FFH_TILE_SIZE) > APL_FFH_ROW_META_COUNT_MASK
+        #error "Rolling full-frame row pixel count exceeds the 20-bit metadata field"
+    #endif
+#else
+    #define APL_FFH_ROLLING_ROW_SLOTS APL_FFH_TILE_COUNT_Y
+#endif
+
+#if (APL_FFH_THREADS_X * APL_FFH_PIXELS_X != APL_FFH_TILE_SIZE) || (APL_FFH_THREADS_Y * APL_FFH_PIXELS_Y != APL_FFH_TILE_SIZE)
+    #error "Full-frame APL histogram tile/thread dimensions are inconsistent"
+#endif
+#if (APL_FFH_BLOCK_W * APL_FFH_BLOCK_H != APL_FFH_MAX_BINS)
+    #error "Full-frame APL histogram block dimensions do not match maximum bin count"
+#endif
+#if (APL_FFH_COLOR_LUMA_BINS * APL_FFH_COLOR_RATIO_BINS != APL_FFH_MAX_BINS)
+    #error "Color-preserving full-frame APL histogram dimensions are inconsistent"
 #endif
 
 
@@ -483,7 +701,7 @@ storage2D<float4> StorageBoostParams
 
 #if PQHDRLUT_ENABLE
 texture3D PQHDRLUTTexture <
-    source = "PQHDRLUT.cube";
+    source = PQHDRLUT_FILE;
 >
 {
     Width = PQHDRLUT_SIZE;
@@ -829,6 +1047,11 @@ sampler SamplerGraphLines
 #endif
 
 
+
+// ============================================================================
+// 5. COLOR SCIENCE, PQ / EOTF, LUT & ROLL-OFF MATH
+// ============================================================================
+
 float GetLuma709(float3 color)
 {
     return dot(color, float3(0.2126, 0.7152, 0.0722));
@@ -1172,73 +1395,6 @@ float SegmentLerp(float x, float x0, float y0, float x1, float y1)
     return lerp(y0, y1, Remap01(x, x0, x1));
 }
 
-// Measured APL data used by the optional graph and per-APL controls.
-static const int GRAPH_APL_COUNT = 10;
-static const int NIT_COUNT = 24;
-
-
-static const float GRAPH_APL_POINTS[GRAPH_APL_COUNT] =
-{
-    3.000000, 5.000000, 7.000000, 10.000000, 14.000000, 18.000000, 22.000000, 25.000000, 35.000000, 50.000000
-};
-
-static const float NIT_POINTS[NIT_COUNT] =
-{
-    3.575635, 5.171928, 7.225205, 10.050671, 13.609937, 18.423039, 24.669117, 32.378420, 42.624646, 55.159547, 71.694443, 92.698470, 118.169439, 151.523348, 191.827692, 244.458256, 307.922168, 390.672851, 494.833309, 620.319592, 783.927695, 981.175502, 1238.660348, 1350.000000
-};
-
-
-// Dense live compensation table. Values correspond to COMP_APL_POINTS.
-static const int COMP_APL_COUNT = 20;
-
-static const float COMP_APL_POINTS[COMP_APL_COUNT] =
-{
-    2.000000,
-    3.000000,
-    4.000000,
-    5.000000,
-    6.000000,
-    7.000000,
-    8.000000,
-    9.000000,
-    10.000000,
-    11.000000,
-    15.000000,
-    20.000000,
-    25.000000,
-    30.000000,
-    35.000000,
-    40.000000,
-    50.000000,
-    60.000000,
-    70.000000,
-    95.000000
-};
-
-static const float COMP_APL_1D[COMP_APL_COUNT] =
-{
-    1.000000,
-    1.000000,
-    1.222800,
-    1.429226,
-    1.654645,
-    1.896584,
-    2.111334,
-    2.346582,
-    2.598814,
-    2.710108,
-    2.911658,
-    3.127065,
-    3.286341,
-    3.429106,
-    3.558611,
-    3.665642,
-    3.855918,
-    4.029733,
-    4.184151,
-    4.530331
-};
-
 
 int FindCompAPLIndex(float aplPct)
 {
@@ -1332,7 +1488,7 @@ float ComputeSceneBoostStrength(float currentAPL)
 #else
     float boostStrength = MaxAPLBoostStrength;
 #endif
-    return max(boostStrength, 0.0);
+    return saturate(boostStrength);
 }
 
 
@@ -1366,7 +1522,7 @@ float ComputeCandidateMaxLogGain()
     }
 #endif
 
-    return max(log2(maxComp) * max(maxStrength, 0.0), 0.0);
+    return max(log2(maxComp) * saturate(maxStrength), 0.0);
 }
 
 
@@ -1864,130 +2020,12 @@ float SolveUniformSceneDisplayAPL(float rawAPL)
     return SolveClosedLoopDisplayAPLFromResponseNodes(safeRawAPL, responseNodes, gMax);
 }
 
+
+// ============================================================================
+// 6. OPTIONAL DEBUG GRAPH SIMULATION & RENDERING
+// ============================================================================
+
 #if ENABLE_APL_GRAPH
-
-
-static const float GRAPH_COMP_TABLE_2D[GRAPH_APL_COUNT * NIT_COUNT] =
-{
-
-    1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
-    1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
-    1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
-
-
-    1.426002, 1.418319, 1.418362, 1.408464, 1.446689, 1.439896, 1.430032, 1.417518,
-    1.426299, 1.433991, 1.438851, 1.438764, 1.444610, 1.457619, 1.461260, 1.451388,
-    1.439402, 1.439348, 1.449156, 1.454828, 1.475658, 1.465801, 1.461834, 1.465964,
-
-
-    1.901008, 1.891043, 1.866986, 1.852415, 1.892284, 1.878469, 1.864525, 1.844185,
-    1.871305, 1.866372, 1.897690, 1.864640, 1.867602, 1.873403, 1.906579, 1.916905,
-    1.903288, 1.889973, 1.892973, 1.909843, 1.900878, 1.893409, 1.890150, 1.903270,
-
-
-    2.696380, 2.656127, 2.571548, 2.531986, 2.572484, 2.587114, 2.581274, 2.553721,
-    2.578727, 2.589062, 2.576027, 2.594132, 2.565634, 2.567442, 2.589947, 2.602294,
-    2.608675, 2.599693, 2.594153, 2.625117, 2.597062, 2.594686, 2.627796, 2.652832,
-
-
-    3.014935, 2.957599, 2.863537, 2.788778, 2.823049, 2.829380, 2.853258, 2.837809,
-    2.827572, 2.835808, 2.841031, 2.833818, 2.847280, 2.824416, 2.807268, 2.818432,
-    2.831186, 2.839942, 2.825752, 2.826951, 2.820289, 2.822078, 2.817427, 2.881472,
-
-
-    3.261780, 3.193873, 3.084611, 2.979779, 3.016971, 3.011393, 3.028951, 3.025158,
-    3.010275, 3.016307, 3.016287, 3.005215, 3.010005, 3.005951, 2.977315, 2.976826,
-    2.990090, 3.010028, 2.998662, 2.990941, 2.983052, 2.984053, 2.983156, 3.050799,
-
-
-    3.447681, 3.384312, 3.275227, 3.149785, 3.193180, 3.166548, 3.178603, 3.166691,
-    3.149251, 3.159883, 3.163959, 3.164954, 3.146424, 3.145451, 3.112629, 3.112500,
-    3.125895, 3.142294, 3.139984, 3.133374, 3.112062, 3.117090, 3.123962, 3.183895,
-
-
-    3.581481, 3.477656, 3.383956, 3.274945, 3.311163, 3.272880, 3.270689, 3.271470,
-    3.238493, 3.255894, 3.252702, 3.255290, 3.245266, 3.237040, 3.207700, 3.208200,
-    3.209342, 3.225015, 3.219945, 3.227690, 3.204559, 3.204962, 3.212599, 3.278812,
-
-
-    3.930382, 3.875004, 3.743497, 3.582293, 3.612637, 3.575576, 3.551885, 3.544735,
-    3.527227, 3.523647, 3.522499, 3.513427, 3.497814, 3.499382, 3.462916, 3.449010,
-    3.444877, 3.457831, 3.466321, 3.467338, 3.438985, 3.438391, 3.457077, 3.529337,
-
-
-    4.419177, 4.341897, 4.162438, 3.959669, 3.972455, 3.940871, 3.907002, 3.879731,
-    3.879384, 3.844997, 3.833234, 3.805490, 3.812932, 3.811731, 3.775736, 3.739971,
-    3.720363, 3.743520, 3.761325, 3.752846, 3.717274, 3.713838, 3.738359, 3.835342,
-};
-
-
-// Measured 2D data used only by graph projection.
-static const int FULLFIELD_100_COUNT = 33;
-
-static const float FULLFIELD_100_INPUT_NITS[FULLFIELD_100_COUNT] =
-{
-    0.000000, 0.014036, 0.059603, 0.157591, 0.322069, 0.595511, 0.992458, 1.592344,
-    2.444660, 3.575635, 5.171928, 7.225205, 10.050671, 13.609937, 18.423039, 24.669117,
-    32.378420, 42.624646, 55.159547, 71.694443, 92.698470, 118.169439, 151.523348, 191.827692,
-    244.458256, 307.922168, 390.672851, 494.833309, 620.319592, 783.927695, 981.175502, 1238.660348,
-    1350.000000
-};
-
-static const float FULLFIELD_100_MEASURED_NITS[FULLFIELD_100_COUNT] =
-{
-    0.000000, 0.014648, 0.088214, 0.193289, 0.318997, 0.661295, 0.989292, 1.447618,
-    2.236296, 3.376542, 4.920436, 6.930280, 9.705878, 13.055362, 17.754820, 23.893304,
-    31.387134, 40.600344, 45.011469, 47.620761, 50.368808, 52.891721, 56.604813, 68.190830,
-    82.588125, 98.494626, 118.746210, 143.304828, 172.126608, 209.385482, 251.637523, 297.368081,
-    309.321642
-};
-
-
-static const int FULLFIELD_50_COUNT = 33;
-
-static const float FULLFIELD_50_MEASURED_NITS[FULLFIELD_50_COUNT] =
-{
-    0.000000, 0.015862, 0.091231, 0.191387, 0.312262, 0.671993, 1.005095, 1.466901,
-    2.286369, 3.449248, 5.001989, 7.038000, 9.801644, 13.156916, 17.924338, 24.163637,
-    31.789419, 41.683506, 53.627316, 69.185620, 84.080554, 92.334532, 96.520524, 101.008793,
-    104.432241, 114.183568, 137.227399, 166.211743, 199.071008, 240.682466, 287.937407, 345.551770,
-    363.939963
-};
-
-static const int FULLFIELD_25_COUNT = 33;
-
-static const float FULLFIELD_25_MEASURED_NITS[FULLFIELD_25_COUNT] =
-{
-    0.000000, 0.017065, 0.092684, 0.188695, 0.316532, 0.675762, 1.014760, 1.479035,
-    2.288388, 3.459781, 4.990658, 7.024088, 9.770902, 13.179701, 17.913331, 24.091540,
-    31.696396, 41.565991, 53.429244, 68.944165, 88.666517, 112.012512, 143.437406, 170.146931,
-    184.837337, 192.847953, 201.161006, 207.413333, 229.887560, 275.787536, 329.782519, 395.968809,
-    415.892980
-};
-
-static const int FULLFIELD_15_COUNT = 33;
-
-static const float FULLFIELD_15_MEASURED_NITS[FULLFIELD_15_COUNT] =
-{
-    0.000000, 0.016253, 0.094834, 0.187706, 0.317148, 0.676951, 1.015021, 1.479980,
-    2.287189, 3.448004, 4.994607, 7.041970, 9.784785, 13.150748, 17.905736, 24.049399,
-    31.633274, 41.473215, 53.281468, 69.049461, 88.784032, 112.346140, 143.356248, 182.754138,
-    234.099656, 278.571999, 300.521740, 315.031157, 328.402913, 344.764374, 366.215873, 440.577317,
-    462.133337
-};
-
-static const int FULLFIELD_10_COUNT = 33;
-
-static const float FULLFIELD_10_MEASURED_NITS[FULLFIELD_10_COUNT] =
-{
-    0.000000, 0.015782, 0.096480, 0.189964, 0.315951, 0.677001, 1.013099, 1.478316,
-    2.295147, 3.465727, 5.010710, 7.056289, 9.789478, 13.159489, 17.861715, 24.058224,
-    31.705232, 41.587231, 53.534239, 69.184716, 88.953048, 112.100670, 143.263472, 182.691020,
-    234.475162, 294.818124, 372.854232, 426.292189, 459.043502, 483.394124, 503.668346, 517.617448,
-    513.378666
-};
-
-
 static const int GRAPH_WINDOW_MODE_50  = 1;
 static const int GRAPH_WINDOW_MODE_25  = 2;
 static const int GRAPH_WINDOW_MODE_15  = 3;
@@ -2198,7 +2236,6 @@ float SampleCorrectedOutputNitsForAPL(float aplPct, float boostedTargetNits, flo
 }
 
 
-#if ENABLE_APL_GRAPH
 float ApplyGraphInputSignalLimitNits(float inputNits)
 {
     float safeInputNits = max(inputNits, 0.0);
@@ -2218,7 +2255,6 @@ float ComputeGraphCurveMeasuredRawOutputNits(bool useFullFieldWindowProjection, 
 
     return SampleRealMeasuredOutputNitsForAPL(graphRawAPLPercent, limitedInputNits);
 }
-#endif
 
 float ComputeBT2390ReferenceOutputNits(float inputNits, float sourcePeakNits, float targetPeakNits)
 {
@@ -2570,6 +2606,10 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 
 #endif
 
+
+// ============================================================================
+// 7. LIVE APL MEASUREMENT & SOLVER PASSES (PASSES 0 - 4)
+// ============================================================================
 
 // Bilinear lookup in the 129-node PQ decode table.
 float APL_FastPQCodeToNits(float pqCode)
@@ -3302,6 +3342,10 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
 #undef APL_REDUCE_EVAL_STAGE
 
 
+// ============================================================================
+// 8. OSD RENDERING
+// ============================================================================
+
 float DrawOSDDigitAt(float2 texcoord, float2 topRight, float scale, float aspect, int digit)
 {
     float2 uv = texcoord;
@@ -3538,6 +3582,11 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     return result;
 }
 
+
+// ============================================================================
+// 9. HIGHLIGHT DETAIL RECOVERY PASSES (PASS 5)
+// ============================================================================
+
 // Pass 5: half-resolution PQ extract and separable bilateral filter for highlight detail recovery.
 float ComputeHighlightDetailSourceKneePQ(float4 boostParams)
 {
@@ -3659,6 +3708,11 @@ float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) 
     return float4(sumVal / sumW, 0.0, 0.0, 1.0);
 }
 
+
+
+// ============================================================================
+// 10. MAIN OUTPUT PASS, OPTIONAL GRAPH PASSES & TECHNIQUE
+// ============================================================================
 
 // Pass 6: apply boost, highlight detail recovery, and saturation, calibrate, then draw the OSD and graph.
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
