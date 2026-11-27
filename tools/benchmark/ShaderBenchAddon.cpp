@@ -287,14 +287,26 @@ static void ResetTimerRing(BenchRuntimeData &data)
 
 static std::string GetBufferColorSpaceString(reshade::api::effect_runtime *runtime)
 {
-    switch (runtime->get_color_space())
+    char buf[32] = {};
+    if (runtime->get_preprocessor_definition("BUFFER_COLOR_SPACE", buf) && buf[0] != '\0')
+        return std::string(buf);
+
+    auto bb = runtime->get_current_back_buffer();
+    if (bb.handle != 0)
     {
-    case reshade::api::color_space::srgb_nonlinear:       return "1(sRGB)";
-    case reshade::api::color_space::extended_srgb_linear: return "2(scRGB)";
-    case reshade::api::color_space::hdr10_st2084:         return "3(PQ)";
-    case reshade::api::color_space::hdr10_hlg:            return "4(HLG)";
-    default:                                              return "0(Unknown)";
+        auto desc = runtime->get_device()->get_resource_desc(bb);
+        switch (desc.texture.format)
+        {
+        case reshade::api::format::r10g10b10a2_unorm:    return "10bit_PQ";
+        case reshade::api::format::r16g16b16a16_float:  return "16f_scRGB";
+        case reshade::api::format::r8g8b8a8_unorm:
+        case reshade::api::format::r8g8b8a8_unorm_srgb:
+        case reshade::api::format::b8g8r8a8_unorm:
+        case reshade::api::format::b8g8r8a8_unorm_srgb: return "8bit_SDR";
+        default: break;
+        }
     }
+    return "unknown";
 }
 
 static void WriteCsvRow(
