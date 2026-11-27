@@ -53,7 +53,7 @@ struct BenchConfig
 {
     std::string effect = "EOTF_Boost_X36.fx";
     std::string technique = "EOTF_Boost_1D_APL_LUT";
-    std::string outputCsv = "results.csv";
+    std::string outputCsv = "results.txt";
     std::string doneFile = "bench_done.flag";
     int warmupFrames = 60;
     int sampleFrames = 200;
@@ -310,14 +310,6 @@ static std::string GetBufferColorSpaceString(reshade::api::effect_runtime *runti
     return "unknown";
 }
 
-static std::string GetSystemListSeparator()
-{
-    char buf[16] = {};
-    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SLIST, buf, static_cast<int>(sizeof(buf))) > 1 && buf[0] != '\0')
-        return std::string(buf);
-    return ",";
-}
-
 static std::string GetSystemDecimalSeparator()
 {
     char buf[16] = {};
@@ -352,7 +344,7 @@ static void WriteCsvRow(
     double maxMs,
     size_t validSamples)
 {
-    const std::string sep = GetSystemListSeparator();
+    const std::string sep = "\t";
     const std::string dec = GetSystemDecimalSeparator();
 
     std::ios::openmode mode = data.csvHeaderWritten ? (std::ios::out | std::ios::app) : (std::ios::out | std::ios::trunc);

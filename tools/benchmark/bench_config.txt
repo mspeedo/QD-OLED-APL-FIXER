@@ -4,7 +4,7 @@ effect=EOTF_Boost_X36.fx
 technique=EOTF_Boost_1D_APL_LUT
 warmup=60
 samples=200
-output=results.csv
+output=results.txt
 done_file=bench_done.flag
 
 [case:BoostOn_SatOff_DetailOn]

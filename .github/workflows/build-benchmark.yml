@@ -42,7 +42,7 @@ jobs:
           del /Q *.obj *.exp *.lib 2>nul
           del /Q dist\*.exp dist\*.lib 2>nul
 
-      - name: Stage benchmark files, ReShade headers, and current shader
+      - name: Stage benchmark files and ReShade headers
         shell: pwsh
         run: |
           Copy-Item tools\benchmark\ReShade.ini dist\
@@ -52,8 +52,6 @@ jobs:
 
           Copy-Item _deps\reshade-shaders\Shaders\ReShade.fxh dist\Shaders\
           Copy-Item _deps\reshade-shaders\Shaders\ReShadeUI.fxh dist\Shaders\
-
-          cmd /c "git show origin/test/x36-refactor-structure:Shaders/EOTF_Boost_X36.fx > dist\Shaders\EOTF_Boost_X36.fx"
 
           Get-ChildItem -Recurse dist | Select-Object FullName, Length
 

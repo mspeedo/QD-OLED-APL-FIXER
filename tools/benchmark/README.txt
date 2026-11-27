@@ -15,16 +15,21 @@ Features
   while `ShaderBench.addon64` timestamps ONLY ReShade effect execution.
 - Waits automatically for ReShade to finish compiling the shader before
   measuring.
-- Outputs `results.csv` using your Windows locale list & decimal separators.
+- Outputs tab-delimited `results.txt` (using your Windows locale decimal
+  separator) so you can `Ctrl+A`, `Ctrl+C`, and paste directly into Excel
+  with automatic column splitting.
 
 Quick Start
 -----------
 1. Copy 64-bit ReShade (FULL ADD-ON SUPPORT build from https://reshade.me/)
    into this folder renamed as `dxgi.dll`.
-2. (Optional) Double-click `BenchmarkHost.exe` to open the interactive 120 FPS
+2. Copy the `EOTF_Boost_X36.fx` shader version you want to test into the
+   `Shaders\` subfolder (not bundled in the zip so updates never overwrite
+   your shader).
+3. (Optional) Double-click `BenchmarkHost.exe` to open the interactive 120 FPS
    window (GPU load off by default), press `Home` to configure ReShade, then
    close the window.
-3. Double-click `run_bench.bat` to benchmark `Shaders\EOTF_Boost_X36.fx` in
+4. Double-click `run_bench.bat` to benchmark `Shaders\EOTF_Boost_X36.fx` in
    HDR10 PQ at 3440x1440 @ 120 FPS with ~5 ms/frame GPU load.
 
 Optional CLI Arguments for run_bench.bat

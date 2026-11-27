@@ -14,6 +14,7 @@ if not exist "dxgi.dll" (
 
 if not exist "Shaders\EOTF_Boost_X36.fx" (
     echo [ERROR] Shaders\EOTF_Boost_X36.fx not found!
+    echo Please copy the EOTF_Boost_X36.fx you want to test into: %~dp0Shaders\
     pause
     exit /b 1
 )
@@ -39,7 +40,7 @@ echo  Press ESC in the test window at any time to abort.
 echo ===================================================================
 echo.
 
-del /Q "results.csv" 2>nul
+del /Q "results.txt" 2>nul
 del /Q "bench_done.flag" 2>nul
 
 BenchmarkHost.exe --bench --mode %MODE% --width %WIDTH% --height %HEIGHT% --fps %FPS% --load-ms %LOAD_MS% --done-file bench_done.flag --timeout 240
@@ -51,10 +52,11 @@ if errorlevel 1 (
 )
 
 echo.
-if exist "results.csv" (
-    echo ====================== RESULTS ^(results.csv^) ======================
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Import-Csv -UseCulture .\results.csv | Format-Table case,status,color_space,timer,samples,median_ms,mean_ms,p95_ms -AutoSize"
+if exist "results.txt" (
+    echo ====================== RESULTS ^(results.txt^) ======================
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Import-Csv -Delimiter ([char]9) .\results.txt | Format-Table case,status,color_space,timer,samples,median_ms,mean_ms,p95_ms -AutoSize"
     echo ===================================================================
+    echo Tip: Open results.txt, Ctrl+A, Ctrl+C, and paste directly into Excel.
 )
 pause
 exit /b 0
