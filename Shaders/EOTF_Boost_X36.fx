@@ -1146,11 +1146,9 @@ int ResolveDetectedColorSpaceMode()
 
 int ResolveEffectiveAPLInputMode()
 {
-    if (APLInputMode == 0)
-        return APL_MODE_SCRGB;
-    if (APLInputMode == 1)
-        return APL_MODE_PQ;
-    return ResolveDetectedColorSpaceMode();
+    return (APLInputMode == 0)
+        ? APL_MODE_SCRGB
+        : ((APLInputMode == 1) ? APL_MODE_PQ : ResolveDetectedColorSpaceMode());
 }
 
 bool IsShaderActiveForInputMode()
