@@ -3642,7 +3642,7 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float rawLabelMask = DrawOSDLabel8(texcoord, inputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
     float outputLabelMask = DrawOSDLabel8(texcoord, outputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_O, OSD_CHAR_U, OSD_CHAR_T, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
     float nitsLabelMask = DrawOSDLabel8(texcoord, nitsLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_N, OSD_CHAR_I, OSD_CHAR_T, OSD_CHAR_S);
-    float modeLabelMask = DrawOSDLabel8(texcoord, modeLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_I, OSD_CHAR_N, OSD_CHAR_SPACE, OSD_CHAR_M, OSD_CHAR_O, OSD_CHAR_D, OSD_CHAR_E, OSD_CHAR_SPACE);
+    float modeLabelMask = DrawOSDLabel8(texcoord, modeLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE, OSD_CHAR_M, OSD_CHAR_O, OSD_CHAR_D, OSD_CHAR_E);
 
     float inputMask = 0.0;
     inputMask += DrawOSDAPLPercent2(texcoord, inputRowRight, scale, stepX, aspect, rawInputAPL);
