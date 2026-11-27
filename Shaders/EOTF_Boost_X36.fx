@@ -773,9 +773,10 @@ storage2D<int> StorageAPLMeasurementClock
     Texture = TexAPLMeasurementClock;
 };
 
+// Slot (0,0): previous APL state + rolling phase; Slot (1,0): cached PQ LUT readiness & gain.
 texture TexAPLPrev
 {
-    Width = 1;
+    Width = 2;
     Height = 1;
     Format = RGBA32F;
 };
@@ -810,7 +811,8 @@ storage2D<float> StorageAPLFastPQNits
     Texture = TexAPLFastPQNits;
 };
 
-// Frame-built 1024-entry PQ LUTs (4 KB each: linear nits decode and fused below-knee boosted PQ).
+// Cached 1024-entry PQ LUTs (built once for nits; rebuilt on gain change for fused below-knee boost,
+// with texel 1024 storing the cached gain).
 texture TexPQFrameNits
 {
     Width = 1024;
@@ -833,7 +835,7 @@ storage2D<float> StoragePQFrameNits
 
 texture TexPQFrameBoost
 {
-    Width = 1024;
+    Width = 1025;
     Height = 1;
     Format = R32F;
 };
@@ -1203,7 +1205,7 @@ float3 PQFrameLUT_ToNits(float3 pq)
 
 float3 PQFrameLUT_Boosted(float3 pq)
 {
-    float3 u = saturate(pq) * (1023.0 / 1024.0) + (0.5 / 1024.0);
+    float3 u = saturate(pq) * (1023.0 / 1025.0) + (0.5 / 1025.0);
     return float3(
         tex2Dlod(SamplerPQFrameBoost, float4(u.r, 0.5, 0.0, 0.0)).r,
         tex2Dlod(SamplerPQFrameBoost, float4(u.g, 0.5, 0.0, 0.0)).r,
@@ -3044,6 +3046,9 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
         }
         tex2Dstore(StorageAPLPrev, int2(0, 0),
             float4(previousAPL.r, float(APL_SetupRollingPhase), previousAPL.b, previousAPL.a));
+        float nitsReady = (tex2Dfetch(SamplerPQFrameNits, int2(1023, 0)).r > 1.0) ? 1.0 : 0.0;
+        float cachedBoostGain = tex2Dfetch(SamplerPQFrameBoost, int2(1024, 0)).r;
+        tex2Dstore(StorageAPLPrev, int2(1, 0), float4(nitsReady, cachedBoostGain, 0.0, 0.0));
     }
     barrier();
     if (APL_SetupRollingPhase < 0)
@@ -3367,13 +3372,16 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         }
         if (IsShaderActiveForInputMode() && (ResolveEffectiveAPLInputMode() == APL_MODE_PQ) && (HDRSaturationPercent != 100))
         {
-            [unroll]
-            for (int k = 0; k < 4; ++k)
+            if (tex2Dfetch(SamplerAPLPrev, int2(1, 0)).r < 0.5)
             {
-                int idx = localIndex + k * 256;
-                float pqCode = float(idx) * (1.0 / 1023.0);
-                float nits = PQToLinearScalar(pqCode) * 10000.0;
-                tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
+                [unroll]
+                for (int k = 0; k < 4; ++k)
+                {
+                    int idx = localIndex + k * 256;
+                    float pqCode = float(idx) * (1.0 / 1023.0);
+                    float nits = PQToLinearScalar(pqCode) * 10000.0;
+                    tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
+                }
             }
         }
         return;
@@ -3493,19 +3501,28 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
 
     if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
     {
+        float4 lutCache = tex2Dfetch(SamplerAPLPrev, int2(1, 0));
+        bool needNits = (lutCache.r < 0.5);
+        float cachedBoostGain = lutCache.g;
         float frameGain = max(APL_FrameLutGain, 0.0);
-        bool buildFusedBoost = (frameGain > 1.000001) && (HDRSaturationPercent == 100) && !EnableColorPreservingBoostMode;
-        [unroll]
-        for (int k = 0; k < 4; ++k)
+        bool buildFusedBoost = (frameGain > 1.0) && (HDRSaturationPercent == 100) && !EnableColorPreservingBoostMode;
+        bool needBoost = buildFusedBoost && (abs(frameGain - cachedBoostGain) > 1e-6);
+
+        if (needNits || needBoost)
         {
-            int idx = localIndex + k * 256;
-            float pqCode = float(idx) * (1.0 / 1023.0);
-            float nits = PQToLinearScalar(pqCode) * 10000.0;
-            float boostedPQ = buildFusedBoost
-                ? LinearToPQBT2100(saturate((nits * frameGain) / 10000.0))
-                : pqCode;
-            tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
-            tex2Dstore(StoragePQFrameBoost, int2(idx, 0), boostedPQ);
+            [unroll]
+            for (int k = 0; k < 4; ++k)
+            {
+                int idx = localIndex + k * 256;
+                float pqCode = float(idx) * (1.0 / 1023.0);
+                float nits = PQToLinearScalar(pqCode) * 10000.0;
+                if (needNits)
+                    tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
+                if (needBoost)
+                    tex2Dstore(StoragePQFrameBoost, int2(idx, 0), LinearToPQBT2100(saturate((nits * frameGain) / 10000.0)));
+            }
+            if (needBoost && localIndex == 0)
+                tex2Dstore(StoragePQFrameBoost, int2(1024, 0), frameGain);
         }
     }
 }
