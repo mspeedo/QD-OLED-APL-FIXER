@@ -22,17 +22,19 @@ set MODE=pq
 set WIDTH=3440
 set HEIGHT=1440
 set FPS=120
+set LOAD_MS=5
 
 if not "%~1"=="" set MODE=%~1
 if not "%~2"=="" set WIDTH=%~2
 if not "%~3"=="" set HEIGHT=%~3
 if not "%~4"=="" set FPS=%~4
+if not "%~5"=="" set LOAD_MS=%~5
 
 echo ===================================================================
 echo  QD-OLED EOTF Boost Shader Benchmark
 echo  Shader:     Shaders\EOTF_Boost_X36.fx
 echo  Mode:       %MODE%  ^(pq ^| scrgb ^| sdr^)
-echo  Resolution: %WIDTH%x%HEIGHT% @ %FPS% FPS
+echo  Resolution: %WIDTH%x%HEIGHT% @ %FPS% FPS  ^(GPU Load: ~%LOAD_MS% ms/frame^)
 echo  Press ESC in the test window at any time to abort.
 echo ===================================================================
 echo.
@@ -40,7 +42,7 @@ echo.
 del /Q "results.csv" 2>nul
 del /Q "bench_done.flag" 2>nul
 
-BenchmarkHost.exe --bench --mode %MODE% --width %WIDTH% --height %HEIGHT% --fps %FPS% --done-file bench_done.flag --timeout 240
+BenchmarkHost.exe --bench --mode %MODE% --width %WIDTH% --height %HEIGHT% --fps %FPS% --load-ms %LOAD_MS% --done-file bench_done.flag --timeout 240
 if errorlevel 1 (
     echo.
     echo [ERROR] Benchmark aborted or failed. Check ReShade.log for details.
