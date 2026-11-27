@@ -65,6 +65,18 @@
     #define ENABLE_UI_TOOLTIPS 0
 #endif
 
+// 0 strips the HDR pipeline at compile time in SDR for minimal runtime cost.
+// 1 keeps the full pipeline compiled in SDR for manual PQ/scRGB override if a game misreports BUFFER_COLOR_SPACE.
+#ifndef ALLOW_SDR_MANUAL_OVERRIDE
+    #define ALLOW_SDR_MANUAL_OVERRIDE 0
+#endif
+
+#if (BUFFER_COLOR_SPACE == 2) || (BUFFER_COLOR_SPACE == 3) || (ALLOW_SDR_MANUAL_OVERRIDE != 0)
+    #define HDR_PIPELINE_COMPILED 1
+#else
+    #define HDR_PIPELINE_COMPILED 0
+#endif
+
 // 0 refreshes all rows each frame. N refreshes one of N interleaved row phases.
 #ifndef APL_FULLFRAME_ROLLING_PHASES
     #define APL_FULLFRAME_ROLLING_PHASES 6
@@ -296,7 +308,7 @@ uniform int APLInputMode <
     ui_type = "combo";
     ui_items = "scRGB Normalized\0PQ Decoded Normalized\0Auto\0";
     ui_label = "APL Input Mode";
-    UI_TOOLTIP("Selects scRGB, PQ, or Auto detection from ReShade's buffer color space. Auto disables the shader in SDR.")
+    UI_TOOLTIP("Selects scRGB, PQ, or Auto detection from ReShade's buffer color space. Auto disables the shader in SDR; set ALLOW_SDR_MANUAL_OVERRIDE=1 to allow manual override in SDR.")
 > = 2;
 
 uniform float APLReferenceWhiteNits <
@@ -3591,7 +3603,9 @@ float DrawOSDModeValue(float2 texcoord, float2 topRight, float scale, float step
 }
 
 
-float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSceneNits, int inputMode)
+// Returns premultiplied RGBA (rgb = premultiplied overlay color, a = coverage/darken alpha)
+// so both HDR DrawStatsOverlay and SDR hardware-blended PS_SDR_OSD produce identical output.
+float4 ComputeStatsOverlayBlend(float2 texcoord, float rawInputAPL, float outputAPL, float maxSceneNits, int inputMode)
 {
     float aspect = ReShade::ScreenSize.x / ReShade::ScreenSize.y;
     float invAspect = 1.0 / max(aspect, 1e-6);
@@ -3633,7 +3647,7 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float padY = scale * 0.20;
 
     if (texcoord.x < left - padX || texcoord.x > right + padX || texcoord.y < top - padY || texcoord.y > bottom + padY)
-        return sceneColor;
+        return 0.0.xxxx;
 
     int nitDisplay = clamp(int(floor(max(maxSceneNits, 0.0) + 0.5)), 0, 99999);
 
@@ -3658,7 +3672,6 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
     float modeMask = DrawOSDModeValue(texcoord, modeRowRight, labelScale, labelStepX, labelGlyphWidth, aspect, inputMode);
 
     float bgAlpha = 0.18 * OSDBrightness * bgMask;
-    float3 shadedScene = sceneColor * (1.0 - bgAlpha);
 
     float3 inputColor = float3(0.30, 1.00, 0.30) * OSDBrightness;
     float3 outputColor = float3(1.00, 0.90, 0.18) * OSDBrightness;
@@ -3667,13 +3680,33 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
         ? float3(1.00, 0.45, 0.35) * OSDBrightness
         : float3(0.85, 0.85, 0.85) * OSDBrightness;
 
-    float3 result = shadedScene;
-    result = lerp(result, inputColor, saturate(rawLabelMask + inputMask));
-    result = lerp(result, outputColor, saturate(outputLabelMask + outputMask));
-    result = lerp(result, nitsColor, saturate(nitsLabelMask + nitsMask));
-    result = lerp(result, modeColor, saturate(modeLabelMask + modeMask));
+    float row1 = saturate(rawLabelMask + inputMask);
+    float row2 = saturate(outputLabelMask + outputMask);
+    float row3 = saturate(nitsLabelMask + nitsMask);
+    float row4 = saturate(modeLabelMask + modeMask);
 
-    return result;
+    float3 premulRGB = 0.0.xxx;
+    float alpha = bgAlpha;
+
+    premulRGB = lerp(premulRGB, inputColor, row1);
+    alpha = lerp(alpha, 1.0, row1);
+
+    premulRGB = lerp(premulRGB, outputColor, row2);
+    alpha = lerp(alpha, 1.0, row2);
+
+    premulRGB = lerp(premulRGB, nitsColor, row3);
+    alpha = lerp(alpha, 1.0, row3);
+
+    premulRGB = lerp(premulRGB, modeColor, row4);
+    alpha = lerp(alpha, 1.0, row4);
+
+    return float4(premulRGB, alpha);
+}
+
+float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSceneNits, int inputMode)
+{
+    float4 overlay = ComputeStatsOverlayBlend(texcoord, rawInputAPL, outputAPL, maxSceneNits, inputMode);
+    return sceneColor * (1.0 - overlay.a) + overlay.rgb;
 }
 
 
@@ -4141,10 +4174,36 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
 
 #endif
 
+#if !HDR_PIPELINE_COMPILED
+// Lightweight SDR-only pass: never reads ReShade::BackBuffer (skips BackBuffer copy),
+// culls off-screen when OSD is hidden, and hardware-blends the SDR OSD when visible.
+void VS_SDR_OSD(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD0)
+{
+    if (!EnableEOTFBoost || !ShowOSD)
+    {
+        texcoord = 0.0.xx;
+        position = float4(-2.0, -2.0, 0.0, 1.0);
+        return;
+    }
+
+    texcoord.x = (id == 2) ? 2.0 : 0.0;
+    texcoord.y = (id == 1) ? 2.0 : 0.0;
+    position = float4(texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 PS_SDR_OSD(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
+{
+    float4 overlay = ComputeStatsOverlayBlend(texcoord, 0.0, 0.0, 0.0, APL_MODE_SDR);
+    if (overlay.a <= 0.0)
+        discard;
+    return overlay;
+}
+#endif
+
 // Technique order preserves the required histogram synchronization boundaries.
 technique EOTF_Boost_1D_APL_LUT
 {
-
+#if HDR_PIPELINE_COMPILED
 
     pass APL_FrameSetup_And_RowHistogramClear
     {
@@ -4243,4 +4302,16 @@ technique EOTF_Boost_1D_APL_LUT
         VertexShader = PostProcessVS;
         PixelShader = PS_MainPass;
     }
+#else
+    pass SDR_OSD_Bypass
+    {
+        VertexShader = VS_SDR_OSD;
+        PixelShader = PS_SDR_OSD;
+        BlendEnable = true;
+        SrcBlend = ONE;
+        DestBlend = INVSRCALPHA;
+        SrcBlendAlpha = ZERO;
+        DestBlendAlpha = ONE;
+    }
+#endif
 }
