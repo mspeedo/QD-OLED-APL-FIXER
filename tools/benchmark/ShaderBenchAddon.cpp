@@ -90,12 +90,13 @@ struct __declspec(uuid("7c4a9b12-8e34-4f1a-9d21-6c5e8a2f3b91")) BenchRuntimeData
     size_t caseIdx = 0;
     std::map<std::string, std::string> appliedDefines;
     bool reloadedSinceRequest = false;
-    uint32_t waitFrames = 0;
+    bool initialReloadDone = false;
+    uint32_t settleFrames = 0;
+    ULONGLONG initStartTick = 0;
     ULONGLONG reloadStartTick = 0;
     uint32_t warmupLeft = 0;
     uint32_t measureFrames = 0;
     bool csvHeaderWritten = false;
-    uint32_t initialFrames = 0;
 
     std::vector<double> samplesMs;
 
@@ -469,6 +470,9 @@ static void FinishCurrentCase(reshade::api::effect_runtime *runtime, BenchRuntim
     const BenchCase &bc = data.cfg.cases[data.caseIdx];
     if (data.samplesMs.empty())
     {
+        std::printf("[ShaderBench] [%zu/%zu] %-30s -> NO_SAMPLES\n",
+                    data.caseIdx + 1, data.cfg.cases.size(), bc.name.c_str());
+        std::fflush(stdout);
         WriteCsvRow(runtime, data, bc.name, "NO_SAMPLES", 0, 0, 0, 0, 0, 0);
     }
     else
@@ -483,12 +487,18 @@ static void FinishCurrentCase(reshade::api::effect_runtime *runtime, BenchRuntim
         double p95 = data.samplesMs[p95Idx];
         double minV = data.samplesMs.front();
         double maxV = data.samplesMs.back();
+        std::printf("[ShaderBench] [%zu/%zu] %-30s -> median=%.4f ms  mean=%.4f ms  p95=%.4f ms  (%zu samples)\n",
+                    data.caseIdx + 1, data.cfg.cases.size(), bc.name.c_str(), median, mean, p95, n);
+        std::fflush(stdout);
         WriteCsvRow(runtime, data, bc.name, "OK", median, mean, p95, minV, maxV, n);
     }
 
     ++data.caseIdx;
     if (data.caseIdx >= data.cfg.cases.size())
     {
+        std::printf("[ShaderBench] All %zu cases complete! Saved %s\n",
+                    data.cfg.cases.size(), data.cfg.outputCsv.c_str());
+        std::fflush(stdout);
         data.state = BenchState::Done;
         WriteDoneFlag(data.cfg.doneFile);
     }
@@ -519,8 +529,14 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
 
     data.enabled = true;
     InitGpuTimers(runtime, data);
+    data.initStartTick = GetTickCount64();
+    data.initialReloadDone = false;
+    data.settleFrames = 0;
     data.state = BenchState::WaitInitialLoad;
-    reshade::log::message(reshade::log::level::info, "[ShaderBench] Loaded bench_config.txt; waiting for initial effect load.");
+    std::printf("[ShaderBench] Loaded bench_config.txt (%zu cases). Waiting for ReShade to finish compiling shaders...\n",
+                data.cfg.cases.size());
+    std::fflush(stdout);
+    reshade::log::message(reshade::log::level::info, "[ShaderBench] Loaded bench_config.txt; waiting for ReShade shader compilation.");
 }
 
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
@@ -541,8 +557,8 @@ static void OnReloadedEffects(reshade::api::effect_runtime *runtime)
         return;
 
     data->reloadedSinceRequest = true;
-    if (data->state == BenchState::WaitInitialLoad)
-        data->state = BenchState::SetupCase;
+    data->initialReloadDone = true;
+    data->settleFrames = 0;
 }
 
 static void OnBeginEffects(
@@ -651,8 +667,31 @@ static void OnPresent(reshade::api::effect_runtime *runtime)
 
     if (data->state == BenchState::WaitInitialLoad)
     {
-        if (++data->initialFrames >= 30)
-            data->state = BenchState::SetupCase;
+        auto tech = runtime->find_technique(data->cfg.effect.c_str(), data->cfg.technique.c_str());
+        bool techLoaded = (tech.handle != 0);
+        ULONGLONG elapsedMs = GetTickCount64() - data->initStartTick;
+
+        // Wait until ReShade finishes compiling shaders (reshade_reloaded_effects fired AND technique exists),
+        // or if effects were already loaded before init, wait at least 2 seconds with technique present.
+        if ((data->initialReloadDone && techLoaded) || (techLoaded && elapsedMs >= 2000ULL))
+        {
+            if (++data->settleFrames >= 60)
+            {
+                std::printf("[ShaderBench] Shader compiled and ready! Starting benchmark (%zu cases)...\n",
+                            data->cfg.cases.size());
+                std::fflush(stdout);
+                data->state = BenchState::SetupCase;
+            }
+        }
+        else if (elapsedMs > 60000ULL)
+        {
+            std::printf("[ShaderBench] ERROR: Timed out waiting 60s for %s (%s) to compile.\n",
+                        data->cfg.effect.c_str(), data->cfg.technique.c_str());
+            std::fflush(stdout);
+            WriteCsvRow(runtime, *data, "INITIAL_COMPILE", "COMPILE_FAIL", 0, 0, 0, 0, 0, 0);
+            data->state = BenchState::Done;
+            WriteDoneFlag(data->cfg.doneFile);
+        }
         return;
     }
 
@@ -666,10 +705,9 @@ static void OnPresent(reshade::api::effect_runtime *runtime)
         }
 
         const BenchCase &bc = data->cfg.cases[data->caseIdx];
-        bool needReload = (data->caseIdx == 0) || (bc.defines != data->appliedDefines);
+        bool needReload = (bc.defines != data->appliedDefines);
         if (needReload)
         {
-            // Clear any defines from the previous case that are not in the new case
             for (const auto &kv : data->appliedDefines)
             {
                 if (bc.defines.find(kv.first) == bc.defines.end())
@@ -681,7 +719,7 @@ static void OnPresent(reshade::api::effect_runtime *runtime)
             }
             data->appliedDefines = bc.defines;
             data->reloadedSinceRequest = false;
-            data->waitFrames = 0;
+            data->settleFrames = 0;
             data->reloadStartTick = GetTickCount64();
             runtime->reload_effect_next_frame(data->cfg.effect.c_str());
             data->state = BenchState::WaitReload;
@@ -693,9 +731,13 @@ static void OnPresent(reshade::api::effect_runtime *runtime)
 
     if (data->state == BenchState::WaitReload)
     {
-        ++data->waitFrames;
-        bool timedOut = (GetTickCount64() - data->reloadStartTick) > 15000ULL;
-        if ((data->reloadedSinceRequest && data->waitFrames >= 2) || timedOut)
+        bool timedOut = (GetTickCount64() - data->reloadStartTick) > 60000ULL;
+        if (data->reloadedSinceRequest)
+        {
+            if (++data->settleFrames >= 30)
+                data->state = BenchState::ApplyUniforms;
+        }
+        else if (timedOut)
         {
             data->state = BenchState::ApplyUniforms;
         }

@@ -1,42 +1,36 @@
-QD-OLED EOTF Boost Automated GPU Benchmark Suite
-================================================
+QD-OLED EOTF Boost GPU Shader Benchmark
+========================================
 
-What this does
---------------
-Runs deterministic GPU timestamp benchmarks (D3D11 hardware timestamp queries)
-against BOTH `shaders_main\EOTF_Boost_X36.fx` (production main) and
-`shaders_new\EOTF_Boost_X36.fx` (refactored test branch) across:
-  - HDR10 PQ  (BUFFER_COLOR_SPACE = 3, 13 combinations)
-  - HDR scRGB (BUFFER_COLOR_SPACE = 2,  3 combinations)
-  - SDR sRGB  (BUFFER_COLOR_SPACE = 1,  4 combinations)
+Tests whatever shader is placed in `Shaders\EOTF_Boost_X36.fx` across the
+8 combinations of:
+  - EnableEOTFBoost:               On / Off
+  - HDRSaturationPercent:          Off (100) / On (115)
+  - EnableHighlightDetailRecovery: On / Off
 
-Then prints and saves a side-by-side `comparison_report.md` (median ms, p95 ms,
-delta ms, delta %, and compile status for every case).
+Waits automatically for ReShade to finish compiling the shader before starting
+measurement, then records exact D3D11 hardware GPU timestamps (median, mean,
+p95, min, max in ms) to `results.csv` and prints a summary table.
 
-Quick Start (3 steps)
----------------------
-1. Download 64-bit ReShade WITH FULL ADD-ON SUPPORT from https://reshade.me/
-   Extract or install it and copy its 64-bit `ReShade64.dll` into THIS folder
-   renamed as:
-       dxgi.dll
-2. Make sure Windows HDR is ON (Settings -> System -> Display -> Use HDR) so
-   HDR10 PQ and scRGB swapchains advertise real HDR color spaces.
-3. Double-click `run_compare.bat` (default 3440x1440), or pass a custom
-   resolution from CMD:
-       run_compare.bat 3840 2160
+Quick Start
+-----------
+1. Copy 64-bit ReShade (FULL ADD-ON SUPPORT build from https://reshade.me/)
+   into this folder renamed as `dxgi.dll`.
+2. (Optional) Double-click `BenchmarkHost.exe` to open the interactive 120 FPS
+   window, press `Home` to verify/configure ReShade, then close the window.
+3. Double-click `run_bench.bat` to benchmark `Shaders\EOTF_Boost_X36.fx` in
+   HDR10 PQ at 3440x1440 @ 120 FPS (make sure Windows HDR is enabled).
 
-Customizing / Comparing Other Shader Versions
----------------------------------------------
-`ShaderBench.addon64` is 100% generic (works with ANY version of the shader
-without recompiling). To compare any two shader versions:
-  - Replace `shaders_main\EOTF_Boost_X36.fx` and `shaders_new\EOTF_Boost_X36.fx`
-  - Edit `bench_cases_pq.txt`, `bench_cases_scrgb.txt`, or `bench_cases_sdr.txt`
-  - Run `run_compare.bat` again!
+Optional CLI Arguments for run_bench.bat
+----------------------------------------
+  run_bench.bat [mode] [width] [height] [fps]
 
-Notes
------
-- You can also drop `ShaderBench.addon64` + a `bench_config.txt` into any D3D11
-  or D3D12 game folder with ReShade (full add-on support) to benchmark in-game.
-- Press ESC inside the test window at any time to abort.
-- If a case fails to compile, the add-on logs `COMPILE_FAIL` cleanly and
-  continues to the next case. Check `ReShade.log` for exact compiler diagnostics.
+Examples:
+  run_bench.bat pq 3440 1440 120
+  run_bench.bat scrgb 3440 1440 120
+  run_bench.bat sdr 3440 1440 120
+  run_bench.bat pq 3840 2160 120
+
+Testing Another Shader Version
+------------------------------
+Just replace `Shaders\EOTF_Boost_X36.fx` with any version you want to test
+(e.g. `main` or a test branch) and run `run_bench.bat` again!
