@@ -1680,13 +1680,13 @@ bool IsHighlightDetailActive(float4 boostParams)
 
 // Compute boosted luminance with edge-aware local highlight detail recovery
 // gated strictly by the analytical BT.2390 roll-off compression (1 - slope).
-float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boostParams, int2 pixelCoord)
+float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boostParams, float boostedKneeNits, int2 pixelCoord)
 {
     float safeInputLumaNits = max(inputLumaNits, 0.0);
     float fullyBoostedNits = safeInputLumaNits * max(boostParams.r, 0.0);
     float pqRange = boostParams.g;
 
-    if (pqRange <= 0.0)
+    if (pqRange <= 0.0 || fullyBoostedNits <= boostedKneeNits)
         return fullyBoostedNits;
 
     float fullyBoostedPQ = NitsToPQ(fullyBoostedNits);
@@ -1861,7 +1861,7 @@ float3 HDRSaturationBuffer(float3 color)
     return LinearToPQBT2100(adjusted / 10000.0);
 }
 
-float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, int2 pixelCoord)
+float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, float boostedKneeNits, int2 pixelCoord)
 {
     float3 result = color;
 
@@ -1880,7 +1880,7 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, int2 pixelCo
         }
         else
         {
-            float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
+            float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, boostedKneeNits, pixelCoord);
             float colorScale = boostedLumaNits / originalLumaNits;
 
             if (EnableColorPreservingBoostMode)
@@ -1910,7 +1910,7 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, int2 pixelCo
         }
         else
         {
-            float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
+            float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, boostedKneeNits, pixelCoord);
             float colorScale = boostedLumaNits / originalLumaNits;
 
             if (EnableColorPreservingBoostMode)
@@ -3720,14 +3720,40 @@ float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) 
 // ============================================================================
 
 // Cull the fullscreen triangle off-screen when boost, OSD, saturation, LUT, and graph are all inactive.
-void VS_MainPass(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD0)
+// Also hoists per-frame APL, boost parameters, and linear roll-off knee threshold out of PS_MainPass.
+void VS_MainPass(
+    in uint id : SV_VertexID,
+    out float4 position : SV_Position,
+    out float2 texcoord : TEXCOORD0,
+    out float4 outBoostParams : TEXCOORD1,
+    out float4 outMainMeta : TEXCOORD2)
 {
     bool shaderActive = IsShaderActiveForInputMode();
+    bool boostActive = EnableEOTFBoost && shaderActive;
+
+    float4 aplData = 0.0.xxxx;
+    float4 boostParams = float4(1.0, 0.0, 1.0, 0.0);
+    float boostedKneeNits = 0.0;
+
+    if (boostActive)
+    {
+        aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
+        if (aplData.a > 1e-6)
+        {
+            boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
+            if (boostParams.g > 0.0)
+            {
+                float kneePQ = saturate(saturate(boostParams.b) * boostParams.g + PQ_BLACK);
+                boostedKneeNits = PQToLinearScalar(kneePQ) * 10000.0;
+            }
+        }
+    }
+
     bool needsMainPass = ShowOSD;
     if (shaderActive)
     {
         needsMainPass = needsMainPass
-            || EnableEOTFBoost
+            || (boostActive && aplData.a > 1e-6)
             || (HDRSaturationPercent != 100);
 #if PQHDRLUT_ENABLE
         needsMainPass = needsMainPass || EnablePQHDRLUT;
@@ -3736,6 +3762,9 @@ void VS_MainPass(in uint id : SV_VertexID, out float4 position : SV_Position, ou
         needsMainPass = needsMainPass || ShowAPLGraph;
 #endif
     }
+
+    outBoostParams = boostParams;
+    outMainMeta = float4(aplData.g, aplData.a, boostedKneeNits, 0.0);
 
     if (!needsMainPass)
     {
@@ -3750,26 +3779,24 @@ void VS_MainPass(in uint id : SV_VertexID, out float4 position : SV_Position, ou
 }
 
 // Pass 6: apply boost, highlight detail recovery, and saturation, calibrate, then draw the OSD and graph.
-float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
+float4 PS_MainPass(
+    float4 vpos : SV_Position,
+    float2 texcoord : TEXCOORD0,
+    float4 boostParams : TEXCOORD1,
+    float4 mainMeta : TEXCOORD2) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
     int inputMode = ResolveEffectiveAPLInputMode();
     bool shaderActive = (inputMode < APL_MODE_SDR);
     bool boostActive = EnableEOTFBoost && shaderActive;
-
-    float4 aplData = 0.0.xxxx;
     float3 finalColor = color;
 
     if (shaderActive)
     {
-        if (boostActive)
-            aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
-
-        if (boostActive && aplData.a > 1e-6)
+        if (boostActive && mainMeta.y > 1e-6)
         {
-            float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
             int2 pixelCoord = clamp(int2(vpos.xy), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
-            finalColor = ApplyBoostAndHDRSaturation(color, boostParams, pixelCoord);
+            finalColor = ApplyBoostAndHDRSaturation(color, boostParams, mainMeta.z, pixelCoord);
         }
         else
         {
@@ -3791,7 +3818,7 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_
         {
             float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
             rawInputAPL = saturate(instantData.r);
-            outputAPL = boostActive ? saturate(aplData.g) : rawInputAPL;
+            outputAPL = boostActive ? saturate(mainMeta.x) : rawInputAPL;
             currentMaxSceneNits = max(instantData.g, 0.0);
         }
         finalColor = DrawStatsOverlay(
