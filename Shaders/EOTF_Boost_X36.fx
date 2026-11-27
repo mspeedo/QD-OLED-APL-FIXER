@@ -1881,61 +1881,70 @@ float3 HDRSaturationBuffer(float3 color)
 
 float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, int2 pixelCoord)
 {
-    if (boostParams.r <= 1.000001 && boostParams.g <= 0.0)
-        return HDRSaturationBuffer(color);
+    float3 result = color;
 
-    if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
+    if (boostParams.r <= 1.000001 && boostParams.g <= 0.0)
+    {
+        result = HDRSaturationBuffer(color);
+    }
+    else if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
     {
         float3 linearColorNits = PQToLinearBT2100(saturate(color)) * 10000.0;
         float originalLumaNits = max(GetLuma2020(linearColorNits), 0.0);
 
         if (originalLumaNits <= 1e-6)
-            return HDRSaturationBuffer(color);
-
-        float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
-        float colorScale = boostedLumaNits / originalLumaNits;
-
-        if (EnableColorPreservingBoostMode)
         {
-
-
-            float outputChannelLimitNits = (BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0;
-            float maxHuePreservingScale = ComputeMaxHuePreservingScale(linearColorNits, outputChannelLimitNits);
-            colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+            result = HDRSaturationBuffer(color);
         }
+        else
+        {
+            float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
+            float colorScale = boostedLumaNits / originalLumaNits;
 
-        float3 boostedColorNits = linearColorNits * colorScale;
+            if (EnableColorPreservingBoostMode)
+            {
+                float outputChannelLimitNits = (BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0;
+                float maxHuePreservingScale = ComputeMaxHuePreservingScale(linearColorNits, outputChannelLimitNits);
+                colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+            }
 
-        // Match the original PQ boost output boundary before adjusting chroma.
-        if (HDRSaturationPercent != 100)
-            boostedColorNits = HDRSaturationLinearRGB(clamp(boostedColorNits, 0.0, 10000.0), true);
+            float3 boostedColorNits = linearColorNits * colorScale;
 
-        return LinearToPQBT2100(saturate(max(boostedColorNits, 0.0) / 10000.0));
+            // Match the original PQ boost output boundary before adjusting chroma.
+            if (HDRSaturationPercent != 100)
+                boostedColorNits = HDRSaturationLinearRGB(clamp(boostedColorNits, 0.0, 10000.0), true);
+
+            result = LinearToPQBT2100(saturate(max(boostedColorNits, 0.0) / 10000.0));
+        }
     }
-
-    float3 linearColor = color;
-
-
-    float originalLumaNits = max(GetLuma709(linearColor) * SIGNAL_REFERENCE_NITS, 0.0);
-
-    if (originalLumaNits <= 1e-6)
-        return HDRSaturationBuffer(color);
-
-    float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
-    float colorScale = boostedLumaNits / originalLumaNits;
-
-    if (EnableColorPreservingBoostMode)
+    else
     {
+        float3 linearColor = color;
+        float originalLumaNits = max(GetLuma709(linearColor) * SIGNAL_REFERENCE_NITS, 0.0);
 
+        if (originalLumaNits <= 1e-6)
+        {
+            result = HDRSaturationBuffer(color);
+        }
+        else
+        {
+            float boostedLumaNits = ComputeBoostedLumaNitsWithHighlightDetail(originalLumaNits, boostParams, pixelCoord);
+            float colorScale = boostedLumaNits / originalLumaNits;
 
-        float outputChannelLimit = ((BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0) / max(SIGNAL_REFERENCE_NITS, 1.0);
-        // Preserve signed scRGB through conversion before checking Rec.2020 channel headroom.
-        float3 rec2020Color = HDRSaturationRec709ToRec2020(linearColor);
-        float maxHuePreservingScale = ComputeMaxHuePreservingScale(rec2020Color, outputChannelLimit);
-        colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+            if (EnableColorPreservingBoostMode)
+            {
+                float outputChannelLimit = ((BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0) / max(SIGNAL_REFERENCE_NITS, 1.0);
+                // Preserve signed scRGB through conversion before checking Rec.2020 channel headroom.
+                float3 rec2020Color = HDRSaturationRec709ToRec2020(linearColor);
+                float maxHuePreservingScale = ComputeMaxHuePreservingScale(rec2020Color, outputChannelLimit);
+                colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+            }
+
+            result = HDRSaturationBuffer(linearColor * colorScale);
+        }
     }
 
-    return HDRSaturationBuffer(linearColor * colorScale);
+    return result;
 }
 
 
@@ -2416,24 +2425,24 @@ float DrawDigitAt(float2 texcoord, float2 topRight, float scale, float aspect, i
 
 float DrawNumberRightAligned(float2 texcoord, float2 topRight, float scale, float aspect, int value)
 {
-    int v = max(value, 0);
-    int digits = CountDigitsInt(v);
+    uint v = uint(max(value, 0));
+    int digits = CountDigitsInt(int(v));
     float stepX = (scale * 0.82) / max(aspect, 1e-6);
     float mask = 0.0;
 
-    mask += DrawDigitAt(texcoord, topRight, scale, aspect, v % 10);
+    mask += DrawDigitAt(texcoord, topRight, scale, aspect, int(v % 10u));
 
     if (digits >= 2)
-        mask += DrawDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (v / 10) % 10);
+        mask += DrawDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, int((v / 10u) % 10u));
 
     if (digits >= 3)
-        mask += DrawDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (v / 100) % 10);
+        mask += DrawDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, int((v / 100u) % 10u));
 
     if (digits >= 4)
-        mask += DrawDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, (v / 1000) % 10);
+        mask += DrawDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, int((v / 1000u) % 10u));
 
     if (digits >= 5)
-        mask += DrawDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (v / 10000) % 10);
+        mask += DrawDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, int((v / 10000u) % 10u));
 
     return saturate(mask);
 }
@@ -2749,7 +2758,7 @@ int APL_EncodeWithinBinOffset10(int lumaQ4, int lumaBin)
 
 float APL_ReconstructMeanLumaQ4(int binIndex, bool colorHistogram, float pixelCount, float offsetSum10)
 {
-    int lumaBin = colorHistogram ? (binIndex / APL_FFH_COLOR_RATIO_BINS) : binIndex;
+    int lumaBin = colorHistogram ? int(uint(binIndex) / uint(APL_FFH_COLOR_RATIO_BINS)) : binIndex;
     int lowerQ4 = 0;
     int upperQ4 = 0;
     APL_HistogramLumaBinBoundsQ4(lumaBin, lowerQ4, upperQ4);
@@ -3026,7 +3035,7 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
         [loop]
         for (int entry = localIndex; entry < totalEntries; entry += 256)
         {
-            int rowSlot = entry / activeBins;
+            int rowSlot = int(uint(entry) / uint(activeBins));
             int binIndex = entry - rowSlot * activeBins;
             int rowIndex = APL_GetPhysicalRowFromDispatchSlot(rowSlot, APL_SetupRollingPhase);
             if (rowIndex < APL_FFH_TILE_COUNT_Y)
@@ -3460,23 +3469,23 @@ float DrawOSDDotAt(float2 texcoord, float2 topRight, float scale, float aspect)
 
 float DrawOSDAPLPercent2(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, float currentAPL)
 {
-    int aplPctX100 = clamp(int(floor(saturate(currentAPL) * 10000.0 + 0.5)), 0, 10000);
-    int integerPart = aplPctX100 / 100;
-    int fractionalPart = aplPctX100 % 100;
+    uint aplPctX100 = uint(clamp(int(floor(saturate(currentAPL) * 10000.0 + 0.5)), 0, 10000));
+    uint integerPart = aplPctX100 / 100u;
+    uint fractionalPart = aplPctX100 % 100u;
 
     float mask = 0.0;
 
 
-    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, fractionalPart % 10);
-    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (fractionalPart / 10) % 10);
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, int(fractionalPart % 10u));
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, int((fractionalPart / 10u) % 10u));
     mask += DrawOSDDotAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect);
-    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, integerPart % 10);
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, int(integerPart % 10u));
 
-    if (integerPart >= 10)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (integerPart / 10) % 10);
+    if (integerPart >= 10u)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, int((integerPart / 10u) % 10u));
 
-    if (integerPart >= 100)
-        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 5.0, 0.0), scale, aspect, (integerPart / 100) % 10);
+    if (integerPart >= 100u)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 5.0, 0.0), scale, aspect, int((integerPart / 100u) % 10u));
 
     return saturate(mask);
 }
