@@ -89,7 +89,6 @@
 #define MONITOR_DEFAULT_ROLLOFF_NITS    1300.0
 #define MONITOR_ROLLOFF_SLIDER_MAX      1500.0
 #define MONITOR_DEFAULT_FREEZE_APL      50.0
-#define MONITOR_FREEZE_APL_UI_MAX       95.0
 #define MONITOR_DEFAULT_GRAPH_AXIS_NITS 1300.0
 
 // Dense live 1D APL compensation table (REQUIRED when porting to another monitor).
@@ -309,7 +308,7 @@ uniform float APLReferenceWhiteNits <
 
 uniform float CompensationFreezeAPLPercent <
     ui_type = "slider";
-    ui_min = 0.0; ui_max = MONITOR_FREEZE_APL_UI_MAX; ui_step = 0.1;
+    ui_min = 0.0; ui_max = 95.0; ui_step = 0.1;
     ui_label = "Compensation Freeze APL %";
     UI_TOOLTIP("Holds compensation at this solved APL for all higher APL values. 0 disables it.")
 > = MONITOR_DEFAULT_FREEZE_APL;
