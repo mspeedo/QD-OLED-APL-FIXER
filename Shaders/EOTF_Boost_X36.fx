@@ -1175,7 +1175,7 @@ bool IsEOTFBoostActive()
 
 bool NeedsAPLProcessing()
 {
-    return IsEOTFBoostActive();
+    return IsShaderActiveForInputMode() && (EnableEOTFBoost || ShowOSD);
 }
 
 // Optional PQ Rec.2020 calibration LUT.
@@ -2953,9 +2953,10 @@ void APL_UpdateSmoothClock(bool hasPrevious)
 void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID)
 {
     bool aplActive = NeedsAPLProcessing();
+    bool boostActive = IsEOTFBoostActive();
     int localIndex = int(threadID.x);
     int activeBins = APL_ActiveHistogramBins();
-    bool needsMaxHistogram = aplActive && EnableColorPreservingBoostMode;
+    bool needsMaxHistogram = boostActive && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
 
@@ -2987,7 +2988,7 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
     if (localIndex < 3)
     {
         float4 candidateParams = float4(1.0, 0.0, 1.0, 0.0);
-        if (aplActive)
+        if (boostActive)
         {
             float gMax = ComputeCandidateMaxLogGain();
             float candidateLogGain = gMax * (float(localIndex + 1) / 3.0);
@@ -3013,7 +3014,7 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
 #endif
 
 
-    if (!trackExactMax)
+    if (aplActive && !trackExactMax)
     {
         [loop]
         for (int rowIndex = localIndex; rowIndex < APL_FFH_TILE_COUNT_Y; rowIndex += 256)
@@ -3059,7 +3060,7 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
 
     uint localIndex = threadID.y * APL_FFH_THREADS_X + threadID.x;
     int activeBins = APL_ActiveHistogramBins();
-    bool needsMaxHistogram = aplActive && EnableColorPreservingBoostMode;
+    bool needsMaxHistogram = IsEOTFBoostActive() && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
     int rollingPhase = int(tex2Dfetch(SamplerAPLPrev, int2(0, 0)).g);
@@ -3170,7 +3171,7 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
     if (tex2Dfetch(SamplerAPLPrev, int2(0, 0)).g < 0.0)
         return;
 
-    bool needsMaxHistogram = aplActive && EnableColorPreservingBoostMode;
+    bool needsMaxHistogram = IsEOTFBoostActive() && EnableColorPreservingBoostMode;
     bool trackExactMax = aplActive && ShowOSD;
 
     int countSum = 0;
@@ -3300,14 +3301,25 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         return;
     }
 
-    bool colorHistogram = aplActive && EnableColorPreservingBoostMode;
+    bool boostActive = IsEOTFBoostActive();
+    bool colorHistogram = boostActive && EnableColorPreservingBoostMode;
     int activeBins = colorHistogram ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
 
     float4 prevData = tex2Dfetch(SamplerAPLPrev, int2(0, 0));
     if (prevData.g < 0.0)
     {
         if (localIndex == 0)
-            UpdateSmoothedLogGain(prevData.r, prevData.a, prevData.b > 0.0);
+        {
+            if (boostActive)
+            {
+                UpdateSmoothedLogGain(prevData.r, prevData.a, prevData.b > 0.0);
+            }
+            else
+            {
+                tex2Dstore(StorageAPL, int2(0, 0), float4(prevData.r, prevData.r, 1.0, 0.0));
+                tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
+            }
+        }
         return;
     }
 
@@ -3327,15 +3339,18 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             float rawMetric = saturate(sceneNits / max(APLReferenceWhiteNits, 1.0));
             float3 candidateMetrics = rawMetric.xxx;
 
-            float maxChannelNits = 0.0;
-            if (colorHistogram)
+            if (boostActive)
             {
-                float maxSumNits = tex2Dfetch(SamplerAPLGlobalHistMaxNits, binCoord);
-                maxChannelNits = max((maxSumNits / pixelCount) * 2.0, sceneNits);
+                float maxChannelNits = 0.0;
+                if (colorHistogram)
+                {
+                    float maxSumNits = tex2Dfetch(SamplerAPLGlobalHistMaxNits, binCoord);
+                    maxChannelNits = max((maxSumNits / pixelCount) * 2.0, sceneNits);
+                }
+                candidateMetrics.x = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(1));
+                candidateMetrics.y = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(2));
+                candidateMetrics.z = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(3));
             }
-            candidateMetrics.x = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(1));
-            candidateMetrics.y = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(2));
-            candidateMetrics.z = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(3));
 
             weighted = float4(rawMetric, candidateMetrics) * pixelCount;
         }
@@ -3356,16 +3371,6 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
 
     if (localIndex == 0)
     {
-
-
-        if (!aplActive)
-        {
-            tex2Dstore(StorageAPLInstant, int2(0, 0), 0.0.xxxx);
-            tex2Dstore(StorageAPL, int2(0, 0), 0.0.xxxx);
-            tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
-            return;
-        }
-
         float rawAPL = 0.0;
         float3 responseNodes = 0.0.xxx;
         float exactRollingMaxNits = 0.0;
@@ -3384,16 +3389,23 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         int currentRollingPhase = APL_DecodeStoredRollingPhase(prevData.g);
         int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
 
-
-        float gMax = ComputeCandidateMaxLogGain();
-        float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
-
         tex2Dstore(
             StorageAPLInstant,
             int2(0, 0),
             float4(rawAPL, exactRollingMaxNits, float(nextRollingPhase), (totalPixelCount > 0.0) ? 1.0 : 0.0)
         );
-        UpdateSmoothedLogGain(currentDisplayAPL, prevData.a, prevData.b > 0.0);
+
+        if (boostActive)
+        {
+            float gMax = ComputeCandidateMaxLogGain();
+            float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
+            UpdateSmoothedLogGain(currentDisplayAPL, prevData.a, prevData.b > 0.0);
+        }
+        else
+        {
+            tex2Dstore(StorageAPL, int2(0, 0), float4(rawAPL, rawAPL, 1.0, 0.0));
+            tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
+        }
     }
 }
 
@@ -3841,8 +3853,38 @@ float4 PS_HL_BilateralV(float4 vpos : SV_Position, float2 hlParams : TEXCOORD0) 
 // 10. MAIN OUTPUT PASS, OPTIONAL GRAPH PASSES & TECHNIQUE
 // ============================================================================
 
+// Cull the fullscreen triangle off-screen when boost, OSD, saturation, LUT, and graph are all inactive.
+void VS_MainPass(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD0)
+{
+    bool shaderActive = IsShaderActiveForInputMode();
+    bool needsMainPass = ShowOSD;
+    if (shaderActive)
+    {
+        needsMainPass = needsMainPass
+            || EnableEOTFBoost
+            || (HDRSaturationPercent != 100);
+#if PQHDRLUT_ENABLE
+        needsMainPass = needsMainPass || EnablePQHDRLUT;
+#endif
+#if ENABLE_APL_GRAPH
+        needsMainPass = needsMainPass || ShowAPLGraph;
+#endif
+    }
+
+    if (!needsMainPass)
+    {
+        texcoord = 0.0.xx;
+        position = float4(-2.0, -2.0, 0.0, 1.0);
+        return;
+    }
+
+    texcoord.x = (id == 2) ? 2.0 : 0.0;
+    texcoord.y = (id == 1) ? 2.0 : 0.0;
+    position = float4(texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
 // Pass 6: apply boost, highlight detail recovery, and saturation, calibrate, then draw the OSD and graph.
-float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
 {
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
     int inputMode = ResolveEffectiveAPLInputMode();
@@ -3857,7 +3899,7 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
         if (boostActive)
             aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
 
-        if (aplData.a > 1e-6)
+        if (boostActive && aplData.a > 1e-6)
         {
             float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
             int2 pixelCoord = clamp(int2(vpos.xy), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
@@ -3874,21 +3916,23 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
 #endif
     }
 
-    if (EnableEOTFBoost && ShowOSD)
+    if (ShowOSD)
     {
         float rawInputAPL = 0.0;
+        float outputAPL = 0.0;
         float currentMaxSceneNits = 0.0;
-        if (boostActive)
+        if (shaderActive)
         {
             float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
             rawInputAPL = saturate(instantData.r);
+            outputAPL = boostActive ? saturate(aplData.g) : rawInputAPL;
             currentMaxSceneNits = max(instantData.g, 0.0);
         }
         finalColor = DrawStatsOverlay(
             texcoord,
             finalColor,
             rawInputAPL,
-            saturate(aplData.g),
+            outputAPL,
             currentMaxSceneNits,
             inputMode
         );
@@ -4179,7 +4223,7 @@ float4 PS_CalcGraphCurves(float4 vpos : SV_Position, float2 texcoord : TexCoord)
 // culls off-screen when OSD is hidden, and hardware-blends the SDR OSD when visible.
 void VS_SDR_OSD(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD0)
 {
-    if (!EnableEOTFBoost || !ShowOSD)
+    if (!ShowOSD)
     {
         texcoord = 0.0.xx;
         position = float4(-2.0, -2.0, 0.0, 1.0);
@@ -4299,7 +4343,7 @@ technique EOTF_Boost_1D_APL_LUT
 
     pass Main_Boost
     {
-        VertexShader = PostProcessVS;
+        VertexShader = VS_MainPass;
         PixelShader = PS_MainPass;
     }
 #else
