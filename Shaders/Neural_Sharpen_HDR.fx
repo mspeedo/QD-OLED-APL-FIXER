@@ -171,6 +171,42 @@ uniform int ViewMode <
 > = 0;
 #endif
 
+#if ENABLE_UI_TOOLTIPS
+uniform int _PreprocessorHelp <
+    ui_category = "Preprocessor Definitions Help";
+    ui_category_closed = true;
+    ui_type = "radio";
+    ui_label = " ";
+    ui_text =
+        "NEURAL_SHARPEN_PROFILE (default: 0)\n"
+        "  0 = Ultra Fast 5-Tap Bilinear (5 TEX, 40 FMAs, fastest)\n"
+        "  1 = Balanced Fast 9-Tap (9 POINT TEX, 108 FMAs, R2=0.97 vs Exact)\n"
+        "  2 = Exact 12-Channel Barbatos CNN (9 POINT TEX, 264 FMAs)\n"
+        "\n"
+        "NEURAL_SHARPEN_MODEL (default: 1)\n"
+        "  1 = Model A only (Balanced, smallest shader)\n"
+        "  2 = Model B only (Edge-Enhanced, smallest shader)\n"
+        "  0 = Both models compiled with runtime UI switcher\n"
+        "\n"
+        "ENABLE_DEBUG_VIEWS (default: 0)\n"
+        "  0 = Stripped at compile time (fastest)\n"
+        "  1 = Enables Sharpening Map & Residual Magnitude debug views\n"
+        "\n"
+        "ALLOW_MANUAL_COLOR_SPACE (default: 0)\n"
+        "  0 = Compile-time specialized to detected BUFFER_COLOR_SPACE\n"
+        "      (runtime Color Space selector still appears if Unknown)\n"
+        "  1 = Always show manual SDR / scRGB / HDR10 PQ selector\n"
+        "\n"
+        "USE_FP16_CNN (default: 0)\n"
+        "  0 = FP32 float4 CNN (recommended / faster on D3D11 SM5.0)\n"
+        "  1 = FP16 min16float4 CNN\n"
+        "\n"
+        "ENABLE_UI_TOOLTIPS (default: 1)\n"
+        "  1 = Show tooltips and this preprocessor help section\n"
+        "  0 = Strip all UI tooltips and help text";
+>;
+#endif
+
 // Dedicated POINT sampler for exact 1-texel BackBuffer loads (avoids 2x2 bilinear L1 tag lookup).
 sampler sBackBufferPoint
 {
@@ -898,7 +934,16 @@ void PS_Apply(
 
 technique Neural_Sharpen_HDR <
     ui_label = "Neural Sharpen HDR";
-    ui_tooltip = "Single-pass, HDR-aware, GPU-optimized Neural Sharpening (based on Barbatos Neural Sharpen 2.8, MIT). Set NEURAL_SHARPEN_PROFILE=0 (Ultra Fast 5-Tap), 1 (Fast 9-Tap), or 2 (Exact 12-Ch).";
+    ui_tooltip =
+        "Single-pass, HDR-aware, GPU-optimized Neural Sharpening (based on Barbatos Neural Sharpen 2.8, MIT).\n"
+        "Supports HDR10 PQ, scRGB Linear, and SDR.\n\n"
+        "Preprocessor definitions:\n"
+        "  NEURAL_SHARPEN_PROFILE: 0=Ultra Fast 5-Tap (default), 1=Fast 9-Tap, 2=Exact 12-Ch\n"
+        "  NEURAL_SHARPEN_MODEL: 1=Model A (default), 2=Model B, 0=Both (UI selector)\n"
+        "  ENABLE_DEBUG_VIEWS: 0=Off (default), 1=On\n"
+        "  ALLOW_MANUAL_COLOR_SPACE: 0=Auto compile-time (default), 1=Manual selector\n"
+        "  USE_FP16_CNN: 0=FP32 (default, faster on D3D11), 1=FP16\n"
+        "  ENABLE_UI_TOOLTIPS: 1=On (default), 0=Off";
 >
 {
     pass Apply
