@@ -50,7 +50,7 @@ struct VSOut
 VSOut VSMain(uint id : SV_VertexID)
 {
     VSOut o;
-    o.uv = float2((id == 2) ? 2.0 : 0.0, (id == 1) ? 2.0 : 0.0);
+    o.uv = float2((id == 1) ? 2.0 : 0.0, (id == 2) ? 2.0 : 0.0);
     o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     return o;
 }
@@ -347,6 +347,13 @@ int main(int argc, char **argv)
     ComPtr<ID3D11Buffer> cb;
     device->CreateBuffer(&cbDesc, nullptr, &cb);
 
+    D3D11_RASTERIZER_DESC rsDesc = {};
+    rsDesc.FillMode = D3D11_FILL_SOLID;
+    rsDesc.CullMode = D3D11_CULL_NONE;
+    rsDesc.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> rs;
+    device->CreateRasterizerState(&rsDesc, &rs);
+
     D3D11_VIEWPORT vp = {};
     vp.Width = static_cast<float>(cfg.width);
     vp.Height = static_cast<float>(cfg.height);
@@ -402,7 +409,11 @@ int main(int argc, char **argv)
 
         ID3D11RenderTargetView *rtvs[1] = { rtv.Get() };
         context->OMSetRenderTargets(1, rtvs, nullptr);
+        context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        context->OMSetDepthStencilState(nullptr, 0);
+        context->RSSetState(rs.Get());
         context->RSSetViewports(1, &vp);
+        context->IASetInputLayout(nullptr);
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context->VSSetShader(vs.Get(), nullptr, 0);
         context->PSSetShader(ps.Get(), nullptr, 0);
