@@ -2865,7 +2865,7 @@ void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int max
 // 200 FPS stream. Allow 1 ms of clock quantization and carry that error forward.
 bool APL_MeasurementDue(bool hasPrevious)
 {
-    int rate = clamp(APLMeasurementRate, 0, 240);
+    int rate = max(APLMeasurementRate, 0);
     uint lastMs = uint(tex2Dfetch(StorageAPLMeasurementClock, int2(0, 0)));
     int lastRate = tex2Dfetch(StorageAPLMeasurementClock, int2(2, 0));
     uint deltaMs = MeasurementClockMs - lastMs;
