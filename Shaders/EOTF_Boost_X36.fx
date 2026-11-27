@@ -851,27 +851,6 @@ storage2D<float> StoragePQFrameBoost
     Texture = TexPQFrameBoost;
 };
 
-// 1024-entry Linear->PQ LUT indexed by L^(1/8) = sqrt(sqrt(sqrt(L))), ~20-bit accurate.
-texture TexPQFrameLinearToPQ
-{
-    Width = 1024;
-    Height = 1;
-    Format = R32F;
-};
-sampler SamplerPQFrameLinearToPQ
-{
-    Texture = TexPQFrameLinearToPQ;
-    AddressU = CLAMP;
-    AddressV = CLAMP;
-    MinFilter = LINEAR;
-    MagFilter = LINEAR;
-    MipFilter = POINT;
-};
-storage2D<float> StoragePQFrameLinearToPQ
-{
-    Texture = TexPQFrameLinearToPQ;
-};
-
 
 // Persistent row histograms. The count texture also stores the row maximum.
 texture TexAPLRowHistCount
@@ -1229,35 +1208,6 @@ float3 PQFrameLUT_Boosted(float3 pq)
         tex2Dlod(SamplerPQFrameBoost, float4(u.r, 0.5, 0.0, 0.0)).r,
         tex2Dlod(SamplerPQFrameBoost, float4(u.g, 0.5, 0.0, 0.0)).r,
         tex2Dlod(SamplerPQFrameBoost, float4(u.b, 0.5, 0.0, 0.0)).r
-    );
-}
-
-float PQFrameLUT_ToNitsScalar(float pq)
-{
-    float u = saturate(pq) * (1023.0 / 1024.0) + (0.5 / 1024.0);
-    return tex2Dlod(SamplerPQFrameNits, float4(u, 0.5, 0.0, 0.0)).r;
-}
-
-float PQFrameLUT_FromLinearScalar(float linearValue)
-{
-    float s = sqrt(sqrt(sqrt(saturate(linearValue))));
-    float u = s * (1023.0 / 1024.0) + (0.5 / 1024.0);
-    return tex2Dlod(SamplerPQFrameLinearToPQ, float4(u, 0.5, 0.0, 0.0)).r;
-}
-
-float PQFrameLUT_FromNitsScalar(float nits)
-{
-    return PQFrameLUT_FromLinearScalar(nits * 0.0001);
-}
-
-float3 PQFrameLUT_FromLinearRGB(float3 linearValue)
-{
-    float3 s = sqrt(sqrt(sqrt(saturate(linearValue))));
-    float3 u = s * (1023.0 / 1024.0) + (0.5 / 1024.0);
-    return float3(
-        tex2Dlod(SamplerPQFrameLinearToPQ, float4(u.r, 0.5, 0.0, 0.0)).r,
-        tex2Dlod(SamplerPQFrameLinearToPQ, float4(u.g, 0.5, 0.0, 0.0)).r,
-        tex2Dlod(SamplerPQFrameLinearToPQ, float4(u.b, 0.5, 0.0, 0.0)).r
     );
 }
 
@@ -1804,7 +1754,7 @@ float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boos
     if (pqRange <= 0.0 || fullyBoostedNits <= boostedKneeNits)
         return fullyBoostedNits;
 
-    float fullyBoostedPQ = PQFrameLUT_FromNitsScalar(fullyBoostedNits);
+    float fullyBoostedPQ = NitsToPQ(fullyBoostedNits);
     float kneeStart = saturate(boostParams.b);
     float e1 = saturate((fullyBoostedPQ - PQ_BLACK) / pqRange);
 
@@ -1824,9 +1774,9 @@ float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boos
     float rolledOffPQ = saturate(e2 * pqRange + PQ_BLACK);
 
     if (!IsHighlightDetailActive(boostParams))
-        return max(PQFrameLUT_ToNitsScalar(rolledOffPQ), safeInputLumaNits);
+        return max(PQToLinearScalar(rolledOffPQ) * 10000.0, safeInputLumaNits);
 
-    float origPQ = PQFrameLUT_FromNitsScalar(safeInputLumaNits);
+    float origPQ = NitsToPQ(safeInputLumaNits);
     if (rolledOffPQ <= origPQ)
         return safeInputLumaNits;
 
@@ -1841,7 +1791,7 @@ float ComputeBoostedLumaNitsWithHighlightDetail(float inputLumaNits, float4 boos
         rolledOffPQ = clamp(rolledOffPQ + HIGHLIGHT_DETAIL_RECOVERY * compression * detailPQ, origPQ, ceilingPQ);
     }
 
-    return max(PQFrameLUT_ToNitsScalar(rolledOffPQ), safeInputLumaNits);
+    return max(PQToLinearScalar(rolledOffPQ) * 10000.0, safeInputLumaNits);
 }
 
 float Max3(float3 v)
@@ -1973,7 +1923,7 @@ float3 HDRSaturationBuffer(float3 color)
     if (all(adjusted == nits))
         return color;
 
-    return PQFrameLUT_FromLinearRGB(adjusted * 0.0001);
+    return LinearToPQBT2100(adjusted / 10000.0);
 }
 
 float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, float boostedKneeNits, float sourceKneePQ, int2 pixelCoord)
@@ -2018,7 +1968,7 @@ float3 ApplyBoostAndHDRSaturation(float3 color, float4 boostParams, float booste
                 if (HDRSaturationPercent != 100)
                     boostedColorNits = HDRSaturationLinearRGB(clamp(boostedColorNits, 0.0, 10000.0), true);
 
-                result = PQFrameLUT_FromLinearRGB(boostedColorNits * 0.0001);
+                result = LinearToPQBT2100(saturate(max(boostedColorNits, 0.0) / 10000.0));
             }
         }
     }
@@ -3421,11 +3371,9 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             for (int k = 0; k < 4; ++k)
             {
                 int idx = localIndex + k * 256;
-                float t = float(idx) * (1.0 / 1023.0);
-                float t2 = t * t;
-                float t4 = t2 * t2;
-                tex2Dstore(StoragePQFrameNits, int2(idx, 0), PQToLinearScalar(t) * 10000.0);
-                tex2Dstore(StoragePQFrameLinearToPQ, int2(idx, 0), LinearToPQBT2100(t4 * t4));
+                float pqCode = float(idx) * (1.0 / 1023.0);
+                float nits = PQToLinearScalar(pqCode) * 10000.0;
+                tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
             }
         }
         return;
@@ -3543,24 +3491,20 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     }
     barrier();
 
-    bool isPQMode = (ResolveEffectiveAPLInputMode() == APL_MODE_PQ);
-    float frameGain = max(APL_FrameLutGain, 0.0);
-    bool buildFusedBoost = isPQMode && (frameGain > 1.000001) && (HDRSaturationPercent == 100) && !EnableColorPreservingBoostMode;
-    [unroll]
-    for (int k = 0; k < 4; ++k)
+    if (ResolveEffectiveAPLInputMode() == APL_MODE_PQ)
     {
-        int idx = localIndex + k * 256;
-        float t = float(idx) * (1.0 / 1023.0);
-        float nits = PQToLinearScalar(t) * 10000.0;
-        float t2 = t * t;
-        float t4 = t2 * t2;
-        tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
-        tex2Dstore(StoragePQFrameLinearToPQ, int2(idx, 0), LinearToPQBT2100(t4 * t4));
-        if (isPQMode)
+        float frameGain = max(APL_FrameLutGain, 0.0);
+        bool buildFusedBoost = (frameGain > 1.000001) && (HDRSaturationPercent == 100) && !EnableColorPreservingBoostMode;
+        [unroll]
+        for (int k = 0; k < 4; ++k)
         {
+            int idx = localIndex + k * 256;
+            float pqCode = float(idx) * (1.0 / 1023.0);
+            float nits = PQToLinearScalar(pqCode) * 10000.0;
             float boostedPQ = buildFusedBoost
                 ? LinearToPQBT2100(saturate((nits * frameGain) / 10000.0))
-                : t;
+                : pqCode;
+            tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
             tex2Dstore(StoragePQFrameBoost, int2(idx, 0), boostedPQ);
         }
     }
@@ -3776,7 +3720,7 @@ float HL_ExtractPQAt(int hx, int hy, bool isPQ)
     float sceneNits = isPQ
         ? max(GetLuma2020(PQFrameLUT_ToNits(color)), 0.0)
         : max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
-    return PQFrameLUT_FromNitsScalar(sceneNits);
+    return NitsToPQ(sceneNits);
 }
 
 groupshared float HL_TileRow[256 + APL_HL_HALO * 2];
