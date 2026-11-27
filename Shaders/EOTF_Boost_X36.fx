@@ -810,25 +810,45 @@ storage2D<float> StorageAPLFastPQNits
     Texture = TexAPLFastPQNits;
 };
 
-// Frame-built 1024-entry PQ LUT (.r = linear nits, .g = fused boosted PQ for below-knee fast path).
-texture TexPQFrameLUT
+// Frame-built 1024-entry PQ LUTs (4 KB each: linear nits decode and fused below-knee boosted PQ).
+texture TexPQFrameNits
 {
     Width = 1024;
     Height = 1;
-    Format = RG32F;
+    Format = R32F;
 };
-sampler SamplerPQFrameLUT
+sampler SamplerPQFrameNits
 {
-    Texture = TexPQFrameLUT;
+    Texture = TexPQFrameNits;
     AddressU = CLAMP;
     AddressV = CLAMP;
     MinFilter = LINEAR;
     MagFilter = LINEAR;
     MipFilter = POINT;
 };
-storage2D<float2> StoragePQFrameLUT
+storage2D<float> StoragePQFrameNits
 {
-    Texture = TexPQFrameLUT;
+    Texture = TexPQFrameNits;
+};
+
+texture TexPQFrameBoost
+{
+    Width = 1024;
+    Height = 1;
+    Format = R32F;
+};
+sampler SamplerPQFrameBoost
+{
+    Texture = TexPQFrameBoost;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = POINT;
+};
+storage2D<float> StoragePQFrameBoost
+{
+    Texture = TexPQFrameBoost;
 };
 
 
@@ -1167,9 +1187,9 @@ float3 PQFrameLUT_ToNits(float3 pq)
 {
     float3 u = saturate(pq) * (1023.0 / 1024.0) + (0.5 / 1024.0);
     return float3(
-        tex2Dlod(SamplerPQFrameLUT, float4(u.r, 0.5, 0.0, 0.0)).r,
-        tex2Dlod(SamplerPQFrameLUT, float4(u.g, 0.5, 0.0, 0.0)).r,
-        tex2Dlod(SamplerPQFrameLUT, float4(u.b, 0.5, 0.0, 0.0)).r
+        tex2Dlod(SamplerPQFrameNits, float4(u.r, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameNits, float4(u.g, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameNits, float4(u.b, 0.5, 0.0, 0.0)).r
     );
 }
 
@@ -1177,9 +1197,9 @@ float3 PQFrameLUT_Boosted(float3 pq)
 {
     float3 u = saturate(pq) * (1023.0 / 1024.0) + (0.5 / 1024.0);
     return float3(
-        tex2Dlod(SamplerPQFrameLUT, float4(u.r, 0.5, 0.0, 0.0)).g,
-        tex2Dlod(SamplerPQFrameLUT, float4(u.g, 0.5, 0.0, 0.0)).g,
-        tex2Dlod(SamplerPQFrameLUT, float4(u.b, 0.5, 0.0, 0.0)).g
+        tex2Dlod(SamplerPQFrameBoost, float4(u.r, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameBoost, float4(u.g, 0.5, 0.0, 0.0)).r,
+        tex2Dlod(SamplerPQFrameBoost, float4(u.b, 0.5, 0.0, 0.0)).r
     );
 }
 
@@ -3349,7 +3369,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
                 int idx = localIndex + k * 256;
                 float pqCode = float(idx) * (1.0 / 1023.0);
                 float nits = PQToLinearScalar(pqCode) * 10000.0;
-                tex2Dstore(StoragePQFrameLUT, int2(idx, 0), float2(nits, pqCode));
+                tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
             }
         }
         return;
@@ -3480,7 +3500,8 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             float boostedPQ = buildFusedBoost
                 ? LinearToPQBT2100(saturate((nits * frameGain) / 10000.0))
                 : pqCode;
-            tex2Dstore(StoragePQFrameLUT, int2(idx, 0), float2(nits, boostedPQ));
+            tex2Dstore(StoragePQFrameNits, int2(idx, 0), nits);
+            tex2Dstore(StoragePQFrameBoost, int2(idx, 0), boostedPQ);
         }
     }
 }
