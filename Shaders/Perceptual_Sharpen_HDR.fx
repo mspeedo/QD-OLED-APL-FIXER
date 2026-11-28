@@ -152,8 +152,8 @@ uniform float TAAClarity <
     ui_max = 1.5;
     ui_step = 0.05;
     ui_label = "TAA / DLSS Clarity";
-    PSHDR_TOOLTIP("Edge-preserving bilateral 5x5 band that lifts 2-3 px TAA / DLSS softness without boosting 1-px aliasing or creating silhouette halos. 0.0 = 3x3 fine detail only.")
-> = 0.55;
+    PSHDR_TOOLTIP("Micro-texture-gated bilateral 5x5 band that lifts 2-3 px TAA / DLSS softness without merging fine foliage into blobs. Automatically ramps higher during camera pans when Motion Boost > 0.")
+> = 0.15;
 
 uniform float EdgeDirectionality <
     ui_type = "drag";
@@ -161,8 +161,8 @@ uniform float EdgeDirectionality <
     ui_max = 1.0;
     ui_step = 0.05;
     ui_label = "Edge Directionality";
-    PSHDR_TOOLTIP("Sharpens perpendicular to coherent edges while calming stair-stepping along diagonal edges (fences, hair, foliage, text), keeping full isotropic pop on fine textures.")
-> = 0.80;
+    PSHDR_TOOLTIP("Sharpens perpendicular to long coherent edges without amplifying diagonal stair-stepping or smearing fine foliage/micro-textures.")
+> = 0.70;
 
 uniform float ArtifactProtection <
     ui_type = "drag";
@@ -667,11 +667,11 @@ void VS_Apply(
     out float4 position : SV_Position,
     out float2 uv : TEXCOORD0
 #if PSHDR_MOTION_COMPILED
-    , out nointerpolation float2 outStrengths : TEXCOORD1 // (effectiveIntensity, effectiveTaaClarity)
+    , out nointerpolation float3 outStrengths : TEXCOORD1 // (effectiveIntensity, effectiveTaaClarity, motionFactor)
 #endif
 #if PSHDR_DYNAMIC_CSPACE
     , out nointerpolation int outMode : TEXCOORD2
-    , out nointerpolation float4 outSpaceParams : TEXCOORD3 // (edgeInv, fireflyThresh, contrastStart, contrastInvSpan)
+    , out nointerpolation float4 outSpaceParams : TEXCOORD3 // (edgeInv, centerFireflyThresh, contrastStart, contrastInvSpan)
 #endif
     )
 {
@@ -679,19 +679,20 @@ void VS_Apply(
     outMode = ResolveColorSpaceMode();
 #endif
 
-    float effectiveIntensity = Intensity;
+    float effectiveIntensity  = Intensity;
     float effectiveTaaClarity = TAAClarity;
+    float motionFactor        = 0.0;
 #if PSHDR_MOTION_COMPILED
     if (MotionBoost > 0.0001)
     {
-        float motionFactor = saturate(tex2Dlod(sMotionState, float4(0.125, 0.5, 0.0, 0.0)).r);
+        motionFactor = saturate(tex2Dlod(sMotionState, float4(0.125, 0.5, 0.0, 0.0)).r);
         float addedBoost = MotionBoost * motionFactor;
         effectiveIntensity += addedBoost;
-        // During camera pans, 2-3 px TAA/FrameGen blur degrades most: boost TAA clarity proportionally if enabled.
+        // During camera pans, 2-3 px TAA/FrameGen blur degrades most: ramp bilateral TAA clarity smoothly during motion.
         if (TAAClarity > 0.0001)
-            effectiveTaaClarity += addedBoost * 0.40;
+            effectiveTaaClarity += addedBoost * 0.65;
     }
-    outStrengths = float2(effectiveIntensity, effectiveTaaClarity);
+    outStrengths = float3(effectiveIntensity, effectiveTaaClarity, motionFactor);
 #endif
 
 #if ENABLE_DEBUG_VIEWS
@@ -713,9 +714,9 @@ void VS_Apply(
     uv.y = (id == 1u) ? 2.0 : 0.0;
 #if PSHDR_DYNAMIC_CSPACE
     if (outMode == MODE_SDR)
-        outSpaceParams = float4(12.0, 0.075, 0.075, 1.0 / 0.175);
+        outSpaceParams = float4(13.5, 0.110, 0.105, 1.0 / 0.215);
     else
-        outSpaceParams = float4(16.0, 0.055, 0.055, 1.0 / 0.130);
+        outSpaceParams = float4(18.0, 0.085, 0.080, 1.0 / 0.160);
 #endif
     position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
 }
@@ -724,7 +725,7 @@ void PS_Apply(
     float4 vpos : SV_Position,
     float2 uv : TEXCOORD0
 #if PSHDR_MOTION_COMPILED
-    , nointerpolation float2 strengths : TEXCOORD1
+    , nointerpolation float3 strengths : TEXCOORD1
 #endif
 #if PSHDR_DYNAMIC_CSPACE
     , nointerpolation int mode : TEXCOORD2
@@ -735,21 +736,23 @@ void PS_Apply(
 #if PSHDR_MOTION_COMPILED
     const float effectiveIntensity  = strengths.x;
     const float effectiveTaaClarity = strengths.y;
+    const float motionFactor        = strengths.z;
 #else
     const float effectiveIntensity  = Intensity;
     const float effectiveTaaClarity = TAAClarity;
+    const float motionFactor        = 0.0;
 #endif
 
 #if !PSHDR_DYNAMIC_CSPACE
     #if BUFFER_COLOR_SPACE == 3
         const int mode = MODE_PQ;
-        const float4 spaceParams = float4(16.0, 0.055, 0.055, 1.0 / 0.130);
+        const float4 spaceParams = float4(18.0, 0.085, 0.080, 1.0 / 0.160);
     #elif BUFFER_COLOR_SPACE == 2
         const int mode = MODE_SCRGB;
-        const float4 spaceParams = float4(16.0, 0.055, 0.055, 1.0 / 0.130);
+        const float4 spaceParams = float4(18.0, 0.085, 0.080, 1.0 / 0.160);
     #else
         const int mode = MODE_SDR;
-        const float4 spaceParams = float4(12.0, 0.075, 0.075, 1.0 / 0.175);
+        const float4 spaceParams = float4(13.5, 0.110, 0.105, 1.0 / 0.215);
     #endif
 #endif
 
@@ -803,16 +806,21 @@ void PS_Apply(
     float gy = (3.0 * (p6 - p0) + 10.0 * (p7 - p1) + 3.0 * (p8 - p2)) * (1.0 / 32.0);
     float g2 = gx * gx + gy * gy;
 
-    // Exact 3x3 Gaussian blur & isotropic high-pass
-    float g3 = 0.25 * p4 + 0.125 * ((p1 + p7) + (p3 + p5)) + 0.0625 * ((p0 + p8) + (p2 + p6));
-    float hpIso = p4 - g3;
+    // Crisp 1-px neighbor high-pass (p4 - weighted 8-neighbor average) + exact 3x3 Gaussian g3 for outer band
+    float sumCross = (p1 + p7) + (p3 + p5);
+    float sumDiag  = (p0 + p8) + (p2 + p6);
+    float avgNeighbors = (2.0 * sumCross + sumDiag) * (1.0 / 12.0);
+    float g3           = 0.25 * p4 + 0.125 * sumCross + 0.0625 * sumDiag;
+    float hpIso        = p4 - avgNeighbors;
 
     // Exact 2D Hessian components (positive on bright peaks, matching p4 - avg)
     float hxx = 0.5 * p4 - 0.25 * (p3 + p5);
     float hyy = 0.5 * p4 - 0.25 * (p1 + p7);
     float hxy = -0.125 * ((p0 + p8) - (p2 + p6));
 
-    // Edge-normal projection (0 trig, 0 sqrt, 1 rsqrt): sharpens across edges, calms stair-stepping along tangents
+    // Pure edge-normal projection (0 trig, 0 sqrt, 1 rsqrt, 0 negative tangent blurring!):
+    // Strict coherence ramp (0.30..0.48) leaves fine foliage/micro-textures 100% crisp & isotropic,
+    // while sharpening long straight/diagonal edges strictly perpendicular to the edge!
     float invG  = rsqrt(g2 + 1e-6);
     float invG2 = invG * invG;
     float nxx   = (gx * gx) * invG2;
@@ -820,18 +828,15 @@ void PS_Apply(
     float nxy   = (gx * gy) * invG2;
 
     float hpNormal  = nxx * hxx + 2.0 * nxy * hxy + nyy * hyy;
-    float hpTangent = nyy * hxx - 2.0 * nxy * hxy + nxx * hyy;
-
     float gradMag   = g2 * invG;
-    float coherence = saturate((gradMag / (range3x3 + 1e-5) - 0.16) * 4.2);
+    float coherence = saturate((gradMag / (range3x3 + 1e-5) - 0.30) * 5.5);
 
-    float hpDir      = hpNormal * 1.30 - hpTangent * 0.40;
-    float fineDetail = lerp(hpIso, hpDir, coherence * EdgeDirectionality);
+    float fineDetail = lerp(hpIso, hpNormal * 1.18, coherence * EdgeDirectionality);
 
-    // Exact geometric center-firefly AND neighbor-of-firefly suppression (0 false positives on real edges)
+    // Surgical specular firefly suppression (ignores sunlit 1-px foliage; catches real HDR fireflies & dark rings)
     float centerSpike   = max(max(0.0, p4 - maxCross), max(0.0, minCross - p4));
     float neighborSpike = max(max(0.0, maxCross - maxDiag), max(0.0, minDiag - minCross));
-    float fireflySig    = saturate((max(centerSpike, neighborSpike * 0.90) - spaceParams.y) * 11.0);
+    float fireflySig    = saturate(max((centerSpike - spaceParams.y) * 10.0, (neighborSpike - spaceParams.y * 2.6) * 8.0));
     float artifactMask  = 1.0 - fireflySig * ArtifactProtection;
 #else
     // Profile 0: Fast 9-Tap Dual-Band (1 POINT center + 4 inner BILINEAR +-0.5 px + 4 outer BILINEAR +-1.5 px)
@@ -857,29 +862,29 @@ void PS_Apply(
 
     // Exact 3x3 Gaussian & exact 3x3 Sobel gradient directly from the 4 half-pixel bilinear quadrants!
     float g3    = 0.25 * ((q0 + q3) + (q1 + q2));
-    float hpIso = p4 - g3;
+    float hpIso = (p4 - g3) * 1.3333333; // exact match to p4 - avgNeighbors
     float gx    = 0.25 * ((q1 + q3) - (q0 + q2));
     float gy    = 0.25 * ((q2 + q3) - (q0 + q1));
 
     float g2        = gx * gx + gy * gy;
     float gradMag   = g2 * rsqrt(g2 + 1e-6);
-    float coherence = saturate((gradMag / (range3x3 + 1e-5) - 0.12) * 4.8);
+    float coherence = saturate((gradMag / (range3x3 + 1e-5) - 0.22) * 6.0);
 
-    float fineDetail = hpIso * (1.0 - 0.25 * coherence * EdgeDirectionality);
+    float fineDetail = hpIso * (1.0 - 0.18 * coherence * EdgeDirectionality);
 
     float centerSpike   = max(max(0.0, p4 - maxQ), max(0.0, minQ - p4)) * 1.3333333;
     float qSum4         = (q0 + q3) + (q1 + q2);
     float qAvgOtherMax  = (qSum4 - maxQ) * (1.0 / 3.0);
     float qAvgOtherMin  = (qSum4 - minQ) * (1.0 / 3.0);
     float neighborSpike = max(max(0.0, maxQ - qAvgOtherMax), max(0.0, qAvgOtherMin - minQ)) * 1.5;
-    float fireflySig    = saturate((max(centerSpike, neighborSpike * 0.85) - spaceParams.y) * 11.0);
+    float fireflySig    = saturate(max((centerSpike - spaceParams.y) * 10.0, (neighborSpike - spaceParams.y * 2.6) * 8.0));
     float artifactMask  = 1.0 - fireflySig * ArtifactProtection;
 #endif
 
-    // Band 1: Perceptual compressive 1-px micro-detail restoration (boosts subtle textures, tapers strong edges)
-    float fineDelta = (fineDetail * 1.28) / (1.0 + 7.5 * abs(fineDetail));
+    // Band 1: Crisp 1-px micro-detail restoration (preserves individual leaves, pores, fabric weave)
+    float fineDelta = (fineDetail * 0.96) / (1.0 + 7.5 * abs(fineDetail));
 
-    // Band 2: Edge-preserving bilateral 5x5 outer DoG band (lifts 2-3 px TAA/DLSS blur, 0% 1-px aliasing, 0 2-px halos)
+    // Band 2: Micro-texture-gated bilateral 5x5 outer band (lifts 2-3 px TAA/DLSS blur without blobbing fine foliage!)
     float4 oVec = float4(o0, o1, o2, o3);
     float4 oDiff = (oVec - g3) * spaceParams.x;
     float4 oW = 1.0 / (1.0 + oDiff * oDiff);
@@ -887,27 +892,29 @@ void PS_Apply(
     float bilateralOuter = dot(oW, oVec) / wSum;
     float outerConf = saturate(wSum * 0.35);
 
-    float taaBand  = (g3 - bilateralOuter) * outerConf;
-    float taaDelta = ((taaBand * 2.85) / (1.0 + 14.0 * abs(taaBand))) * effectiveTaaClarity;
+    float taaRaw = (g3 - bilateralOuter) * outerConf;
+    // Busy micro-texture gate: when 3x3 already has dense 1-px foliage/texture detail relative to the 5x5 band,
+    // suppress 5x5 clump boosting so 1-px leaves never merge into blobs; relaxes smoothly during camera pans.
+    float microBusy      = saturate((range3x3 - 2.0 * abs(taaRaw) - 0.020) * 16.0);
+    float taaTextureGate = 1.0 - microBusy * (0.90 - 0.40 * motionFactor);
+    float taaDelta       = ((taaRaw * 1.65) / (1.0 + 18.0 * abs(taaRaw))) * effectiveTaaClarity * taaTextureGate;
 
     float rawDelta = (fineDelta + taaDelta) * flatMask * artifactMask * effectiveIntensity;
 
     // Contrast & Edge-Coherence Adaptive Asymmetric OLED Overshoot Soft-Clamp (runs AFTER MotionBoost!)
-    // - Subtle micro-textures (low contrast, low coherence): generous crest recovery (0.85/0.95)
-    // - Coherent silhouette edges: ultra-tight bright halo limit (0.020 bright / 0.045 dark)
     float upRoom   = max(0.0, max3x3 - p4);
     float downRoom = max(0.0, p4 - min3x3);
 
     float contrastHazard = saturate((range3x3 - spaceParams.z) * spaceParams.w);
-    float edgeHazard     = saturate(max(contrastHazard, coherence * saturate((range3x3 - 0.012) * 20.0)));
+    float edgeHazard     = saturate(max(contrastHazard, coherence * saturate((range3x3 - 0.025) * 14.0)));
 
-    float posRatio = lerp(0.85, lerp(0.85, 0.020, edgeHazard), ArtifactProtection);
-    float negRatio = lerp(0.95, lerp(0.95, 0.045, edgeHazard), ArtifactProtection);
+    float posRatio = lerp(0.85, lerp(0.75, 0.025, edgeHazard), ArtifactProtection);
+    float negRatio = lerp(0.95, lerp(0.85, 0.055, edgeHazard), ArtifactProtection);
 
-    float posLimit = upRoom   + posRatio * range3x3 + 0.0008;
-    float negLimit = downRoom + negRatio * range3x3 + 0.0010;
+    float posLimit = upRoom   + posRatio * range3x3 + 0.0010;
+    float negLimit = downRoom + negRatio * range3x3 + 0.0012;
 
-    // Algebraic rsqrt soft-clamp: preserves ~95-99% of micro-detail while strictly bounding <= limit!
+    // Algebraic rsqrt soft-clamp: preserves ~95-99% of fine micro-detail while strictly bounding <= limit!
     float lim = (rawDelta >= 0.0) ? posLimit : negLimit;
     float r = rawDelta / (lim + 1e-6);
     float delta = rawDelta * rsqrt(1.0 + r * r);
