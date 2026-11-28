@@ -30,7 +30,7 @@
     Performance Profiles (Preprocessor NEURAL_SHARPEN_PROFILE):
       0 = Ultra Fast 5-Tap Bilinear (default): 5 TEX fetches covering full 3x3 via 4 bilinear quadrants,
           distilled 5->4->4->1 CNN (40 FMAs, 6.6x less ALU, 44% fewer TEX fetches).
-      1 = Balanced Fast 9-Tap: 9 POINT TEX fetches, distilled 9->8->4->1 CNN (108 FMAs, 2.5x less ALU, R2=0.97).
+      1 = Balanced Fast 9-Tap: 9 POINT TEX fetches, D4-invariant 9->4->4->1 CNN (56 FMAs, 4.7x less ALU, R2=0.974).
       2 = Exact 12-Channel: 9 POINT TEX fetches, bit-exact Barbatos 1->12->12->1 CNN (264 FMAs).
 
     File layout:
@@ -53,7 +53,7 @@
 #endif
 
 // 0 = Ultra Fast 5-Tap Bilinear Neural (5 TEX, 40 FMAs - default, fastest)
-// 1 = Balanced Fast 9-Tap Neural (9 POINT TEX, 108 FMAs, R2=0.97 vs Exact)
+// 1 = Balanced Fast 9-Tap D4-Symmetric Neural (9 POINT TEX, 56 FMAs, R2=0.974 vs Exact)
 // 2 = Exact 12-Channel Barbatos Neural (9 POINT TEX, 264 FMAs)
 #ifndef NEURAL_SHARPEN_PROFILE
     #define NEURAL_SHARPEN_PROFILE 0
@@ -227,7 +227,7 @@ uniform int _PreprocessorHelp <
     ui_text =
         "NEURAL_SHARPEN_PROFILE (default: 0)\n"
         "  0 = Ultra Fast 5-Tap Bilinear (5 TEX, 40 FMAs, fastest)\n"
-        "  1 = Balanced Fast 9-Tap (9 POINT TEX, 108 FMAs, R2=0.97 vs Exact)\n"
+        "  1 = Balanced Fast 9-Tap (9 POINT TEX, 56 FMAs, R2=0.974 vs Exact)\n"
         "  2 = Exact 12-Channel Barbatos CNN (9 POINT TEX, 264 FMAs)\n"
         "\n"
         "NEURAL_SHARPEN_MODEL (default: 1)\n"
@@ -498,113 +498,83 @@ NS_F1 RunNeuralFast5(NS_F1 c, NS_F1 d0, NS_F1 d1, NS_F1 d2, NS_F1 d3)
 
 #if (NEURAL_SHARPEN_MODEL == 0) || (NEURAL_SHARPEN_MODEL == 1)
 NS_F1 RunModelA_Fast9(
-    NS_F1 c, NS_F1 d0, NS_F1 d1, NS_F1 d2, NS_F1 d3,
-    NS_F1 d4, NS_F1 d5, NS_F1 d6, NS_F1 d7)
+    NS_F1 f0, NS_F1 f1, NS_F1 f2, NS_F1 f3, NS_F1 f4,
+    NS_F1 f5, NS_F1 f6, NS_F1 f7, NS_F1 f8)
 {
-    // Layer 1: 9 -> 8 (18 float4 FMAs)
-    NS_F4 L1_0 = NS_F4(-0.031998970, 0.031589180, -0.011161512, -0.093157247);
-    NS_F4 L1_1 = NS_F4(0.082864963, -0.527208328, 0.031276781, 0.074128695);
-    L1_0 += c * NS_F4(0.554125190, 0.455940366, -0.302275836, -0.228231400);
-    L1_1 += c * NS_F4(-0.068743333, 0.900165081, 0.074868083, -0.833535612);
-    L1_0 += d0 * NS_F4(0.200752094, 1.045886517, 0.338040113, -0.223041028);
-    L1_1 += d0 * NS_F4(1.183322906, -0.258691579, -1.151645422, 0.647287846);
-    L1_0 += d1 * NS_F4(-1.536124468, 0.091142580, -0.972179592, -0.823013783);
-    L1_1 += d1 * NS_F4(-2.458814144, -0.069077872, 1.368291497, -0.705865324);
-    L1_0 += d2 * NS_F4(0.180009082, 1.079992414, -0.721875131, 0.856232107);
-    L1_1 += d2 * NS_F4(1.156480789, -0.145132154, -1.143059969, 0.665071130);
-    L1_0 += d3 * NS_F4(-1.539264798, 0.052741200, 0.811920881, -1.010602832);
-    L1_1 += d3 * NS_F4(-2.446686983, -0.204797328, 1.362010717, -0.998185039);
-    L1_0 += d4 * NS_F4(-1.570204258, -0.048205778, -0.968622923, 0.255360544);
-    L1_1 += d4 * NS_F4(-2.423376799, -0.274419278, 1.313420057, -1.262315273);
-    L1_0 += d5 * NS_F4(0.137203023, 1.057691097, 1.330402970, 0.924584925);
-    L1_1 += d5 * NS_F4(1.116716743, -0.446109384, -1.149516821, -0.004869843);
-    L1_0 += d6 * NS_F4(-1.557010531, -0.085837789, 0.027410431, -0.193212390);
-    L1_1 += d6 * NS_F4(-2.406188250, -0.301070154, 1.350923538, -1.403443575);
-    L1_0 += d7 * NS_F4(0.106081411, 1.099354863, 0.400695503, 2.062373877);
-    L1_1 += d7 * NS_F4(1.117820024, -0.323592067, -1.152697325, 0.155280858);
-    L1_0 = PReLU4(L1_0, NS_F4(-0.101925738, -1.594390869, -0.618606448, -0.542654216));
-    L1_1 = PReLU4(L1_1, NS_F4(-0.217854485, 0.135697380, -2.421566725, -0.583996952));
+    // Layer 1: 9 D4-invariant features -> 4 (9 float4 FMAs, 1 float4 register)
+    NS_F4 L1 = NS_F4(-0.021602197, -0.037732009, -0.031781912, 0.003739639);
+    L1 += f0 * NS_F4(0.490581721, 0.470121324, 0.032057382, -0.304590225);
+    L1 += f1 * NS_F4(0.515552700, -3.694405079, 4.940162659, -5.152735710);
+    L1 += f2 * NS_F4(2.292732239, -0.257025272, -3.482381105, 1.976642013);
+    L1 += f3 * NS_F4(0.605435491, 0.066763438, 0.347984612, -0.520679593);
+    L1 += f4 * NS_F4(0.388647079, -0.061712220, 0.022914547, 0.111411117);
+    L1 += f5 * NS_F4(0.395523220, 0.052985273, 0.120051131, -0.413724184);
+    L1 += f6 * NS_F4(0.229209855, -0.176119968, 0.017499449, 0.384687394);
+    L1 += f7 * NS_F4(-0.246686488, -0.209233299, -0.273828566, 0.398813099);
+    L1 += f8 * NS_F4(0.037717190, 0.020286521, -0.018663839, 0.283268660);
+    L1 = PReLU4(L1, NS_F4(-0.576455534, -0.116835482, -0.668418586, -0.363026619));
 
-    // Layer 2: 8 -> 4 (8 float4 FMAs)
-    NS_F4 L2 = NS_F4(-0.300556898, 0.461136729, -0.703779042, 0.221698195);
-    L2 += L1_0.x * NS_F4(0.601879120, 0.807774723, 0.855787218, -0.250622272);
-    L2 += L1_0.y * NS_F4(0.653280914, -0.575191021, 0.231344372, -0.195182651);
-    L2 += L1_0.z * NS_F4(-0.316202760, -0.207855701, 0.268863440, 0.496142805);
-    L2 += L1_0.w * NS_F4(-0.203538418, -0.287749171, 0.230785713, 0.379764140);
-    L2 += L1_1.x * NS_F4(0.837859094, -0.143739209, -0.316334307, -2.585501432);
-    L2 += L1_1.y * NS_F4(-0.694278657, -0.697551250, -0.390520781, -0.581950366);
-    L2 += L1_1.z * NS_F4(-0.900669754, -0.049759720, 0.496678412, 0.132044002);
-    L2 += L1_1.w * NS_F4(-0.409483910, -0.732794225, 0.539905965, 0.354147643);
-    L2 = PReLU4(L2, NS_F4(-2.338482380, -0.040564131, -1.723849773, -0.228897572));
+    // Layer 2: 4 -> 4 (4 float4 FMAs, 1 float4 register)
+    NS_F4 L2 = NS_F4(0.528029621, 0.066236846, -0.068031587, 0.424274743);
+    L2 += L1.x * NS_F4(-1.067868233, -0.235955998, 0.821404099, -0.244782045);
+    L2 += L1.y * NS_F4(0.310634166, -0.758111000, -0.275063127, -0.956197739);
+    L2 += L1.z * NS_F4(-0.256804377, -1.819971204, 2.701256275, 0.277401924);
+    L2 += L1.w * NS_F4(-0.018259861, 2.818995237, -1.965307236, 0.453616083);
+    L2 = PReLU4(L2, NS_F4(0.020508764, -0.887271762, -0.660406947, -0.984633923));
 
     // Layer 3: 4 -> 1 (1 float4 mul + sum)
-    NS_F4 outAcc = L2 * NS_F4(0.107067667, 0.416742414, -0.149709746, -0.311124414);
-    return (NS_F1)-0.041589886 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
+    NS_F4 outAcc = L2 * NS_F4(0.488787711, -0.190372065, 0.301346272, -0.362045377);
+    return (NS_F1)-0.091703318 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
 }
 #endif
 
 #if (NEURAL_SHARPEN_MODEL == 0) || (NEURAL_SHARPEN_MODEL == 2)
 NS_F1 RunModelB_Fast9(
-    NS_F1 c, NS_F1 d0, NS_F1 d1, NS_F1 d2, NS_F1 d3,
-    NS_F1 d4, NS_F1 d5, NS_F1 d6, NS_F1 d7)
+    NS_F1 f0, NS_F1 f1, NS_F1 f2, NS_F1 f3, NS_F1 f4,
+    NS_F1 f5, NS_F1 f6, NS_F1 f7, NS_F1 f8)
 {
-    // Layer 1: 9 -> 8 (18 float4 FMAs)
-    NS_F4 L1_0 = NS_F4(0.589212298, -0.006024884, -0.408899695, -0.019932732);
-    NS_F4 L1_1 = NS_F4(-0.006232130, 0.041004732, 0.010023184, -0.051134340);
-    L1_0 += c * NS_F4(-0.650064826, -0.008097425, 0.007536399, 0.071693853);
-    L1_1 += c * NS_F4(0.002698497, 0.000686864, -0.028130081, 0.591559589);
-    L1_0 += d0 * NS_F4(0.772505283, 1.174628377, 0.467936307, 2.178745031);
-    L1_1 += d0 * NS_F4(1.127161145, -1.402289987, 2.066283226, -0.846293688);
-    L1_0 += d1 * NS_F4(0.350459993, -0.473415226, 1.495615721, 0.053659558);
-    L1_1 += d1 * NS_F4(2.120580673, 2.854192734, -1.937204361, 1.053054333);
-    L1_0 += d2 * NS_F4(0.759836614, -0.555079877, 0.486662894, 2.174031973);
-    L1_1 += d2 * NS_F4(0.809313357, -1.426777482, 2.073208809, -0.683421135);
-    L1_0 += d3 * NS_F4(0.331205934, 1.690163374, 1.627286077, 0.075821288);
-    L1_1 += d3 * NS_F4(-0.125565350, 2.853359461, -1.921966553, 1.025691628);
-    L1_0 += d4 * NS_F4(0.353371739, -2.582031727, 1.707540274, 0.043890920);
-    L1_1 += d4 * NS_F4(-0.030699311, 2.884803057, -1.965960264, 1.041918635);
-    L1_0 += d5 * NS_F4(0.785464168, 1.196134686, 0.302724302, 2.143142462);
-    L1_1 += d5 * NS_F4(-0.940354407, -1.417217851, 2.056678295, -0.760092854);
-    L1_0 += d6 * NS_F4(0.267994076, -0.437827647, 1.828844905, 0.075968511);
-    L1_1 += d6 * NS_F4(-2.297657251, 2.861240864, -1.949587584, 1.025820494);
-    L1_0 += d7 * NS_F4(0.797478616, -0.615675867, 0.239265487, 2.148883104);
-    L1_1 += d7 * NS_F4(-0.680544019, -1.413342237, 2.064162254, -0.684442818);
-    L1_0 = PReLU4(L1_0, NS_F4(0.464792371, -0.990023613, 0.275134206, 0.725356936));
-    L1_1 = PReLU4(L1_1, NS_F4(-0.984553337, -0.359404445, 0.170000821, -1.091895700));
+    // Layer 1: 9 D4-invariant features -> 4 (9 float4 FMAs, 1 float4 register)
+    NS_F4 L1 = NS_F4(-0.043293942, 0.400390416, -0.116353638, 0.020093702);
+    L1 += f0 * NS_F4(0.550856352, 0.070300192, -0.156522706, -0.013008763);
+    L1 += f1 * NS_F4(4.360252380, -1.881465673, -0.017534792, 9.729352951);
+    L1 += f2 * NS_F4(-0.539573669, -2.096323729, -0.235640705, -4.499947071);
+    L1 += f3 * NS_F4(-0.642835140, -0.897718787, -2.686426878, 0.083114818);
+    L1 += f4 * NS_F4(1.110328317, 0.050820790, 1.611313581, -0.282710671);
+    L1 += f5 * NS_F4(-0.244483963, -0.488649815, -1.500734448, 0.159409881);
+    L1 += f6 * NS_F4(-0.240425289, -0.234503448, 1.156003237, -0.126181141);
+    L1 += f7 * NS_F4(0.637926877, 0.660809159, 2.168094397, 0.115314506);
+    L1 += f8 * NS_F4(-0.004000456, 0.249163449, 1.148556948, -0.164119169);
+    L1 = PReLU4(L1, NS_F4(-1.050242424, -0.756138861, -0.938530564, -0.242162332));
 
-    // Layer 2: 8 -> 4 (8 float4 FMAs)
-    NS_F4 L2 = NS_F4(0.208050773, 0.020678975, -0.021543082, 0.383862555);
-    L2 += L1_0.x * NS_F4(-0.496527582, -0.214418501, -0.172350034, -0.752626836);
-    L2 += L1_0.y * NS_F4(0.321045756, 0.286656410, -0.690625608, -0.196537599);
-    L2 += L1_0.z * NS_F4(-0.359548122, -1.210520506, -0.927967787, -0.207719088);
-    L2 += L1_0.w * NS_F4(-0.830253601, 1.139095426, 0.792401016, 1.094697833);
-    L2 += L1_1.x * NS_F4(0.315937132, 0.275918543, -0.691122353, -0.195112929);
-    L2 += L1_1.y * NS_F4(-2.133630276, 1.153848886, 0.014148850, -0.168930069);
-    L2 += L1_1.z * NS_F4(2.002983570, 1.312960863, 2.198209763, -0.667793453);
-    L2 += L1_1.w * NS_F4(-0.380124539, -0.444612563, -0.005287662, 0.527688920);
-    L2 = PReLU4(L2, NS_F4(-0.152752519, -1.030996323, -0.005886404, -4.763410091));
+    // Layer 2: 4 -> 4 (4 float4 FMAs, 1 float4 register)
+    NS_F4 L2 = NS_F4(0.501681566, -0.149832264, -0.566783309, 0.689273655);
+    L2 += L1.x * NS_F4(0.105667859, -0.559347391, 0.398490667, 0.281221420);
+    L2 += L1.y * NS_F4(-1.372257352, 0.243086413, 0.897467256, -1.479187012);
+    L2 += L1.z * NS_F4(0.442376077, 1.213447571, -0.289834768, -0.457043797);
+    L2 += L1.w * NS_F4(-1.711187601, -4.710763454, -1.940149069, -1.514082551);
+    L2 = PReLU4(L2, NS_F4(0.438383222, 0.103595130, -0.154791519, 0.058535647));
 
     // Layer 3: 4 -> 1 (1 float4 mul + sum)
-    NS_F4 outAcc = L2 * NS_F4(0.661731601, -0.449330628, 0.371045768, -0.084763408);
-    return (NS_F1)0.037533216 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
+    NS_F4 outAcc = L2 * NS_F4(-0.804578483, 0.577563882, -0.618271053, 0.833986282);
+    return (NS_F1)0.006116488 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
 }
 #endif
 
 NS_F1 RunNeuralFast9(
-    NS_F1 c, NS_F1 d0, NS_F1 d1, NS_F1 d2, NS_F1 d3,
-    NS_F1 d4, NS_F1 d5, NS_F1 d6, NS_F1 d7)
+    NS_F1 f0, NS_F1 f1, NS_F1 f2, NS_F1 f3, NS_F1 f4,
+    NS_F1 f5, NS_F1 f6, NS_F1 f7, NS_F1 f8)
 {
 #if NEURAL_SHARPEN_MODEL == 1
-    return RunModelA_Fast9(c, d0, d1, d2, d3, d4, d5, d6, d7);
+    return RunModelA_Fast9(f0, f1, f2, f3, f4, f5, f6, f7, f8);
 #elif NEURAL_SHARPEN_MODEL == 2
-    return RunModelB_Fast9(c, d0, d1, d2, d3, d4, d5, d6, d7);
+    return RunModelB_Fast9(f0, f1, f2, f3, f4, f5, f6, f7, f8);
 #else
     NS_F1 res = (NS_F1)0.0;
     [branch]
     if (ModelSelector == 0)
-        res = RunModelA_Fast9(c, d0, d1, d2, d3, d4, d5, d6, d7);
+        res = RunModelA_Fast9(f0, f1, f2, f3, f4, f5, f6, f7, f8);
     else
-        res = RunModelB_Fast9(c, d0, d1, d2, d3, d4, d5, d6, d7);
+        res = RunModelB_Fast9(f0, f1, f2, f3, f4, f5, f6, f7, f8);
     return res;
 #endif
 }
@@ -1139,15 +1109,20 @@ void PS_Apply(
         (NS_F1)p4,
         (NS_F1)(q0 - p4), (NS_F1)(q1 - p4), (NS_F1)(q2 - p4), (NS_F1)(q3 - p4));
 #else
-    // 9-Tap POINT sampling (1-texel loads via sBackBufferPoint avoid 2x2 bilinear L1 tag lookups).
-    float p0 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2(-px, -py), 0.0, 0.0)).rgb, mode);
-    float p1 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2(0.0, -py), 0.0, 0.0)).rgb, mode);
-    float p2 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2( px, -py), 0.0, 0.0)).rgb, mode);
-    float p3 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2(-px, 0.0), 0.0, 0.0)).rgb, mode);
-    float p5 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2( px, 0.0), 0.0, 0.0)).rgb, mode);
-    float p6 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2(-px,  py), 0.0, 0.0)).rgb, mode);
-    float p7 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2(0.0,  py), 0.0, 0.0)).rgb, mode);
-    float p8 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv + float2( px,  py), 0.0, 0.0)).rgb, mode);
+    // 9-Tap POINT sampling with pre-reduced coordinates (4 scalar adds instead of 16).
+    float xL = uv.x - px;
+    float xR = uv.x + px;
+    float yT = uv.y - py;
+    float yB = uv.y + py;
+
+    float p0 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(xL,   yT,   0.0, 0.0)).rgb, mode);
+    float p1 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv.x, yT,   0.0, 0.0)).rgb, mode);
+    float p2 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(xR,   yT,   0.0, 0.0)).rgb, mode);
+    float p3 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(xL,   uv.y, 0.0, 0.0)).rgb, mode);
+    float p5 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(xR,   uv.y, 0.0, 0.0)).rgb, mode);
+    float p6 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(xL,   yB,   0.0, 0.0)).rgb, mode);
+    float p7 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(uv.x, yB,   0.0, 0.0)).rgb, mode);
+    float p8 = ExtractLuma(tex2Dlod(sBackBufferPoint, float4(xR,   yB,   0.0, 0.0)).rgb, mode);
 
     float maxCross = max(max(p1, p7), max(p3, p5));
     float minCross = min(min(p1, p7), min(p3, p5));
@@ -1166,10 +1141,18 @@ void PS_Apply(
     float suppressionMask = 1.0 - saturate(aliasingSignal + fireflySignal) * ArtifactProtection;
 
     #if NEURAL_SHARPEN_PROFILE == 1
+        // Exact D4-invariant 9-tap features reusing maxCross/minCross/maxDiag/minDiag (56 FMAs vs 108, R2=0.974).
+        float avgCrossDiff = 0.25 * ((p1 + p7) + (p3 + p5)) - p4;
+        float avgDiagDiff  = 0.25 * ((p0 + p8) + (p2 + p6)) - p4;
+        float anisoHV      = 0.5  * abs((p1 + p7) - (p3 + p5));
+        float anisoDiag    = 0.5  * abs((p0 + p8) - (p2 + p6));
+
         float rawResidual = (float)RunNeuralFast9(
             (NS_F1)p4,
-            (NS_F1)(p0 - p4), (NS_F1)(p1 - p4), (NS_F1)(p2 - p4), (NS_F1)(p3 - p4),
-            (NS_F1)(p5 - p4), (NS_F1)(p6 - p4), (NS_F1)(p7 - p4), (NS_F1)(p8 - p4));
+            (NS_F1)avgCrossDiff,   (NS_F1)avgDiagDiff,
+            (NS_F1)(maxCross - p4), (NS_F1)(minCross - p4),
+            (NS_F1)(maxDiag  - p4), (NS_F1)(minDiag  - p4),
+            (NS_F1)anisoHV,        (NS_F1)anisoDiag);
     #else
         float rawResidual = (float)RunNeuralExact12(
             (NS_F1)p0, (NS_F1)p1, (NS_F1)p2,
