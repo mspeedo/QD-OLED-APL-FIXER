@@ -306,10 +306,10 @@ storage2D<float> StorageMotionPrev
     Texture = TexMotionPrev;
 };
 
-// 2x1 R32I wall-clock state: [0,0]=initialized flag, [1,0]=last wall-clock ms.
+// 3x1 R32I wall-clock state: [0,0]=initialized flag, [1,0]=last wall-clock ms, [2,0]=executions since last measurement.
 texture TexMotionClock
 {
-    Width = 2;
+    Width = 3;
     Height = 1;
     Format = R32I;
 };
@@ -318,10 +318,12 @@ storage2D<int> StorageMotionClock
     Texture = TexMotionClock;
 };
 
-// 2x1 R32F motion state: [0,0]=smoothed motion [0,1] (read once per frame in VS_Apply), [1,0]=prev mean luma.
+// 4x1 R32F motion state:
+// [0,0]=smoothed motion [0,1] (stepped on every frame including generated frames),
+// [1,0]=prev mean luma, [2,0]=latest panTarget, [3,0]=estimated ms per presented execution.
 texture TexMotionState
 {
-    Width = 2;
+    Width = 4;
     Height = 1;
     Format = R32F;
 };
@@ -829,9 +831,10 @@ NS_F1 RunNeuralExact12(
 // ============================================================================
 
 #if NSHDR_MOTION_COMPILED
-groupshared int   gs_MotionAction; // 0 = skip/hold, 2 = init snapshot, 3 = update motion
+groupshared int   gs_MotionAction; // 0 = smooth-only (generated/sub-12ms frame), 2 = init snapshot, 3 = measure + smooth
 groupshared int   gs_MotionMode;
 groupshared float gs_MotionDtMs;
+groupshared float gs_MotionStepMs;
 groupshared float gs_MotionPrevMean;
 groupshared float gs_MotionCurrMean;
 groupshared float gs_MotionCurr[256];
@@ -842,8 +845,9 @@ groupshared float gs_MotionColDiff[16];
 groupshared float gs_MotionColMove[16];
 
 // Single 1x1x1 threadgroup (256 threads) measuring camera-pan motion across a 16x16 inner-80% grid.
-// Uses ReShade wall-clock timer (source="timer") gated at >=12 ms (~60-80 Hz) so FrameGen generated
-// frames (dtMs == 0) never flicker or false-drop motion, and holds boosted intensity across them.
+// Measurement is gated by wall-clock timer (source="timer", >=12 ms) so FrameGen generated frames
+// (deltaMs == 0) never trigger false zero-motion drops or extra BackBuffer reads, while auto-tracking
+// wall-clock ms per presented execution so smoothedMotion glides smoothly on EVERY frame (real + generated).
 // All barriers sit unconditionally at top level (zero returns before any barrier -> 100% FXC X3663-safe).
 void CS_UpdateMotion(uint3 gtid : SV_GroupThreadID)
 {
@@ -853,6 +857,7 @@ void CS_UpdateMotion(uint3 gtid : SV_GroupThreadID)
     {
         int action = 0;
         float dtMs = 16.666667;
+        float stepMs = 8.333333;
         float prevMean = 0.0;
 
 #if NSHDR_DYNAMIC_CSPACE
@@ -870,7 +875,9 @@ void CS_UpdateMotion(uint3 gtid : SV_GroupThreadID)
             if (tex2Dfetch(StorageMotionClock, int2(0, 0)) != 0)
             {
                 tex2Dstore(StorageMotionClock, int2(0, 0), 0);
+                tex2Dstore(StorageMotionClock, int2(2, 0), 0);
                 tex2Dstore(StorageMotionState, int2(0, 0), 0.0);
+                tex2Dstore(StorageMotionState, int2(2, 0), 0.0);
             }
         }
         else
@@ -881,26 +888,50 @@ void CS_UpdateMotion(uint3 gtid : SV_GroupThreadID)
             {
                 tex2Dstore(StorageMotionClock, int2(0, 0), 1);
                 tex2Dstore(StorageMotionClock, int2(1, 0), int(nowMs));
+                tex2Dstore(StorageMotionClock, int2(2, 0), 0);
                 tex2Dstore(StorageMotionState, int2(0, 0), 0.0);
+                tex2Dstore(StorageMotionState, int2(2, 0), 0.0);
+                tex2Dstore(StorageMotionState, int2(3, 0), 8.333333);
                 action = 2;
             }
             else
             {
                 uint lastMs = uint(tex2Dfetch(StorageMotionClock, int2(1, 0)));
+                int execs = tex2Dfetch(StorageMotionClock, int2(2, 0)) + 1;
                 uint deltaMs = nowMs - lastMs;
-                // Skip generated frames (deltaMs == 0) and sub-12 ms intervals; hold smoothed motion.
+
                 if (deltaMs >= 12u)
                 {
                     tex2Dstore(StorageMotionClock, int2(1, 0), int(nowMs));
+                    tex2Dstore(StorageMotionClock, int2(2, 0), 0);
                     dtMs = float(min(deltaMs, 250u));
+
+                    float measuredStep = clamp(dtMs / float(max(execs, 1)), 1.0, 50.0);
+                    float prevEst = tex2Dfetch(StorageMotionState, int2(3, 0));
+                    stepMs = (prevEst > 0.5) ? lerp(prevEst, measuredStep, 0.25) : measuredStep;
+                    tex2Dstore(StorageMotionState, int2(3, 0), stepMs);
+
                     prevMean = tex2Dfetch(StorageMotionState, int2(1, 0));
                     action = 3;
+                }
+                else
+                {
+                    // Generated frame or sub-12 ms frame: skip 16x16 grid reads, but smoothly step
+                    // smoothedMotion toward latest panTarget using auto-tracked ms per presented frame.
+                    tex2Dstore(StorageMotionClock, int2(2, 0), min(execs, 64));
+                    float prevSmooth = tex2Dfetch(StorageMotionState, int2(0, 0));
+                    float target     = tex2Dfetch(StorageMotionState, int2(2, 0));
+                    float estStep    = clamp(tex2Dfetch(StorageMotionState, int2(3, 0)), 1.0, 50.0);
+                    float tauMs      = (target > prevSmooth) ? 30.0 : max(MotionDecayMs, 20.0);
+                    float alpha      = 1.0 - exp(-estStep / tauMs);
+                    tex2Dstore(StorageMotionState, int2(0, 0), lerp(prevSmooth, target, alpha));
                 }
             }
         }
 
         gs_MotionAction = action;
         gs_MotionDtMs = dtMs;
+        gs_MotionStepMs = stepMs;
         gs_MotionPrevMean = prevMean;
     }
     barrier();
@@ -989,7 +1020,7 @@ void CS_UpdateMotion(uint3 gtid : SV_GroupThreadID)
     }
     barrier();
 
-    // Stage 5: Coverage-gated camera-pan score + asymmetric wall-clock smoothing (fast attack, smooth decay).
+    // Stage 5: Coverage-gated camera-pan score + asymmetric per-presentation-frame smoothing.
     if ((lane == 0u) && (gs_MotionAction == 3))
     {
         float sumDiff = 0.0;
@@ -1011,11 +1042,12 @@ void CS_UpdateMotion(uint3 gtid : SV_GroupThreadID)
 
         float prevSmooth = tex2Dfetch(StorageMotionState, int2(0, 0));
         float tauMs      = (panTarget > prevSmooth) ? 30.0 : max(MotionDecayMs, 20.0);
-        float alpha      = 1.0 - exp(-gs_MotionDtMs / tauMs);
+        float alpha      = 1.0 - exp(-gs_MotionStepMs / tauMs);
         float newSmooth  = lerp(prevSmooth, panTarget, alpha);
 
         tex2Dstore(StorageMotionState, int2(0, 0), newSmooth);
         tex2Dstore(StorageMotionState, int2(1, 0), gs_MotionCurrMean);
+        tex2Dstore(StorageMotionState, int2(2, 0), panTarget);
     }
 }
 #endif
@@ -1041,7 +1073,7 @@ void VS_Apply(
 #if NSHDR_MOTION_COMPILED
     if (MotionBoost > 0.0001)
     {
-        float motionFactor = saturate(tex2Dlod(sMotionState, float4(0.25, 0.5, 0.0, 0.0)).r);
+        float motionFactor = saturate(tex2Dlod(sMotionState, float4(0.125, 0.5, 0.0, 0.0)).r);
         effectiveIntensity += MotionBoost * motionFactor;
     }
     outEffectiveIntensity = effectiveIntensity;
@@ -1323,7 +1355,7 @@ void VS_MotionOSD(
     }
 
     float motionFactor = (MotionBoost > 0.0001)
-        ? saturate(tex2Dlod(sMotionState, float4(0.25, 0.5, 0.0, 0.0)).r)
+        ? saturate(tex2Dlod(sMotionState, float4(0.125, 0.5, 0.0, 0.0)).r)
         : 0.0;
     float addedBoost = MotionBoost * motionFactor;
     outMotionData = float3(motionFactor, addedBoost, Intensity + addedBoost);
