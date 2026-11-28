@@ -28,9 +28,9 @@
     SOFTWARE.
 
     Performance Profiles (Preprocessor NEURAL_SHARPEN_PROFILE):
-      0 = Ultra Fast 5-Tap Bilinear (default): 5 TEX fetches covering full 3x3 via 4 bilinear quadrants,
-          distilled 5->4->4->1 CNN (40 FMAs, 6.6x less ALU, 44% fewer TEX fetches).
-      1 = Balanced Fast 9-Tap: 9 POINT TEX fetches, D4-invariant 9->4->4->1 CNN (56 FMAs, 4.7x less ALU, R2=0.974).
+      1 = Balanced Fast 9-Tap (default): 9 POINT TEX fetches, D4-invariant 9->4->4->1 CNN (56 FMAs, 4.7x less ALU, R2=0.974).
+      0 = Ultra Fast 5-Tap Bilinear: 5 TEX fetches covering full 3x3 via 4 bilinear quadrants,
+          D4-invariant 6->4->4->1 CNN (44 FMAs, 6.0x less ALU, 44% fewer TEX fetches, R2=0.92).
       2 = Exact 12-Channel: 9 POINT TEX fetches, bit-exact Barbatos 1->12->12->1 CNN (264 FMAs).
 
     File layout:
@@ -52,11 +52,11 @@
     #define BUFFER_COLOR_SPACE 0
 #endif
 
-// 0 = Ultra Fast 5-Tap Bilinear Neural (5 TEX, 40 FMAs - default, fastest)
-// 1 = Balanced Fast 9-Tap D4-Symmetric Neural (9 POINT TEX, 56 FMAs, R2=0.974 vs Exact)
+// 1 = Balanced Fast 9-Tap D4-Symmetric Neural (9 POINT TEX, 56 FMAs, R2=0.974 vs Exact - default)
+// 0 = Ultra Fast 5-Tap Bilinear D4-Symmetric Neural (5 TEX, 44 FMAs, R2=0.92 - fastest)
 // 2 = Exact 12-Channel Barbatos Neural (9 POINT TEX, 264 FMAs)
 #ifndef NEURAL_SHARPEN_PROFILE
-    #define NEURAL_SHARPEN_PROFILE 0
+    #define NEURAL_SHARPEN_PROFILE 1
 #endif
 
 // 1 = Compile-time Model A only (Balanced - default, smallest binary & lowest register pressure)
@@ -225,9 +225,9 @@ uniform int _PreprocessorHelp <
     ui_type = "radio";
     ui_label = " ";
     ui_text =
-        "NEURAL_SHARPEN_PROFILE (default: 0)\n"
-        "  0 = Ultra Fast 5-Tap Bilinear (5 TEX, 40 FMAs, fastest)\n"
+        "NEURAL_SHARPEN_PROFILE (default: 1)\n"
         "  1 = Balanced Fast 9-Tap (9 POINT TEX, 56 FMAs, R2=0.974 vs Exact)\n"
+        "  0 = Ultra Fast 5-Tap Bilinear (5 TEX, 44 FMAs, R2=0.92, fastest)\n"
         "  2 = Exact 12-Channel Barbatos CNN (9 POINT TEX, 264 FMAs)\n"
         "\n"
         "NEURAL_SHARPEN_MODEL (default: 1)\n"
@@ -426,70 +426,72 @@ NS_F4 PReLU4(NS_F4 v, NS_F4 a)
 #if NEURAL_SHARPEN_PROFILE == 0
 
 #if (NEURAL_SHARPEN_MODEL == 0) || (NEURAL_SHARPEN_MODEL == 1)
-NS_F1 RunModelA_Fast5(NS_F1 c, NS_F1 d0, NS_F1 d1, NS_F1 d2, NS_F1 d3)
+NS_F1 RunModelA_Fast5(NS_F1 f0, NS_F1 f1, NS_F1 f2, NS_F1 f3, NS_F1 f4, NS_F1 f5)
 {
-    // Layer 1: 5 -> 4 (5 float4 FMAs)
-    NS_F4 L1 = NS_F4(0.044041615, -0.464537889, 0.254479736, -0.278363824);
-    L1 += c * NS_F4(-0.724115193, 0.554412425, 0.006577393, 1.313981652);
-    L1 += d0 * NS_F4(0.470940173, -1.002664804, -2.012996912, 1.113625169);
-    L1 += d1 * NS_F4(-0.408214957, -0.990056753, -1.895673871, 0.969342709);
-    L1 += d2 * NS_F4(-0.395975262, -0.965034127, -1.898413658, 1.011839151);
-    L1 += d3 * NS_F4(0.428595275, -0.971805334, -2.014953375, 1.168593287);
-    L1 = PReLU4(L1, NS_F4(0.231460378, -0.131050378, -0.300561428, 2.181897640));
+    // Layer 1: 6 D4-invariant quadrant features -> 4 (6 float4 FMAs, 1 float4 register)
+    NS_F4 L1 = NS_F4(-0.730821788, -0.012679012, -0.011884286, -0.203455493);
+    L1 += f0 * NS_F4(0.784533858, 0.461801618, 0.369383633, 0.038089700);
+    L1 += f1 * NS_F4(-2.707480907, 4.825026512, -2.861585617, 0.167170525);
+    L1 += f2 * NS_F4(-2.689104557, 1.570460081, -1.354166269, 1.572292686);
+    L1 += f3 * NS_F4(-0.333779693, 0.844432175, -0.652857542, -0.179609820);
+    L1 += f4 * NS_F4(3.167257786, 2.580765486, -2.669166803, -1.620874643);
+    L1 += f5 * NS_F4(1.200607181, -0.656353354, 1.005273700, 2.967521906);
+    L1 = PReLU4(L1, NS_F4(-0.659885526, -0.405795425, -5.364359856, 0.331523985));
 
-    // Layer 2: 4 -> 4 (4 float4 FMAs)
-    NS_F4 L2 = NS_F4(-0.098853096, 0.261688620, -0.391664416, 0.305713117);
-    L2 += L1.x * NS_F4(0.620059669, -0.060512822, -0.479162425, 2.558356047);
-    L2 += L1.y * NS_F4(-2.420872450, 0.023130698, -0.021687264, -0.769975364);
-    L2 += L1.z * NS_F4(2.035257816, -0.618476212, 0.529927671, 0.751240253);
-    L2 += L1.w * NS_F4(0.503898799, 0.197636768, -0.269512057, -0.195414096);
-    L2 = PReLU4(L2, NS_F4(-0.374701828, -1.780340195, -0.111108810, -2.096511126));
+    // Layer 2: 4 -> 4 (4 float4 FMAs, 1 float4 register)
+    NS_F4 L2 = NS_F4(0.297295213, -0.505572319, 0.686525464, -0.234156102);
+    L2 += L1.x * NS_F4(-0.783984542, -0.385230303, -0.732657433, 1.050563812);
+    L2 += L1.y * NS_F4(-1.248377442, 1.311829448, -0.769987106, 0.640519083);
+    L2 += L1.z * NS_F4(0.544887245, -0.021909865, 0.129431665, -0.265296131);
+    L2 += L1.w * NS_F4(0.601746738, 0.395208925, -0.665749490, 0.236189306);
+    L2 = PReLU4(L2, NS_F4(0.332469761, -0.260700166, -0.552000105, -0.615324855));
 
     // Layer 3: 4 -> 1 (1 float4 mul + sum)
-    NS_F4 outAcc = L2 * NS_F4(0.197443008, -0.337130219, 0.244023353, 0.102219202);
-    return (NS_F1)-0.070484601 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
+    NS_F4 outAcc = L2 * NS_F4(0.219960108, 0.227117255, 0.241145313, -0.125508279);
+    return (NS_F1)-0.100949124 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
 }
 #endif
 
 #if (NEURAL_SHARPEN_MODEL == 0) || (NEURAL_SHARPEN_MODEL == 2)
-NS_F1 RunModelB_Fast5(NS_F1 c, NS_F1 d0, NS_F1 d1, NS_F1 d2, NS_F1 d3)
+NS_F1 RunModelB_Fast5(NS_F1 f0, NS_F1 f1, NS_F1 f2, NS_F1 f3, NS_F1 f4, NS_F1 f5)
 {
-    // Layer 1: 5 -> 4 (5 float4 FMAs)
-    NS_F4 L1 = NS_F4(0.262699813, 0.175043285, 0.004409165, -0.493532926);
-    L1 += c * NS_F4(-1.006822586, 0.042879995, -0.003238662, 0.011929572);
-    L1 += d0 * NS_F4(-0.978823006, 3.065347433, -0.606804430, 1.061139107);
-    L1 += d1 * NS_F4(-0.591226280, 1.846954226, 4.010735035, -0.184501663);
-    L1 += d2 * NS_F4(-0.661103189, 1.885742188, -2.807567120, 3.971651554);
-    L1 += d3 * NS_F4(-0.923658133, 3.059687614, -0.590139270, 1.153838634);
-    L1 = PReLU4(L1, NS_F4(0.143238261, 0.311831802, -1.398360968, 0.028653659));
+    // Layer 1: 6 D4-invariant quadrant features -> 4 (6 float4 FMAs, 1 float4 register)
+    NS_F4 L1 = NS_F4(-0.498439014, -0.086211741, 0.080668695, 0.034546122);
+    L1 += f0 * NS_F4(0.045874864, 0.791166902, -0.053344809, 0.023593465);
+    L1 += f1 * NS_F4(1.555841923, 2.135283947, 4.186703205, 3.080390453);
+    L1 += f2 * NS_F4(2.931004524, 0.199650809, -0.889571428, 1.885230184);
+    L1 += f3 * NS_F4(1.550874114, 0.225837886, 1.671626925, -0.297964156);
+    L1 += f4 * NS_F4(0.384031236, -5.218594074, 0.298344046, -1.024906278);
+    L1 += f5 * NS_F4(1.380360603, -2.309120178, 0.051716380, 0.095078066);
+    L1 = PReLU4(L1, NS_F4(-0.382867306, -1.903236389, 2.302712679, -1.544907331));
 
-    // Layer 2: 4 -> 4 (4 float4 FMAs)
-    NS_F4 L2 = NS_F4(0.233327508, 0.351621002, -0.161384359, 0.018692229);
-    L2 += L1.x * NS_F4(-0.926041603, -0.786513031, 0.045969095, -0.981017470);
-    L2 += L1.y * NS_F4(-1.331356406, -1.728933334, 0.977817178, 0.859942198);
-    L2 += L1.z * NS_F4(-1.405285001, 0.678171337, -3.152433634, -0.065504521);
-    L2 += L1.w * NS_F4(1.738002658, -0.383949339, 0.960667074, -2.419680595);
-    L2 = PReLU4(L2, NS_F4(-0.496564537, 0.031802882, 0.033218812, -0.767354369));
+    // Layer 2: 4 -> 4 (4 float4 FMAs, 1 float4 register)
+    NS_F4 L2 = NS_F4(-0.221982688, -0.322668999, 0.394862086, -0.031507511);
+    L2 += L1.x * NS_F4(0.222056463, 0.615740299, -1.905480981, -1.438645840);
+    L2 += L1.y * NS_F4(0.295358181, 0.176379740, -0.322972000, 0.105399743);
+    L2 += L1.z * NS_F4(1.366834044, 2.617906332, 0.841546118, -0.457906306);
+    L2 += L1.w * NS_F4(0.893518746, -0.315902114, 2.189673662, 1.249550939);
+    L2 = PReLU4(L2, NS_F4(2.560443401, 0.114069745, -0.921200156, -0.033280935));
 
     // Layer 3: 4 -> 1 (1 float4 mul + sum)
-    NS_F4 outAcc = L2 * NS_F4(-0.429979295, 0.441342771, 0.382009625, -0.299290389);
-    return (NS_F1)0.058439214 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
+    NS_F4 outAcc = L2 * NS_F4(-0.199998975, 0.505118191, -0.229397729, -0.235644013);
+    return (NS_F1)0.030873140 + (outAcc.x + outAcc.y) + (outAcc.z + outAcc.w);
 }
 #endif
 
-NS_F1 RunNeuralFast5(NS_F1 c, NS_F1 d0, NS_F1 d1, NS_F1 d2, NS_F1 d3)
+NS_F1 RunNeuralFast5(NS_F1 f0, NS_F1 f1, NS_F1 f2, NS_F1 f3, NS_F1 f4, NS_F1 f5)
 {
 #if NEURAL_SHARPEN_MODEL == 1
-    return RunModelA_Fast5(c, d0, d1, d2, d3);
+    return RunModelA_Fast5(f0, f1, f2, f3, f4, f5);
 #elif NEURAL_SHARPEN_MODEL == 2
-    return RunModelB_Fast5(c, d0, d1, d2, d3);
+    return RunModelB_Fast5(f0, f1, f2, f3, f4, f5);
 #else
     NS_F1 res = (NS_F1)0.0;
     [branch]
     if (ModelSelector == 0)
-        res = RunModelA_Fast5(c, d0, d1, d2, d3);
+        res = RunModelA_Fast5(f0, f1, f2, f3, f4, f5);
     else
-        res = RunModelB_Fast5(c, d0, d1, d2, d3);
+        res = RunModelB_Fast5(f0, f1, f2, f3, f4, f5);
     return res;
 #endif
 }
@@ -1082,14 +1084,18 @@ void PS_Apply(
     float p4 = ExtractLuma(origColor, mode);
 
 #if NEURAL_SHARPEN_PROFILE == 0
-    // Ultra Fast 5-Tap Bilinear: 4 half-pixel LINEAR taps cover all 9 pixels of the 3x3 box!
+    // Ultra Fast 5-Tap Bilinear: 4 half-pixel LINEAR taps cover all 9 pixels of the 3x3 box (4 scalar UV adds).
     const float hx = 0.5 * px;
     const float hy = 0.5 * py;
+    float xL = uv.x - hx;
+    float xR = uv.x + hx;
+    float yT = uv.y - hy;
+    float yB = uv.y + hy;
 
-    float q0 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(uv + float2(-hx, -hy), 0.0, 0.0)).rgb, mode);
-    float q1 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(uv + float2( hx, -hy), 0.0, 0.0)).rgb, mode);
-    float q2 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(uv + float2(-hx,  hy), 0.0, 0.0)).rgb, mode);
-    float q3 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(uv + float2( hx,  hy), 0.0, 0.0)).rgb, mode);
+    float q0 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(xL, yT, 0.0, 0.0)).rgb, mode);
+    float q1 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(xR, yT, 0.0, 0.0)).rgb, mode);
+    float q2 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(xL, yB, 0.0, 0.0)).rgb, mode);
+    float q3 = ExtractLuma(tex2Dlod(ReShade::BackBuffer, float4(xR, yB, 0.0, 0.0)).rgb, mode);
 
     float maxQ = max(max(q0, q1), max(q2, q3));
     float minQ = min(min(q0, q1), min(q2, q3));
@@ -1105,9 +1111,15 @@ void PS_Apply(
 
     float suppressionMask = 1.0 - saturate(aliasingSignal + fireflySignal) * ArtifactProtection;
 
+    // Exact D4-invariant 5-tap quadrant features reusing maxQ/minQ (44 FMAs, R2=0.92).
+    float avgQDiff = 0.25 * ((q0 + q3) + (q1 + q2)) - p4;
+    float anisoQ   = 0.5  * abs((q0 + q3) - (q1 + q2));
+    float gradQ    = 0.5  * abs((q0 + q1) - (q2 + q3)) + 0.5 * abs((q0 + q2) - (q1 + q3));
+
     float rawResidual = (float)RunNeuralFast5(
-        (NS_F1)p4,
-        (NS_F1)(q0 - p4), (NS_F1)(q1 - p4), (NS_F1)(q2 - p4), (NS_F1)(q3 - p4));
+        (NS_F1)p4, (NS_F1)avgQDiff,
+        (NS_F1)(maxQ - p4), (NS_F1)(minQ - p4),
+        (NS_F1)anisoQ, (NS_F1)gradQ);
 #else
     // 9-Tap POINT sampling with pre-reduced coordinates (4 scalar adds instead of 16).
     float xL = uv.x - px;
@@ -1227,7 +1239,7 @@ technique Neural_Sharpen_HDR <
         "HDR-aware, GPU-optimized Neural Sharpening with FrameGen-safe camera-pan motion adaptation (based on Barbatos Neural Sharpen 2.8, MIT).\n"
         "Supports HDR10 PQ, scRGB Linear, and SDR.\n\n"
         "Preprocessor definitions:\n"
-        "  NEURAL_SHARPEN_PROFILE: 0=Ultra Fast 5-Tap (default), 1=Fast 9-Tap, 2=Exact 12-Ch\n"
+        "  NEURAL_SHARPEN_PROFILE: 1=Fast 9-Tap (default), 0=Ultra Fast 5-Tap, 2=Exact 12-Ch\n"
         "  NEURAL_SHARPEN_MODEL: 1=Model A (default), 2=Model B, 0=Both (UI selector)\n"
         "  ENABLE_MOTION_ADAPTATION: 1=On (default, ~0.002 ms), 0=Off\n"
         "  ENABLE_DEBUG_VIEWS: 0=Off (default), 1=On\n"
