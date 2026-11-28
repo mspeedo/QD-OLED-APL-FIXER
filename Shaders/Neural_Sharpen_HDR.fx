@@ -1469,18 +1469,6 @@ void PS_MotionOSD(
 
 technique Neural_Sharpen_HDR <
     ui_label = "Neural Sharpen HDR";
-    ui_tooltip =
-        "HDR-aware, GPU-optimized Neural Sharpening with FrameGen-safe camera-pan motion adaptation (based on Barbatos Neural Sharpen 2.8, MIT).\n"
-        "Supports HDR10 PQ, scRGB Linear, and SDR.\n\n"
-        "Preprocessor definitions:\n"
-        "  NEURAL_SHARPEN_PROFILE: 1=Fast 9-Tap (default), 0=Ultra Fast 5-Tap, 2=Exact 12-Ch\n"
-        "  NEURAL_SHARPEN_MODEL: 1=Model A (default), 2=Model B, 0=Both (UI selector)\n"
-        "  ENABLE_MOTION_ADAPTATION: 1=On (default, ~0.005 ms), 0=Off\n"
-        "  ENABLE_MOTION_OSD: 0=Off (default), 1=Live motion boost OSD (top-right)\n"
-        "  ENABLE_DEBUG_VIEWS: 0=Off (default), 1=On\n"
-        "  ALLOW_MANUAL_COLOR_SPACE: 0=Auto compile-time (default), 1=Manual selector\n"
-        "  USE_FP16_CNN: 0=FP32 (default, faster on D3D11), 1=FP16\n"
-        "  ENABLE_UI_TOOLTIPS: 1=On (default), 0=Off";
 >
 {
 #if NSHDR_MOTION_COMPILED
