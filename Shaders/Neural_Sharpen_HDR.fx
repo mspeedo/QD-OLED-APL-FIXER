@@ -103,6 +103,18 @@
     #define NSHDR_MOTION_COMPILED 0
 #endif
 
+// 0 = Strip diagnostic motion OSD completely at compile time (default)
+// 1 = Enable compact top-right OSD showing live total intensity, motion boost, and live pan meter
+#ifndef ENABLE_MOTION_OSD
+    #define ENABLE_MOTION_OSD 0
+#endif
+
+#if ENABLE_MOTION_OSD && NSHDR_MOTION_COMPILED
+    #define NSHDR_OSD_COMPILED 1
+#else
+    #define NSHDR_OSD_COMPILED 0
+#endif
+
 #if USE_FP16_CNN
     #define NS_F1 min16float
     #define NS_F4 min16float4
@@ -205,6 +217,14 @@ uniform float MotionDecayMs <
     NSHDR_TOOLTIP("Wall-clock decay time after stopping a camera pan. Higher values fade back more gradually without sharpness pop.")
 > = 140.0;
 
+#if NSHDR_OSD_COMPILED
+uniform bool ShowMotionOSD <
+    ui_category = "Motion Adaptive";
+    ui_label = "Show Motion OSD";
+    NSHDR_TOOLTIP("Displays a compact top-right overlay with live total intensity, added motion boost, and a real-time pan meter.")
+> = true;
+#endif
+
 // Wall-clock milliseconds (FrameGen-safe; does not rely on frametime which freezes on generated frames).
 uniform uint MotionClockMs < source = "timer"; >;
 #endif
@@ -236,8 +256,12 @@ uniform int _PreprocessorHelp <
         "  0 = Both models compiled with runtime UI switcher\n"
         "\n"
         "ENABLE_MOTION_ADAPTATION (default: 1)\n"
-        "  1 = FrameGen-safe wall-clock camera-pan boost (~0.002 ms)\n"
+        "  1 = FrameGen-safe wall-clock camera-pan boost (~0.005 ms)\n"
         "  0 = Strip motion compute pass and textures completely\n"
+        "\n"
+        "ENABLE_MOTION_OSD (default: 0)\n"
+        "  0 = Stripped at compile time (zero overhead)\n"
+        "  1 = Compact top-right diagnostic OSD showing live motion boost\n"
         "\n"
         "ENABLE_DEBUG_VIEWS (default: 0)\n"
         "  0 = Stripped at compile time (fastest)\n"
@@ -354,7 +378,7 @@ int ResolveColorSpaceMode()
 }
 #endif
 
-#if NSHDR_DYNAMIC_CSPACE || (BUFFER_COLOR_SPACE == 2) || ENABLE_DEBUG_VIEWS
+#if NSHDR_DYNAMIC_CSPACE || (BUFFER_COLOR_SPACE == 2) || ENABLE_DEBUG_VIEWS || NSHDR_OSD_COMPILED
 // 0-pow ST.2084 Linear [0, 1] -> PQ [0, 1] rational fit on u = L^0.25 (2 sqrts + 5 FMAs + 1 rcp).
 float FastLinearToPQ(float linearVal)
 {
@@ -1233,6 +1257,184 @@ void PS_Apply(
 }
 
 
+#if NSHDR_OSD_COMPILED
+// Compact 3x5 bitmap font for diagnostic OSD ("INT X.XX +X.XX").
+uint GetOSDCharBits(uint glyphId)
+{
+    static const uint GLYPHS[15] = {
+        31599u, // 0: '0'
+        11415u, // 1: '1'
+        29671u, // 2: '2'
+        29647u, // 3: '3'
+        23497u, // 4: '4'
+        31183u, // 5: '5'
+        31215u, // 6: '6'
+        29266u, // 7: '7'
+        31727u, // 8: '8'
+        31695u, // 9: '9'
+        2u,     // 10: '.'
+        1488u,  // 11: '+'
+        29847u, // 12: 'I'
+        24557u, // 13: 'N'
+        29842u  // 14: 'T'
+    };
+    return (glyphId < 15u) ? GLYPHS[glyphId] : 0u;
+}
+
+float3 EncodeOSDColor(float3 srgbCol, int mode)
+{
+    float3 lin = srgbCol * srgbCol; // fast ~gamma 2.0 to linear (0 pow())
+    float3 result = srgbCol;
+    if (mode == MODE_PQ)
+    {
+        float3 n = lin * (180.0 / 10000.0);
+        result = float3(FastLinearToPQ(n.r), FastLinearToPQ(n.g), FastLinearToPQ(n.b));
+    }
+    else if (mode == MODE_SCRGB)
+    {
+        result = lin * (180.0 / 80.0);
+    }
+    return result;
+}
+
+void VS_MotionOSD(
+    in uint id : SV_VertexID,
+    out float4 position : SV_Position,
+    out float2 localPx : TEXCOORD0,
+    out nointerpolation float3 outMotionData : TEXCOORD1, // (motionFactor, addedBoost, effectiveIntensity)
+    out nointerpolation int outMode : TEXCOORD2)
+{
+#if NSHDR_DYNAMIC_CSPACE
+    outMode = ResolveColorSpaceMode();
+#elif BUFFER_COLOR_SPACE == 3
+    outMode = MODE_PQ;
+#elif BUFFER_COLOR_SPACE == 2
+    outMode = MODE_SCRGB;
+#else
+    outMode = MODE_SDR;
+#endif
+
+    if (!ShowMotionOSD)
+    {
+        position = float4(0.0, 0.0, 0.0, 0.0);
+        localPx = float2(0.0, 0.0);
+        outMotionData = float3(0.0, 0.0, 0.0);
+        return;
+    }
+
+    float motionFactor = (MotionBoost > 0.0001)
+        ? saturate(tex2Dlod(sMotionState, float4(0.25, 0.5, 0.0, 0.0)).r)
+        : 0.0;
+    float addedBoost = MotionBoost * motionFactor;
+    outMotionData = float3(motionFactor, addedBoost, Intensity + addedBoost);
+
+    // Tight 188x46 px quad anchored 16 px from top-right corner (avoids EOTF_Boost_X36 top-left OSD).
+    const float boxW = 188.0;
+    const float boxH = 46.0;
+    const float u0 = (BUFFER_WIDTH - 16.0 - boxW) * BUFFER_RCP_WIDTH;
+    const float u1 = (BUFFER_WIDTH - 16.0) * BUFFER_RCP_WIDTH;
+    const float v0 = 16.0 * BUFFER_RCP_HEIGHT;
+    const float v1 = (16.0 + boxH) * BUFFER_RCP_HEIGHT;
+
+    float cx = (id == 1u || id == 3u || id == 4u) ? 1.0 : 0.0;
+    float cy = (id == 2u || id == 4u || id == 5u) ? 1.0 : 0.0;
+
+    float2 uv = float2(lerp(u0, u1, cx), lerp(v0, v1, cy));
+    localPx = float2(cx * boxW, cy * boxH);
+    position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+void PS_MotionOSD(
+    float4 vpos : SV_Position,
+    float2 localPx : TEXCOORD0,
+    nointerpolation float3 motionData : TEXCOORD1,
+    nointerpolation int mode : TEXCOORD2,
+    out float4 outColor : SV_Target)
+{
+    uint px = uint(max(localPx.x, 0.0));
+    uint py = uint(max(localPx.y, 0.0));
+
+    float motionFactor = motionData.x;
+    uint boostCenti = uint(round(clamp(motionData.y, 0.0, 9.99) * 100.0));
+    uint totalCenti = uint(round(clamp(motionData.z, 0.0, 9.99) * 100.0));
+
+    // Dark translucent backdrop with subtle 1px border
+    float3 srgbCol = float3(0.06, 0.07, 0.09);
+    float alpha = 0.80;
+    if (px == 0u || px == 187u || py == 0u || py == 45u)
+    {
+        srgbCol = float3(0.32, 0.38, 0.46);
+        alpha = 0.90;
+    }
+
+    // Row 1 (y = 8..22, 3x scale = 9x15 px glyphs, 12 px pitch): "INT X.XX +X.XX" (14 cells)
+    if (px >= 10u && px < 178u && py >= 8u && py < 23u)
+    {
+        uint relX = px - 10u;
+        uint relY = py - 8u;
+        uint cell = relX / 12u;
+        uint subX = relX - cell * 12u;
+        if (subX < 9u)
+        {
+            uint col = subX / 3u;
+            uint row = relY / 3u;
+            uint glyphId = 99u; // space
+            bool isBoostText = (cell >= 9u);
+
+            if (cell == 0u) glyphId = 12u; // I
+            else if (cell == 1u) glyphId = 13u; // N
+            else if (cell == 2u) glyphId = 14u; // T
+            else if (cell == 4u) glyphId = totalCenti / 100u;
+            else if (cell == 5u) glyphId = 10u; // .
+            else if (cell == 6u) glyphId = (totalCenti / 10u) % 10u;
+            else if (cell == 7u) glyphId = totalCenti % 10u;
+            else if (cell == 9u) glyphId = 11u; // +
+            else if (cell == 10u) glyphId = boostCenti / 100u;
+            else if (cell == 11u) glyphId = 10u; // .
+            else if (cell == 12u) glyphId = (boostCenti / 10u) % 10u;
+            else if (cell == 13u) glyphId = boostCenti % 10u;
+
+            uint bits = GetOSDCharBits(glyphId);
+            uint bitIdx = 14u - (row * 3u + col);
+            if (((bits >> bitIdx) & 1u) != 0u)
+            {
+                srgbCol = isBoostText
+                    ? lerp(float3(0.65, 0.75, 0.85), float3(0.25, 0.95, 0.65), motionFactor)
+                    : float3(0.92, 0.95, 0.98);
+                alpha = 1.0;
+            }
+        }
+    }
+
+    // Row 2 (y = 28..37, x = 10..177): Live motion meter bar (0% -> 100% of MotionBoost)
+    if (px >= 10u && px < 178u && py >= 28u && py < 38u)
+    {
+        if (px == 10u || px == 177u || py == 28u || py == 37u)
+        {
+            srgbCol = float3(0.35, 0.42, 0.50);
+            alpha = 0.95;
+        }
+        else
+        {
+            float barPos = float(px - 11u) / 165.0;
+            if (barPos <= motionFactor)
+            {
+                srgbCol = lerp(float3(0.18, 0.72, 0.95), float3(0.25, 0.98, 0.58), barPos);
+                alpha = 0.96;
+            }
+            else
+            {
+                srgbCol = float3(0.13, 0.15, 0.19);
+                alpha = 0.85;
+            }
+        }
+    }
+
+    outColor = float4(EncodeOSDColor(srgbCol, mode), alpha);
+}
+#endif
+
+
 technique Neural_Sharpen_HDR <
     ui_label = "Neural Sharpen HDR";
     ui_tooltip =
@@ -1241,7 +1443,8 @@ technique Neural_Sharpen_HDR <
         "Preprocessor definitions:\n"
         "  NEURAL_SHARPEN_PROFILE: 1=Fast 9-Tap (default), 0=Ultra Fast 5-Tap, 2=Exact 12-Ch\n"
         "  NEURAL_SHARPEN_MODEL: 1=Model A (default), 2=Model B, 0=Both (UI selector)\n"
-        "  ENABLE_MOTION_ADAPTATION: 1=On (default, ~0.002 ms), 0=Off\n"
+        "  ENABLE_MOTION_ADAPTATION: 1=On (default, ~0.005 ms), 0=Off\n"
+        "  ENABLE_MOTION_OSD: 0=Off (default), 1=Live motion boost OSD (top-right)\n"
         "  ENABLE_DEBUG_VIEWS: 0=Off (default), 1=On\n"
         "  ALLOW_MANUAL_COLOR_SPACE: 0=Auto compile-time (default), 1=Manual selector\n"
         "  USE_FP16_CNN: 0=FP32 (default, faster on D3D11), 1=FP16\n"
@@ -1261,6 +1464,17 @@ technique Neural_Sharpen_HDR <
         VertexShader = VS_Apply;
         PixelShader  = PS_Apply;
     }
+#if NSHDR_OSD_COMPILED
+    pass MotionOSD
+    {
+        VertexShader = VS_MotionOSD;
+        PixelShader  = PS_MotionOSD;
+        VertexCount  = 6;
+        BlendEnable  = true;
+        SrcBlend     = SRCALPHA;
+        DestBlend    = INVSRCALPHA;
+    }
+#endif
 }
 
 } // namespace NeuralSharpenHDR
