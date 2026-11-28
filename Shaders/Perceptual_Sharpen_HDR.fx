@@ -714,9 +714,9 @@ void VS_Apply(
     uv.y = (id == 1u) ? 2.0 : 0.0;
 #if PSHDR_DYNAMIC_CSPACE
     if (outMode == MODE_SDR)
-        outSpaceParams = float4(13.5, 0.110, 0.105, 1.0 / 0.215);
+        outSpaceParams = float4(13.5, 0.110, 0.075, 1.0 / 0.190);
     else
-        outSpaceParams = float4(18.0, 0.085, 0.080, 1.0 / 0.160);
+        outSpaceParams = float4(18.0, 0.085, 0.055, 1.0 / 0.140);
 #endif
     position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
 }
@@ -746,13 +746,13 @@ void PS_Apply(
 #if !PSHDR_DYNAMIC_CSPACE
     #if BUFFER_COLOR_SPACE == 3
         const int mode = MODE_PQ;
-        const float4 spaceParams = float4(18.0, 0.085, 0.080, 1.0 / 0.160);
+        const float4 spaceParams = float4(18.0, 0.085, 0.055, 1.0 / 0.140);
     #elif BUFFER_COLOR_SPACE == 2
         const int mode = MODE_SCRGB;
-        const float4 spaceParams = float4(18.0, 0.085, 0.080, 1.0 / 0.160);
+        const float4 spaceParams = float4(18.0, 0.085, 0.055, 1.0 / 0.140);
     #else
         const int mode = MODE_SDR;
-        const float4 spaceParams = float4(13.5, 0.110, 0.105, 1.0 / 0.215);
+        const float4 spaceParams = float4(13.5, 0.110, 0.075, 1.0 / 0.190);
     #endif
 #endif
 
@@ -881,8 +881,13 @@ void PS_Apply(
     float artifactMask  = 1.0 - fireflySig * ArtifactProtection;
 #endif
 
-    // Band 1: Crisp 1-px micro-detail restoration (preserves individual leaves, pores, fabric weave)
-    float fineDelta = (fineDetail * 0.96) / (1.0 + 7.5 * abs(fineDetail));
+    // Band 1: Linear-energy-conserving asymmetric 1-px micro-detail restoration:
+    // Because PQ/gamma are concave, symmetric +/- deltas create net linear brightening and white halo glow
+    // on sunlit distant foliage. Tapering positive peak gain (0.78 -> 0.56 with brightness) while keeping
+    // dark micro-valleys crisp (1.0x) matches natural photographic acuity with near-zero brightness shift.
+    float posScale  = 0.78 - 0.22 * saturate((p4 - 0.22) * 2.2);
+    float asymFine  = (fineDetail >= 0.0) ? posScale : 1.0;
+    float fineDelta = (fineDetail * 0.92 * asymFine) / (1.0 + 7.5 * abs(fineDetail));
 
     // Band 2: Micro-texture-gated bilateral 5x5 outer band (lifts 2-3 px TAA/DLSS blur without blobbing fine foliage!)
     float4 oVec = float4(o0, o1, o2, o3);
@@ -897,7 +902,8 @@ void PS_Apply(
     // suppress 5x5 clump boosting so 1-px leaves never merge into blobs; relaxes smoothly during camera pans.
     float microBusy      = saturate((range3x3 - 2.0 * abs(taaRaw) - 0.020) * 16.0);
     float taaTextureGate = 1.0 - microBusy * (0.90 - 0.40 * motionFactor);
-    float taaDelta       = ((taaRaw * 1.65) / (1.0 + 18.0 * abs(taaRaw))) * effectiveTaaClarity * taaTextureGate;
+    float asymTaa        = (taaRaw >= 0.0) ? 0.72 : 1.0;
+    float taaDelta       = ((taaRaw * 1.65 * asymTaa) / (1.0 + 18.0 * abs(taaRaw))) * effectiveTaaClarity * taaTextureGate;
 
     float rawDelta = (fineDelta + taaDelta) * flatMask * artifactMask * effectiveIntensity;
 
@@ -906,13 +912,14 @@ void PS_Apply(
     float downRoom = max(0.0, p4 - min3x3);
 
     float contrastHazard = saturate((range3x3 - spaceParams.z) * spaceParams.w);
-    float edgeHazard     = saturate(max(contrastHazard, coherence * saturate((range3x3 - 0.025) * 14.0)));
+    float edgeHazard     = saturate(max(contrastHazard, coherence * saturate((range3x3 - 0.020) * 16.0)));
 
-    float posRatio = lerp(0.85, lerp(0.75, 0.025, edgeHazard), ArtifactProtection);
-    float negRatio = lerp(0.95, lerp(0.85, 0.055, edgeHazard), ArtifactProtection);
+    float basePosRatio = lerp(0.36, 0.50, motionFactor);
+    float posRatio     = lerp(0.70, lerp(basePosRatio, 0.018, edgeHazard), ArtifactProtection);
+    float negRatio     = lerp(0.85, lerp(0.70,         0.050, edgeHazard), ArtifactProtection);
 
-    float posLimit = upRoom   + posRatio * range3x3 + 0.0010;
-    float negLimit = downRoom + negRatio * range3x3 + 0.0012;
+    float posLimit = upRoom   + posRatio * range3x3 + 0.0006;
+    float negLimit = downRoom + negRatio * range3x3 + 0.0010;
 
     // Algebraic rsqrt soft-clamp: preserves ~95-99% of fine micro-detail while strictly bounding <= limit!
     float lim = (rawDelta >= 0.0) ? posLimit : negLimit;
