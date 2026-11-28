@@ -91,6 +91,18 @@
     #define USE_FP16_CNN 0
 #endif
 
+// 1 = Enable FrameGen-safe wall-clock camera-pan motion adaptation (~0.001-0.003 ms, D3D11+/Vulkan/GL4.3+)
+// 0 = Strip motion compute pass and textures completely at compile time
+#ifndef ENABLE_MOTION_ADAPTATION
+    #define ENABLE_MOTION_ADAPTATION 1
+#endif
+
+#if ENABLE_MOTION_ADAPTATION && defined(__RENDERER__) && (__RENDERER__ >= 0x0B000)
+    #define NSHDR_MOTION_COMPILED 1
+#else
+    #define NSHDR_MOTION_COMPILED 0
+#endif
+
 #if USE_FP16_CNN
     #define NS_F1 min16float
     #define NS_F4 min16float4
@@ -141,7 +153,7 @@ uniform float Intensity <
     ui_max = 2.0;
     ui_step = 0.05;
     ui_label = "Intensity";
-    NSHDR_TOOLTIP("Overall neural sharpening strength. At 0.0, the pass is vertex-culled for zero shader cost.")
+    NSHDR_TOOLTIP("Base neural sharpening strength when stationary. Set to 0.0 with Motion Boost > 0 for pan-only sharpening (vertex-culled when still).")
 > = 1.0;
 
 uniform float EdgeResponse <
@@ -161,6 +173,41 @@ uniform float ArtifactProtection <
     ui_label = "Artifact Protection";
     NSHDR_TOOLTIP("Suppresses sharpening on high-contrast aliasing edges and isolated specular fireflies. 1.0 = full protection, 0.0 = off.")
 > = 1.0;
+
+#if NSHDR_MOTION_COMPILED
+uniform float MotionBoost <
+    ui_category = "Motion Adaptive";
+    ui_type = "drag";
+    ui_min = 0.0;
+    ui_max = 2.0;
+    ui_step = 0.05;
+    ui_label = "Motion Boost";
+    NSHDR_TOOLTIP("Extra sharpening intensity added during camera pans to counteract TAA / FrameGen motion blur. 0.0 = disabled.")
+> = 0.50;
+
+uniform float MotionSensitivity <
+    ui_category = "Motion Adaptive";
+    ui_type = "drag";
+    ui_min = 0.25;
+    ui_max = 3.0;
+    ui_step = 0.05;
+    ui_label = "Motion Sensitivity";
+    NSHDR_TOOLTIP("How easily camera pans reach full Motion Boost. Higher = triggers on slower pans; lower = requires faster pans.")
+> = 1.0;
+
+uniform float MotionDecayMs <
+    ui_category = "Motion Adaptive";
+    ui_type = "drag";
+    ui_min = 40.0;
+    ui_max = 400.0;
+    ui_step = 10.0;
+    ui_label = "Motion Decay (ms)";
+    NSHDR_TOOLTIP("Wall-clock decay time after stopping a camera pan. Higher values fade back more gradually without sharpness pop.")
+> = 140.0;
+
+// Wall-clock milliseconds (FrameGen-safe; does not rely on frametime which freezes on generated frames).
+uniform uint MotionClockMs < source = "timer"; >;
+#endif
 
 #if ENABLE_DEBUG_VIEWS
 uniform int ViewMode <
@@ -187,6 +234,10 @@ uniform int _PreprocessorHelp <
         "  1 = Model A only (Balanced, smallest shader)\n"
         "  2 = Model B only (Edge-Enhanced, smallest shader)\n"
         "  0 = Both models compiled with runtime UI switcher\n"
+        "\n"
+        "ENABLE_MOTION_ADAPTATION (default: 1)\n"
+        "  1 = FrameGen-safe wall-clock camera-pan boost (~0.002 ms)\n"
+        "  0 = Strip motion compute pass and textures completely\n"
         "\n"
         "ENABLE_DEBUG_VIEWS (default: 0)\n"
         "  0 = Stripped at compile time (fastest)\n"
@@ -217,6 +268,53 @@ sampler sBackBufferPoint
     MagFilter = POINT;
     MipFilter = POINT;
 };
+
+#if NSHDR_MOTION_COMPILED
+// 16x16 R32F previous-frame coarse luma snapshot (1 KB VRAM; single-channel R32F supports D3D11 typed UAV load).
+texture TexMotionPrev
+{
+    Width = 16;
+    Height = 16;
+    Format = R32F;
+};
+storage2D<float> StorageMotionPrev
+{
+    Texture = TexMotionPrev;
+};
+
+// 2x1 R32I wall-clock state: [0,0]=initialized flag, [1,0]=last wall-clock ms.
+texture TexMotionClock
+{
+    Width = 2;
+    Height = 1;
+    Format = R32I;
+};
+storage2D<int> StorageMotionClock
+{
+    Texture = TexMotionClock;
+};
+
+// 2x1 R32F motion state: [0,0]=smoothed motion [0,1] (read once per frame in VS_Apply), [1,0]=prev mean luma.
+texture TexMotionState
+{
+    Width = 2;
+    Height = 1;
+    Format = R32F;
+};
+sampler sMotionState
+{
+    Texture = TexMotionState;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<float> StorageMotionState
+{
+    Texture = TexMotionState;
+};
+#endif
 
 #define MODE_SDR   1
 #define MODE_SCRGB 2
@@ -255,15 +353,6 @@ int ResolveColorSpaceMode()
     return mode;
 }
 #endif
-
-bool IsShaderActive()
-{
-#if ENABLE_DEBUG_VIEWS
-    return (Intensity > 0.0001) || (ViewMode != 0);
-#else
-    return (Intensity > 0.0001);
-#endif
-}
 
 #if NSHDR_DYNAMIC_CSPACE || (BUFFER_COLOR_SPACE == 2) || ENABLE_DEBUG_VIEWS
 // 0-pow ST.2084 Linear [0, 1] -> PQ [0, 1] rational fit on u = L^0.25 (2 sqrts + 5 FMAs + 1 rcp).
@@ -740,23 +829,234 @@ NS_F1 RunNeuralExact12(
 
 
 // ============================================================================
-// 5. SINGLE-PASS SHADER & TECHNIQUE
+// 5. MOTION ADAPTATION PASS, APPLY SHADER & TECHNIQUE
 // ============================================================================
+
+#if NSHDR_MOTION_COMPILED
+groupshared int   gs_MotionAction; // 0 = skip/hold, 2 = init snapshot, 3 = update motion
+groupshared int   gs_MotionMode;
+groupshared float gs_MotionDtMs;
+groupshared float gs_MotionPrevMean;
+groupshared float gs_MotionCurrMean;
+groupshared float gs_MotionCurr[256];
+groupshared float gs_MotionDiff[256];
+groupshared float gs_MotionMove[256];
+groupshared float gs_MotionColSum[16];
+groupshared float gs_MotionColDiff[16];
+groupshared float gs_MotionColMove[16];
+
+// Single 1x1x1 threadgroup (256 threads) measuring camera-pan motion across a 16x16 inner-80% grid.
+// Uses ReShade wall-clock timer (source="timer") gated at >=12 ms (~60-80 Hz) so FrameGen generated
+// frames (dtMs == 0) never flicker or false-drop motion, and holds boosted intensity across them.
+// All barriers sit unconditionally at top level (zero returns before any barrier -> 100% FXC X3663-safe).
+void CS_UpdateMotion(uint3 gtid : SV_GroupThreadID)
+{
+    uint lane = gtid.y * 16u + gtid.x;
+
+    if (lane == 0u)
+    {
+        int action = 0;
+        float dtMs = 16.666667;
+        float prevMean = 0.0;
+
+#if NSHDR_DYNAMIC_CSPACE
+        gs_MotionMode = ResolveColorSpaceMode();
+#elif BUFFER_COLOR_SPACE == 3
+        gs_MotionMode = MODE_PQ;
+#elif BUFFER_COLOR_SPACE == 2
+        gs_MotionMode = MODE_SCRGB;
+#else
+        gs_MotionMode = MODE_SDR;
+#endif
+
+        if (MotionBoost <= 0.0001)
+        {
+            if (tex2Dfetch(StorageMotionClock, int2(0, 0)) != 0)
+            {
+                tex2Dstore(StorageMotionClock, int2(0, 0), 0);
+                tex2Dstore(StorageMotionState, int2(0, 0), 0.0);
+            }
+        }
+        else
+        {
+            int initialized = tex2Dfetch(StorageMotionClock, int2(0, 0));
+            uint nowMs = MotionClockMs;
+            if (initialized == 0)
+            {
+                tex2Dstore(StorageMotionClock, int2(0, 0), 1);
+                tex2Dstore(StorageMotionClock, int2(1, 0), int(nowMs));
+                tex2Dstore(StorageMotionState, int2(0, 0), 0.0);
+                action = 2;
+            }
+            else
+            {
+                uint lastMs = uint(tex2Dfetch(StorageMotionClock, int2(1, 0)));
+                uint deltaMs = nowMs - lastMs;
+                // Skip generated frames (deltaMs == 0) and sub-12 ms intervals; hold smoothed motion.
+                if (deltaMs >= 12u)
+                {
+                    tex2Dstore(StorageMotionClock, int2(1, 0), int(nowMs));
+                    dtMs = float(min(deltaMs, 250u));
+                    prevMean = tex2Dfetch(StorageMotionState, int2(1, 0));
+                    action = 3;
+                }
+            }
+        }
+
+        gs_MotionAction = action;
+        gs_MotionDtMs = dtMs;
+        gs_MotionPrevMean = prevMean;
+    }
+    barrier();
+
+    // Stage 1: Sample 16x16 grid across inner 80% of screen (avoids HUD edges) and swap with previous snapshot.
+    float curr = 0.0;
+    float prev = 0.0;
+    if (gs_MotionAction != 0)
+    {
+        float2 gridUV = float2(0.10, 0.10) + (float2(gtid.xy) + 0.5) * (0.80 / 16.0);
+        float3 sampleRGB = tex2Dlod(ReShade::BackBuffer, float4(gridUV, 0.0, 0.0)).rgb;
+        curr = ExtractLuma(sampleRGB, gs_MotionMode);
+        prev = tex2Dfetch(StorageMotionPrev, int2(gtid.xy));
+        tex2Dstore(StorageMotionPrev, int2(gtid.xy), curr);
+    }
+    gs_MotionCurr[lane] = curr;
+    barrier();
+
+    // Stage 2: Compute current frame mean luma (16 lanes sum 16 entries each, then lane 0 sums 16).
+    if (lane < 16u)
+    {
+        float s = 0.0;
+        if (gs_MotionAction != 0)
+        {
+            uint baseIdx = lane * 16u;
+            [unroll]
+            for (uint k = 0u; k < 16u; ++k)
+                s += gs_MotionCurr[baseIdx + k];
+        }
+        gs_MotionColSum[lane] = s;
+    }
+    barrier();
+
+    if (lane == 0u)
+    {
+        float meanCurr = 0.0;
+        if (gs_MotionAction != 0)
+        {
+            float total = 0.0;
+            [unroll]
+            for (uint k = 0u; k < 16u; ++k)
+                total += gs_MotionColSum[k];
+            meanCurr = total * (1.0 / 256.0);
+            if (gs_MotionAction == 2)
+                tex2Dstore(StorageMotionState, int2(1, 0), meanCurr);
+        }
+        gs_MotionCurrMean = meanCurr;
+    }
+    barrier();
+
+    // Stage 3: min(rawDiff, zeroMeanDiff) normalized to 60 Hz wall-clock rate:
+    // - zmDiff == 0 rejects global flashes / exposure shifts.
+    // - rawDiff == 0 on static background rejects localized bright NPCs / spells shifting the frame mean.
+    float diffVal = 0.0;
+    float moveVal = 0.0;
+    if (gs_MotionAction == 3)
+    {
+        float rateScale = 16.666667 / clamp(gs_MotionDtMs, 12.0, 100.0);
+        float rawDiff = abs(curr - prev);
+        float zmDiff  = abs((curr - gs_MotionCurrMean) - (prev - gs_MotionPrevMean));
+        float d = min(rawDiff, zmDiff) * rateScale;
+        diffVal = min(d, 0.25);
+        moveVal = (d > 0.008) ? 1.0 : 0.0;
+    }
+    gs_MotionDiff[lane] = diffVal;
+    gs_MotionMove[lane] = moveVal;
+    barrier();
+
+    // Stage 4: Reduce diff magnitude & screen coverage fraction.
+    if (lane < 16u)
+    {
+        float sd = 0.0;
+        float sm = 0.0;
+        if (gs_MotionAction == 3)
+        {
+            uint baseIdx = lane * 16u;
+            [unroll]
+            for (uint k = 0u; k < 16u; ++k)
+            {
+                sd += gs_MotionDiff[baseIdx + k];
+                sm += gs_MotionMove[baseIdx + k];
+            }
+        }
+        gs_MotionColDiff[lane] = sd;
+        gs_MotionColMove[lane] = sm;
+    }
+    barrier();
+
+    // Stage 5: Coverage-gated camera-pan score + asymmetric wall-clock smoothing (fast attack, smooth decay).
+    if ((lane == 0u) && (gs_MotionAction == 3))
+    {
+        float sumDiff = 0.0;
+        float sumMove = 0.0;
+        [unroll]
+        for (uint k = 0u; k < 16u; ++k)
+        {
+            sumDiff += gs_MotionColDiff[k];
+            sumMove += gs_MotionColMove[k];
+        }
+
+        float meanDiff = sumDiff * (1.0 / 256.0);
+        float coverage = sumMove * (1.0 / 256.0);
+
+        // Require broad screen shift (>25% moving -> full at 60%) to ignore local NPCs, grass, and HUD.
+        float coverageGate = saturate((coverage - 0.25) * (1.0 / 0.35));
+        float magSignal    = saturate((meanDiff * MotionSensitivity - 0.006) * (1.0 / 0.030));
+        float panTarget    = (gs_MotionDtMs > 200.0) ? 0.0 : (coverageGate * magSignal);
+
+        float prevSmooth = tex2Dfetch(StorageMotionState, int2(0, 0));
+        float tauMs      = (panTarget > prevSmooth) ? 30.0 : max(MotionDecayMs, 20.0);
+        float alpha      = 1.0 - exp(-gs_MotionDtMs / tauMs);
+        float newSmooth  = lerp(prevSmooth, panTarget, alpha);
+
+        tex2Dstore(StorageMotionState, int2(0, 0), newSmooth);
+        tex2Dstore(StorageMotionState, int2(1, 0), gs_MotionCurrMean);
+    }
+}
+#endif
 
 void VS_Apply(
     in uint id : SV_VertexID,
     out float4 position : SV_Position,
     out float2 uv : TEXCOORD0
+#if NSHDR_MOTION_COMPILED
+    , out nointerpolation float outEffectiveIntensity : TEXCOORD1
+#endif
 #if NSHDR_DYNAMIC_CSPACE
-    , out nointerpolation int outMode : TEXCOORD1
-    , out nointerpolation float4 outSuppressParams : TEXCOORD2
+    , out nointerpolation int outMode : TEXCOORD2
+    , out nointerpolation float4 outSuppressParams : TEXCOORD3
 #endif
     )
 {
 #if NSHDR_DYNAMIC_CSPACE
     outMode = ResolveColorSpaceMode();
 #endif
-    if (!IsShaderActive())
+
+    float effectiveIntensity = Intensity;
+#if NSHDR_MOTION_COMPILED
+    if (MotionBoost > 0.0001)
+    {
+        float motionFactor = saturate(tex2Dlod(sMotionState, float4(0.25, 0.5, 0.0, 0.0)).r);
+        effectiveIntensity += MotionBoost * motionFactor;
+    }
+    outEffectiveIntensity = effectiveIntensity;
+#endif
+
+#if ENABLE_DEBUG_VIEWS
+    bool active = (effectiveIntensity > 0.0001) || (ViewMode != 0);
+#else
+    bool active = (effectiveIntensity > 0.0001);
+#endif
+    if (!active)
     {
         position = float4(0.0, 0.0, 0.0, 0.0);
         uv = float2(0.0, 0.0);
@@ -780,12 +1080,18 @@ void VS_Apply(
 void PS_Apply(
     float4 vpos : SV_Position,
     float2 uv : TEXCOORD0
+#if NSHDR_MOTION_COMPILED
+    , nointerpolation float effectiveIntensity : TEXCOORD1
+#endif
 #if NSHDR_DYNAMIC_CSPACE
-    , nointerpolation int mode : TEXCOORD1
-    , nointerpolation float4 suppressParams : TEXCOORD2
+    , nointerpolation int mode : TEXCOORD2
+    , nointerpolation float4 suppressParams : TEXCOORD3
 #endif
     , out float4 outColor : SV_Target)
 {
+#if !NSHDR_MOTION_COMPILED
+    const float effectiveIntensity = Intensity;
+#endif
 #if !NSHDR_DYNAMIC_CSPACE
     #if BUFFER_COLOR_SPACE == 3
         const int mode = MODE_PQ;
@@ -886,7 +1192,7 @@ void PS_Apply(
     float residual = clamp(rawResidual, -0.5, 0.5) * 0.22;
     residual *= (1.0 + EdgeResponse * normalizedResidual);
 
-    float delta = residual * flatMask * suppressionMask * Intensity;
+    float delta = residual * flatMask * suppressionMask * effectiveIntensity;
 
 #if ENABLE_DEBUG_VIEWS
     [branch]
@@ -935,17 +1241,26 @@ void PS_Apply(
 technique Neural_Sharpen_HDR <
     ui_label = "Neural Sharpen HDR";
     ui_tooltip =
-        "Single-pass, HDR-aware, GPU-optimized Neural Sharpening (based on Barbatos Neural Sharpen 2.8, MIT).\n"
+        "HDR-aware, GPU-optimized Neural Sharpening with FrameGen-safe camera-pan motion adaptation (based on Barbatos Neural Sharpen 2.8, MIT).\n"
         "Supports HDR10 PQ, scRGB Linear, and SDR.\n\n"
         "Preprocessor definitions:\n"
         "  NEURAL_SHARPEN_PROFILE: 0=Ultra Fast 5-Tap (default), 1=Fast 9-Tap, 2=Exact 12-Ch\n"
         "  NEURAL_SHARPEN_MODEL: 1=Model A (default), 2=Model B, 0=Both (UI selector)\n"
+        "  ENABLE_MOTION_ADAPTATION: 1=On (default, ~0.002 ms), 0=Off\n"
         "  ENABLE_DEBUG_VIEWS: 0=Off (default), 1=On\n"
         "  ALLOW_MANUAL_COLOR_SPACE: 0=Auto compile-time (default), 1=Manual selector\n"
         "  USE_FP16_CNN: 0=FP32 (default, faster on D3D11), 1=FP16\n"
         "  ENABLE_UI_TOOLTIPS: 1=On (default), 0=Off";
 >
 {
+#if NSHDR_MOTION_COMPILED
+    pass UpdateMotion
+    {
+        ComputeShader = CS_UpdateMotion<16, 16, 1>;
+        DispatchSizeX = 1;
+        DispatchSizeY = 1;
+    }
+#endif
     pass Apply
     {
         VertexShader = VS_Apply;
